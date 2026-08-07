@@ -74,7 +74,6 @@ pub struct ApplySummary {
 #[derive(Debug)]
 pub struct Engine<F> {
     fold: F,
-    config: EngineConfig,
     cursor: Option<Position>,
     ring: BlockRing,
     checkpoints: CheckpointRing<F>,
@@ -91,7 +90,6 @@ impl<F: Fold> Engine<F> {
             ring: BlockRing::with_capacity(config.ring_capacity),
             checkpoints: CheckpointRing::new(config.checkpoint_slots),
             fold,
-            config,
             cursor: None,
             status: EngineStatus::Active,
             last_verified: None,
@@ -177,11 +175,7 @@ impl<F: Fold> Engine<F> {
                 },
             )?;
             if observed_hash != boundary.hash {
-                let observed = BlockRef {
-                    number: cursor.block,
-                    hash: observed_hash,
-                };
-                return Err(fork_suspected(observed, boundary));
+                return Err(fork_suspected(cursor.block, observed_hash, boundary));
             }
             self.last_verified = Some(boundary);
         }
@@ -195,11 +189,7 @@ impl<F: Fold> Engine<F> {
                 && let Some(observed_hash) = self.ring.hash_at(span.block.number)
                 && observed_hash != span.block.hash
             {
-                let observed = BlockRef {
-                    number: span.block.number,
-                    hash: observed_hash,
-                };
-                return Err(fork_suspected(observed, span.block));
+                return Err(fork_suspected(span.block.number, observed_hash, span.block));
             }
             self.apply_span(span, batch, &mut summary)?;
         }
@@ -226,7 +216,8 @@ impl<F: Fold> Engine<F> {
     }
 
     /// Restores the newest checkpoint whose cursor block is at or below the argument.
-    /// Clears Halted and Poisoned; drops checkpoints above the restore point.
+    /// Clears Halted and Poisoned; drops checkpoints above the argument, the fork
+    /// boundary, so checkpoints between it and the restored cursor stay valid.
     /// Freshness resets to None, since the restored cursor is unverified until the
     /// next boundary check confirms it.
     #[cold]
@@ -255,7 +246,7 @@ impl<F: Fold> Engine<F> {
 
     /// Full restart with a fresh fold: clears cursor, ring, checkpoints, counters.
     pub fn reset(&mut self, fold: F) {
-        self.ring = BlockRing::with_capacity(self.config.ring_capacity);
+        self.ring.clear();
         self.checkpoints.clear();
         self.fold = fold;
         self.cursor = None;
@@ -288,27 +279,23 @@ impl<F: Fold> Engine<F> {
         batch: &Batch<F::Event>,
         summary: &mut ApplySummary,
     ) -> Result<(), ApplyError<F::Error>> {
-        let start = span.start as usize;
-        let end = span.end as usize;
-        for entry in &batch.events[start..end] {
+        for entry in &batch.events[span.start as usize..span.end as usize] {
             let pos = Position::new(span.block.number, entry.log_index);
             if self.cursor.is_some_and(|cursor| pos <= cursor) {
                 summary.deduped += 1;
                 continue;
             }
             match self.fold.apply(pos, &entry.event) {
-                Ok(()) => {
-                    self.advance(span.block, pos);
-                    summary.applied += 1;
-                }
+                Ok(()) => summary.applied += 1,
                 Err(FoldError::Skip(_)) => {
-                    self.advance(span.block, pos);
                     self.skips += 1;
                     summary.skipped += 1;
                 }
                 Err(FoldError::Halt(error)) => return Err(self.halt(pos, error)),
                 Err(FoldError::Poison(error)) => return Err(self.poison(pos, error)),
             }
+            // Accepted and skipped both consume the position; halt and poison returned.
+            self.advance(span.block, pos);
         }
         Ok(())
     }
@@ -343,11 +330,19 @@ impl<F: Fold> Engine<F> {
     }
 }
 
-/// Builds the fork report comparing an observed block against its refetched header.
+/// Builds the fork report comparing the hash the ring observed for a block against
+/// the refetched header for that same block.
 #[cold]
-fn fork_suspected<E>(observed: BlockRef, refetched: BlockRef) -> ApplyError<E> {
+fn fork_suspected<E>(
+    number: u64,
+    observed_hash: [u8; 32],
+    refetched: BlockRef,
+) -> ApplyError<E> {
     ApplyError::ForkSuspected {
-        observed,
+        observed: BlockRef {
+            number,
+            hash: observed_hash,
+        },
         refetched,
     }
 }
@@ -588,6 +583,27 @@ mod tests {
         );
         assert_eq!(engine.cursor(), Some(Position::new(1, 1)));
         assert_eq!(engine.skip_count(), 1);
+    }
+
+    #[test]
+    fn a_lone_skip_consumes_its_position_and_observes_the_block() {
+        // given a fold skipping the only event of block 1, so no later apply masks it
+        let mut engine = scripted_engine(Position::new(1, 0), FailKind::Skip);
+        let batch = batch_of(None, vec![(block(1, 0), vec![0])]);
+        // when applied
+        let summary = engine.apply_batch(&batch).unwrap();
+        // then the position is consumed and the block still entered the ring
+        assert_eq!(
+            summary,
+            ApplySummary {
+                applied: 0,
+                deduped: 0,
+                skipped: 1,
+            }
+        );
+        assert_eq!(engine.cursor(), Some(Position::new(1, 0)));
+        assert_eq!(engine.observed().collect::<Vec<_>>(), vec![block(1, 0)]);
+        assert_eq!(engine.last_verified(), Some(block(1, 0)));
     }
 
     #[test]

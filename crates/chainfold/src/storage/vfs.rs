@@ -84,7 +84,17 @@ impl Vfs for RealVfs {
     }
 
     fn fsync_dir(&mut self, path: &Path) -> io::Result<()> {
-        fs::File::open(path)?.sync_all()
+        match fs::File::open(path)?.sync_all() {
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::InvalidInput | io::ErrorKind::Unsupported
+                ) =>
+            {
+                Ok(())
+            }
+            result => result,
+        }
     }
 
     fn exists(&mut self, path: &Path) -> io::Result<bool> {

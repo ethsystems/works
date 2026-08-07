@@ -24,16 +24,20 @@ pub(crate) struct Slot<F> {
 
 impl<F> CheckpointRing<F> {
     pub(crate) fn new(slots: usize) -> Self {
-        let mut buffer = Vec::with_capacity(slots);
-        buffer.resize_with(slots, || None);
         Self {
-            slots: buffer,
+            slots: (0..slots).map(|_| None).collect(),
             next: 0,
         }
     }
 
+    /// Occupied slots oldest first, since the next write position holds the oldest.
+    fn oldest_first(&self) -> impl DoubleEndedIterator<Item = &Slot<F>> {
+        let (newest, oldest) = self.slots.split_at(self.next);
+        oldest.iter().chain(newest).flatten()
+    }
+
     pub(crate) fn count(&self) -> usize {
-        self.slots.iter().filter(|slot| slot.is_some()).count()
+        self.oldest_first().count()
     }
 
     /// Stores a slot at the next write position; overwrites the oldest when full.
@@ -48,49 +52,26 @@ impl<F> CheckpointRing<F> {
 
     /// Oldest retained slot; the mirror of best_at_or_below's newest-first scan.
     pub(crate) fn oldest(&self) -> Option<&Slot<F>> {
-        let len = self.slots.len();
-        for step in 0..len {
-            let index = (self.next + step) % len;
-            if let Some(slot) = &self.slots[index] {
-                return Some(slot);
-            }
-        }
-        None
+        self.oldest_first().next()
     }
 
     /// Newest slot with cursor block at or below the argument; empty-cursor slots always qualify.
     #[cold]
     pub(crate) fn best_at_or_below(&self, block: u64) -> Option<&Slot<F>> {
-        let len = self.slots.len();
-        if len == 0 {
-            return None;
-        }
-        for step in 0..len {
-            let index = (self.next + len - 1 - step) % len;
-            if let Some(slot) = &self.slots[index]
-                && slot.cursor.is_none_or(|cursor| cursor.block <= block)
-            {
-                return Some(slot);
-            }
-        }
-        None
+        self.oldest_first()
+            .rev()
+            .find(|slot| slot.cursor.is_none_or(|cursor| cursor.block <= block))
     }
 
     /// Drops slots with cursor block strictly above the argument.
     #[cold]
     pub(crate) fn drop_above(&mut self, block: u64) {
         for slot in &mut self.slots {
-            if let Some(inner) = slot
-                && inner.cursor.is_some_and(|cursor| cursor.block > block)
-            {
-                *slot = None;
-            }
+            slot.take_if(|slot| slot.cursor.is_some_and(|cursor| cursor.block > block));
         }
     }
 
     pub(crate) fn clear(&mut self) {
-        for slot in &mut self.slots {
-            *slot = None;
-        }
+        self.slots.fill_with(|| None);
     }
 }
