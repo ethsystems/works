@@ -2,6 +2,7 @@ use crate::{
     batch::{
         Batch,
         BlockSpan,
+        LogEvent,
     },
     checkpoint::{
         CheckpointRing,
@@ -279,25 +280,55 @@ impl<F: Fold> Engine<F> {
         batch: &Batch<F::Event>,
         summary: &mut ApplySummary,
     ) -> Result<(), ApplyError<F::Error>> {
-        for entry in &batch.events[span.start as usize..span.end as usize] {
-            let pos = Position::new(span.block.number, entry.log_index);
-            if self.cursor.is_some_and(|cursor| pos <= cursor) {
-                summary.deduped += 1;
-                continue;
-            }
-            match self.fold.apply(pos, &entry.event) {
+        let events = &batch.events[span.start as usize..span.end as usize];
+        let pos = |entry: &LogEvent<F::Event>| {
+            Position::new(span.block.number, entry.log_index)
+        };
+        // Log indices ascend within a span, so the deduped set is a prefix.
+        let deduped = self.cursor.map_or(0, |cursor| {
+            events.partition_point(|entry| pos(entry) <= cursor)
+        });
+        summary.deduped += deduped as u64;
+        let fresh = &events[deduped..];
+        let Some(last) = fresh.last() else {
+            return Ok(());
+        };
+
+        for (index, entry) in fresh.iter().enumerate() {
+            let at = pos(entry);
+            match self.fold.apply(at, &entry.event) {
                 Ok(()) => summary.applied += 1,
                 Err(FoldError::Skip(_)) => {
                     self.skips += 1;
                     summary.skipped += 1;
                 }
-                Err(FoldError::Halt(error)) => return Err(self.halt(pos, error)),
-                Err(FoldError::Poison(error)) => return Err(self.poison(pos, error)),
+                Err(FoldError::Halt(error)) => {
+                    self.consumed_through(span.block, fresh, &pos, index);
+                    return Err(self.halt(at, error));
+                }
+                Err(FoldError::Poison(error)) => {
+                    self.consumed_through(span.block, fresh, &pos, index);
+                    return Err(self.poison(at, error));
+                }
             }
-            // Accepted and skipped both consume the position; halt and poison returned.
-            self.advance(span.block, pos);
         }
+        self.advance(span.block, pos(last));
         Ok(())
+    }
+
+    /// Places the cursor at the predecessor of `fresh[index]`; a no-op at index 0, since
+    /// nothing in this span was consumed yet.
+    #[cold]
+    fn consumed_through(
+        &mut self,
+        block: BlockRef,
+        fresh: &[LogEvent<F::Event>],
+        pos: &impl Fn(&LogEvent<F::Event>) -> Position,
+        index: usize,
+    ) {
+        if let Some(entry) = index.checked_sub(1).and_then(|i| fresh.get(i)) {
+            self.advance(block, pos(entry));
+        }
     }
 
     /// Moves the cursor to `pos`, recording the block the first time the cursor enters it.
@@ -1202,5 +1233,26 @@ mod tests {
         assert_eq!(first_restore, checkpoint_cursor);
         assert_eq!(second_restore, checkpoint_cursor);
         assert_eq!(engine.view(), checkpoint_view);
+    }
+
+    #[test]
+    fn cursor_does_not_regress_when_the_stop_span_is_partially_deduped() {
+        // given cursor at block 5 log index 3 and a fold halting at log index 5
+        let halt_pos = Position::new(5, 5);
+        let mut engine = scripted_engine(halt_pos, FailKind::Halt);
+        let first = batch_of(None, vec![(block(5, 0), vec![0, 1, 2, 3])]);
+        engine.apply_batch(&first).unwrap();
+        // when block 5 is redelivered as [0, 1, 5], dropping 2 and 3 as deduped
+        let next = batch_of(Some(block(5, 0)), vec![(block(5, 0), vec![0, 1, 5])]);
+        let result = engine.apply_batch(&next);
+        // then Halted at (5, 5) and the cursor is still (5, 3), not lower
+        assert_eq!(
+            result,
+            Err(ApplyError::Halted {
+                at: halt_pos,
+                error: FailKind::Halt,
+            })
+        );
+        assert_eq!(engine.cursor(), Some(Position::new(5, 3)));
     }
 }
