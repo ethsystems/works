@@ -91,6 +91,7 @@ impl<E> Batch<E> {
                     .expect("a failed ascending sweep always has a locatable pair");
                 return Err(BatchShapeError::LogIndexNotAscending {
                     span: span_index,
+                    #[allow(clippy::cast_possible_truncation)]
                     index: span.start + 1 + offset as u32,
                 });
             }
