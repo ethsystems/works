@@ -79,15 +79,19 @@ impl<E> Batch<E> {
             {
                 return Err(BatchShapeError::BlocksNotAscending { span: span_index });
             }
-            // Pairwise over a subslice: one bounds check for the span, none per event.
             let events = &self.events[span.start as usize..span.end as usize];
-            if let Some((index, _)) = (span.start + 1..span.end)
-                .zip(events.windows(2))
-                .find(|&(_, pair)| pair[1].log_index <= pair[0].log_index)
-            {
+            let ascending = events
+                .iter()
+                .zip(&events[1..])
+                .fold(true, |acc, (a, b)| acc & (a.log_index < b.log_index));
+            if !ascending {
+                let offset = events
+                    .windows(2)
+                    .position(|pair| pair[1].log_index <= pair[0].log_index)
+                    .expect("a failed ascending sweep always has a locatable pair");
                 return Err(BatchShapeError::LogIndexNotAscending {
                     span: span_index,
-                    index,
+                    index: span.start + 1 + offset as u32,
                 });
             }
             previous = Some(span);

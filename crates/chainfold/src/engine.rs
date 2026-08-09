@@ -284,10 +284,14 @@ impl<F: Fold> Engine<F> {
         let pos = |entry: &LogEvent<F::Event>| {
             Position::new(span.block.number, entry.log_index)
         };
-        // Log indices ascend within a span, so the deduped set is a prefix.
-        let deduped = self.cursor.map_or(0, |cursor| {
-            events.partition_point(|entry| pos(entry) <= cursor)
-        });
+        let deduped = match self.cursor {
+            Some(cursor) if span.block.number > cursor.block => 0,
+            Some(cursor) if span.block.number < cursor.block => events.len(),
+            Some(cursor) => {
+                events.partition_point(|entry| entry.log_index <= cursor.log_index)
+            }
+            None => 0,
+        };
         summary.deduped += deduped as u64;
         let fresh = &events[deduped..];
         let Some(last) = fresh.last() else {
