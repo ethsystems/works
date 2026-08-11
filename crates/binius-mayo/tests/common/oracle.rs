@@ -306,20 +306,16 @@ fn aes128_ctr_keystream(pk_seed: &[u8; PK_SEED_BYTES], output_len: usize) -> Vec
     let mut out = vec![0u8; output_len];
 
     for i in 0..n_full {
-        let mut block = [0u8; 16];
+        let mut block = Block::<Aes128>::default();
         block[12..16].copy_from_slice(&(i as u32).to_be_bytes());
-        let mut blk = Block::<Aes128>::default();
-        blk.copy_from_slice(&block);
-        cipher.encrypt_block(&mut blk);
-        out[i * 16..(i + 1) * 16].copy_from_slice(blk.as_slice());
+        cipher.encrypt_block(&mut block);
+        out[i * 16..(i + 1) * 16].copy_from_slice(block.as_slice());
     }
     if tail > 0 {
-        let mut block = [0u8; 16];
+        let mut block = Block::<Aes128>::default();
         block[12..16].copy_from_slice(&(n_full as u32).to_be_bytes());
-        let mut blk = Block::<Aes128>::default();
-        blk.copy_from_slice(&block);
-        cipher.encrypt_block(&mut blk);
-        out[n_full * 16..n_full * 16 + tail].copy_from_slice(&blk.as_slice()[..tail]);
+        cipher.encrypt_block(&mut block);
+        out[n_full * 16..n_full * 16 + tail].copy_from_slice(&block.as_slice()[..tail]);
     }
     out
 }
