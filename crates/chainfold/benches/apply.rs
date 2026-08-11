@@ -5,10 +5,8 @@ use std::hint::black_box;
 use chainfold::{
     Batch,
     BlockRef,
-    BlockSpan,
     Engine,
     EngineConfig,
-    LogEvent,
     test_util::NoopFold,
 };
 use criterion::{
@@ -24,9 +22,9 @@ const RING_CAPACITY: usize = 128;
 /// Blocks the timed batch spans.
 const SPAN_COUNT: u64 = 64;
 /// Events carried by each timed span.
-const EVENTS_PER_SPAN: u64 = 64;
+const EVENTS_PER_SPAN: u32 = 64;
 /// Total events the timed batch carries.
-const EVENT_COUNT: u64 = SPAN_COUNT * EVENTS_PER_SPAN;
+const EVENT_COUNT: u64 = SPAN_COUNT * EVENTS_PER_SPAN as u64;
 
 /// Builds a distinguishable header for a block number.
 fn block_ref(number: u64) -> BlockRef {
@@ -43,18 +41,8 @@ fn warmed_engine() -> Engine<NoopFold> {
         checkpoint_slots: 0,
     };
     let mut engine = Engine::new(NoopFold, config).expect("engine config is valid");
-    let warmup = Batch {
-        boundary: None,
-        spans: vec![BlockSpan {
-            block: block_ref(0),
-            start: 0,
-            end: 1,
-        }],
-        events: vec![LogEvent {
-            log_index: 0,
-            event: 0,
-        }],
-    };
+    let mut warmup = Batch::new();
+    warmup.push_block(block_ref(0), [(0u32, 0u64)]);
     engine
         .apply_batch(&warmup)
         .expect("warmup batch applies cleanly");
@@ -63,28 +51,15 @@ fn warmed_engine() -> Engine<NoopFold> {
 
 /// Builds the batch under measurement: 4096 events over 64 spans past the warmup block.
 fn timed_batch() -> Batch<u64> {
-    let mut events = Vec::with_capacity(EVENT_COUNT as usize);
-    let mut spans = Vec::with_capacity(SPAN_COUNT as usize);
+    let mut batch = Batch::new();
+    batch.boundary = Some(block_ref(0));
     for block in 1..=SPAN_COUNT {
-        let start = events.len() as u32;
-        for log_index in 0..EVENTS_PER_SPAN {
-            events.push(LogEvent {
-                log_index,
-                event: log_index,
-            });
-        }
-        let end = events.len() as u32;
-        spans.push(BlockSpan {
-            block: block_ref(block),
-            start,
-            end,
-        });
+        batch.push_block(
+            block_ref(block),
+            (0..EVENTS_PER_SPAN).map(|log_index| (log_index, u64::from(log_index))),
+        );
     }
-    Batch {
-        boundary: Some(block_ref(0)),
-        spans,
-        events,
-    }
+    batch
 }
 
 fn bench_apply(c: &mut Criterion) {

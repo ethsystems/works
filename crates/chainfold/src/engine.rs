@@ -1,8 +1,7 @@
 use crate::{
     batch::{
         Batch,
-        BlockSpan,
-        LogEvent,
+        SpanView,
     },
     checkpoint::{
         CheckpointRing,
@@ -118,21 +117,25 @@ impl<F: Fold> Engine<F> {
         self.skips
     }
 
-    /// Count of checkpoints currently retained.
+    /// Count of checkpoints the ring can still serve; expired slots are not counted.
     pub fn checkpoint_count(&self) -> usize {
-        self.checkpoints.count()
+        self.checkpoints.count(&self.ring)
     }
 
-    /// Cursor of the oldest retained checkpoint; the reorg-safe durable point.
-    /// None without checkpoints or when the oldest slot predates any applied event.
+    /// Cursor of the oldest live checkpoint; the reorg-safe durable point.
+    ///
+    /// None without checkpoints, when the oldest live slot predates any applied event, or
+    /// once every slot's cursor block has left the observed window.
     pub fn durable_point(&self) -> Option<Position> {
-        self.checkpoints.oldest().and_then(|slot| slot.cursor)
+        self.checkpoints
+            .oldest(&self.ring)
+            .and_then(|slot| slot.cursor)
     }
 
-    /// Oldest retained checkpoint slot, for the snapshot codec.
+    /// Oldest live checkpoint slot, for the snapshot codec.
     #[cfg(feature = "wincode")]
     pub(crate) fn oldest_checkpoint(&self) -> Option<&Slot<F>> {
-        self.checkpoints.oldest()
+        self.checkpoints.oldest(&self.ring)
     }
 
     /// Borrows the fold state.
@@ -148,6 +151,12 @@ impl<F: Fold> Engine<F> {
     /// Iterates observed blocks oldest first.
     pub fn observed(&self) -> Observed<'_> {
         self.ring.iter()
+    }
+
+    /// Iterates observed blocks at or below a number, oldest first; a checkpoint's window.
+    #[cfg(feature = "wincode")]
+    pub(crate) fn observed_at_or_below(&self, number: u64) -> Observed<'_> {
+        self.ring.iter_at_or_below(number)
     }
 
     /// Applies one poll's batch: total order, dedup, boundary recheck, fork detection.
@@ -182,23 +191,27 @@ impl<F: Fold> Engine<F> {
         }
 
         let mut summary = ApplySummary::default();
-        for span in &batch.spans {
+        for span in batch.spans() {
             let redelivered = self
                 .cursor
-                .is_some_and(|cursor| span.block.number <= cursor.block);
+                .is_some_and(|cursor| span.number <= cursor.block);
             if redelivered
-                && let Some(observed_hash) = self.ring.hash_at(span.block.number)
-                && observed_hash != span.block.hash
+                && let Some(observed_hash) = self.ring.hash_at(span.number)
+                && &observed_hash != span.hash
             {
-                return Err(fork_suspected(span.block.number, observed_hash, span.block));
+                return Err(fork_suspected(span.number, observed_hash, span.block()));
             }
-            self.apply_span(span, batch, &mut summary)?;
+            self.apply_span(&span, &mut summary)?;
         }
 
         Ok(summary)
     }
 
-    /// Stores a checkpoint of the current fold, cursor, and ring.
+    /// Stores a checkpoint of the current fold and cursor.
+    ///
+    /// A slot carries no block history of its own; its window is the engine's ring
+    /// truncated to its cursor, so rollback depth is bounded by ring_capacity and a slot
+    /// expires once its cursor block leaves the window.
     ///
     /// A no-op with zero slots or a non-Active status, so every stored slot holds
     /// state the engine still trusts.
@@ -212,15 +225,17 @@ impl<F: Fold> Engine<F> {
         self.checkpoints.store(Slot {
             fold: self.fold.clone(),
             cursor: self.cursor,
-            ring: self.ring.clone(),
         });
     }
 
-    /// Restores the newest checkpoint whose cursor block is at or below the argument.
+    /// Restores the newest live checkpoint whose cursor block is at or below the argument,
+    /// truncating the ring to that cursor.
+    ///
     /// Clears Halted and Poisoned; drops checkpoints above the argument, the fork
     /// boundary, so checkpoints between it and the restored cursor stay valid.
     /// Freshness resets to None, since the restored cursor is unverified until the
-    /// next boundary check confirms it.
+    /// next boundary check confirms it. Slots whose cursor block has left the observed
+    /// window are expired, so NoCheckpointAtOrBelow also names an exhausted window.
     #[cold]
     pub fn rollback_at_or_below(
         &mut self,
@@ -234,11 +249,14 @@ impl<F: Fold> Engine<F> {
         }
         let slot = self
             .checkpoints
-            .best_at_or_below(block)
+            .best_at_or_below(block, &self.ring)
             .ok_or(RollbackError::NoCheckpointAtOrBelow { block })?;
         self.fold = slot.fold.clone();
         self.cursor = slot.cursor;
-        self.ring = slot.ring.clone();
+        match self.cursor {
+            Some(cursor) => self.ring.truncate_above(cursor.block),
+            None => self.ring.clear(),
+        }
         self.status = EngineStatus::Active;
         self.last_verified = None;
         self.checkpoints.drop_above(block);
@@ -276,62 +294,61 @@ impl<F: Fold> Engine<F> {
     /// Applies every event of one span, deduping positions at or below the cursor.
     fn apply_span(
         &mut self,
-        span: &BlockSpan,
-        batch: &Batch<F::Event>,
+        span: &SpanView<'_, F::Event>,
         summary: &mut ApplySummary,
     ) -> Result<(), ApplyError<F::Error>> {
-        let events = &batch.events[span.start as usize..span.end as usize];
-        let pos = |entry: &LogEvent<F::Event>| {
-            Position::new(span.block.number, entry.log_index)
-        };
+        let number = span.number;
+        let pos = |log_index: u32| Position::new(number, u64::from(log_index));
         let deduped = match self.cursor {
-            Some(cursor) if span.block.number > cursor.block => 0,
-            Some(cursor) if span.block.number < cursor.block => events.len(),
-            Some(cursor) => {
-                events.partition_point(|entry| entry.log_index <= cursor.log_index)
-            }
+            Some(cursor) if number > cursor.block => 0,
+            Some(cursor) if number < cursor.block => span.log_indices.len(),
+            Some(cursor) => span
+                .log_indices
+                .partition_point(|index| u64::from(*index) <= cursor.log_index),
             None => 0,
         };
         summary.deduped += deduped as u64;
-        let fresh = &events[deduped..];
-        let Some(last) = fresh.last() else {
+        // lanes are equal length by construction, so the paired walk drops no event
+        let indices = &span.log_indices[deduped..];
+        let events = &span.events[deduped..];
+        let Some(last) = indices.last() else {
             return Ok(());
         };
 
-        for (index, entry) in fresh.iter().enumerate() {
-            let at = pos(entry);
-            match self.fold.apply(at, &entry.event) {
+        for (offset, (log_index, event)) in indices.iter().zip(events).enumerate() {
+            let at = pos(*log_index);
+            match self.fold.apply(at, event) {
                 Ok(()) => summary.applied += 1,
                 Err(FoldError::Skip(_)) => {
                     self.skips += 1;
                     summary.skipped += 1;
                 }
                 Err(FoldError::Halt(error)) => {
-                    self.consumed_through(span.block, fresh, &pos, index);
+                    self.consumed_through(span, indices, offset);
                     return Err(self.halt(at, error));
                 }
                 Err(FoldError::Poison(error)) => {
-                    self.consumed_through(span.block, fresh, &pos, index);
+                    self.consumed_through(span, indices, offset);
                     return Err(self.poison(at, error));
                 }
             }
         }
-        self.advance(span.block, pos(last));
+        self.advance(span.number, span.hash, pos(*last));
         Ok(())
     }
 
-    /// Places the cursor at the predecessor of `fresh[index]`; a no-op at index 0, since
-    /// nothing in this span was consumed yet.
+    /// Places the cursor at the predecessor of `indices[offset]`; a no-op at offset 0,
+    /// since nothing in this span was consumed yet.
     #[cold]
     fn consumed_through(
         &mut self,
-        block: BlockRef,
-        fresh: &[LogEvent<F::Event>],
-        pos: &impl Fn(&LogEvent<F::Event>) -> Position,
-        index: usize,
+        span: &SpanView<'_, F::Event>,
+        indices: &[u32],
+        offset: usize,
     ) {
-        if let Some(entry) = index.checked_sub(1).and_then(|i| fresh.get(i)) {
-            self.advance(block, pos(entry));
+        if let Some(log_index) = offset.checked_sub(1).and_then(|i| indices.get(i)) {
+            let pos = Position::new(span.number, u64::from(*log_index));
+            self.advance(span.number, span.hash, pos);
         }
     }
 
@@ -339,13 +356,16 @@ impl<F: Fold> Engine<F> {
     ///
     /// Ring and cursor move together, so the ring's newest entry is the cursor block
     /// at every point a batch can return from.
-    #[inline]
-    fn advance(&mut self, block: BlockRef, pos: Position) {
+    fn advance(&mut self, number: u64, hash: &[u8; 32], pos: Position) {
         if self
             .ring
-            .newest()
-            .is_none_or(|newest| newest.number < block.number)
+            .newest_number()
+            .is_none_or(|newest| newest < number)
         {
+            let block = BlockRef {
+                number,
+                hash: *hash,
+            };
             self.ring.push(block);
             self.last_verified = Some(block);
         }
@@ -386,10 +406,7 @@ fn fork_suspected<E>(
 mod tests {
     use super::*;
     use crate::{
-        batch::{
-            BatchShapeError,
-            LogEvent,
-        },
+        batch::BatchShapeError,
         test_util::{
             FailKind,
             RecordingFold,
@@ -415,26 +432,19 @@ mod tests {
 
     fn batch_of(
         boundary: Option<BlockRef>,
-        spans: Vec<(BlockRef, Vec<u64>)>,
+        spans: Vec<(BlockRef, Vec<u32>)>,
     ) -> Batch<u64> {
-        let mut events = Vec::new();
-        let mut built_spans = Vec::new();
+        let mut batch = Batch::new();
+        batch.boundary = boundary;
         for (block, log_indices) in spans {
-            let start = events.len() as u32;
-            for log_index in log_indices {
-                events.push(LogEvent {
-                    log_index,
-                    event: log_index,
-                });
-            }
-            let end = events.len() as u32;
-            built_spans.push(BlockSpan { block, start, end });
+            batch.push_block(
+                block,
+                log_indices
+                    .into_iter()
+                    .map(|index| (index, u64::from(index))),
+            );
         }
-        Batch {
-            boundary,
-            spans: built_spans,
-            events,
-        }
+        batch
     }
 
     fn new_engine() -> Engine<RecordingFold> {
@@ -828,43 +838,15 @@ mod tests {
 
     #[test]
     fn invalid_shape_is_rejected_before_fold_runs() {
-        // given a gap batch
+        // given a batch whose second span moves the block number backwards
         let mut engine = new_engine();
-        let batch = Batch {
-            boundary: None,
-            spans: vec![
-                BlockSpan {
-                    block: block(1, 0),
-                    start: 0,
-                    end: 1,
-                },
-                BlockSpan {
-                    block: block(2, 0),
-                    start: 2,
-                    end: 3,
-                },
-            ],
-            events: vec![
-                LogEvent {
-                    log_index: 0,
-                    event: 0u64,
-                },
-                LogEvent {
-                    log_index: 0,
-                    event: 0u64,
-                },
-                LogEvent {
-                    log_index: 0,
-                    event: 0u64,
-                },
-            ],
-        };
+        let batch = batch_of(None, vec![(block(2, 0), vec![0]), (block(1, 0), vec![0])]);
         // when applied
         let result = engine.apply_batch(&batch);
         // then Shape and the fold recorded nothing
         assert_eq!(
             result,
-            Err(ApplyError::Shape(BatchShapeError::SpansNotContiguous {
+            Err(ApplyError::Shape(BatchShapeError::BlocksNotAscending {
                 span: 1
             }))
         );
@@ -1169,6 +1151,32 @@ mod tests {
         let point = engine.durable_point();
         // then it is block 7, the oldest slot the wraparound left behind
         assert_eq!(point, Some(Position::new(7, 0)));
+    }
+
+    #[test]
+    fn rollback_refuses_a_checkpoint_whose_block_left_the_ring() {
+        // given a checkpoint at block 1, then twelve blocks through a ring holding 8
+        let mut engine = engine_with_checkpoints(2);
+        engine
+            .apply_batch(&batch_of(None, vec![(block(1, 0), vec![0])]))
+            .unwrap();
+        engine.checkpoint();
+        for number in 2..=12u64 {
+            engine
+                .apply_batch(&batch_of(
+                    Some(block(number - 1, 0)),
+                    vec![(block(number, 0), vec![0])],
+                ))
+                .unwrap();
+        }
+        // when rolling back to the expired checkpoint's block
+        let result = engine.rollback_at_or_below(1);
+        // then it is refused rather than restored against a window that cannot serve it
+        assert_eq!(
+            result,
+            Err(RollbackError::NoCheckpointAtOrBelow { block: 1 })
+        );
+        assert_eq!(engine.checkpoint_count(), 0);
     }
 
     #[test]

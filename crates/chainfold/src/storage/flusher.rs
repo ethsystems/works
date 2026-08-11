@@ -112,6 +112,37 @@ impl Admission {
     }
 }
 
+#[repr(align(128))]
+struct Lane<T>(T);
+
+/// State both the apply thread and the flusher thread reach, one allocation per flusher.
+struct Shared {
+    admission: Lane<Admission>,
+    poisoned: Lane<AtomicBool>,
+    durable_cursor: Lane<Mutex<Option<Position>>>,
+}
+
+impl Shared {
+    fn new(queue_depth: usize, cursor: Option<Position>) -> Self {
+        Self {
+            admission: Lane(Admission::new(queue_depth)),
+            poisoned: Lane(AtomicBool::new(false)),
+            durable_cursor: Lane(Mutex::new(cursor)),
+        }
+    }
+
+    fn is_poisoned(&self) -> bool {
+        self.poisoned.0.load(Ordering::Acquire)
+    }
+
+    /// Marks the flusher poisoned and completes the failing job's own token with its error.
+    #[cold]
+    fn poison_and_report(&self, token: &TokenState, error: StoreError) {
+        self.poisoned.0.store(true, Ordering::Release);
+        token.complete(Err(FlushError::from(error)));
+    }
+}
+
 /// Shared cell one durability token waits on.
 #[derive(Default)]
 struct TokenState {
@@ -159,38 +190,30 @@ struct Job {
     snapshot: Vec<u8>,
     cursor: Option<Position>,
     token: Arc<TokenState>,
-    admission: Arc<Admission>,
+    shared: Arc<Shared>,
 }
 
 impl Drop for Job {
     fn drop(&mut self) {
         self.token.complete(Err(FlushError::Closed));
-        self.admission.release();
+        self.shared.admission.0.release();
     }
-}
-
-/// Marks the flusher poisoned and completes the failing job's own token with its error.
-#[cold]
-fn poison_and_report(poisoned: &AtomicBool, token: &TokenState, error: StoreError) {
-    poisoned.store(true, Ordering::Release);
-    token.complete(Err(FlushError::from(error)));
 }
 
 /// Drains jobs until the channel closes, committing each unless already poisoned.
 fn run_flusher<V: Vfs>(
     mut store: SnapshotStore<V>,
     receiver: mpsc::Receiver<Job>,
-    durable_cursor: Arc<Mutex<Option<Position>>>,
-    poisoned: Arc<AtomicBool>,
+    shared: Arc<Shared>,
 ) -> SnapshotStore<V> {
     while let Ok(job) = receiver.recv() {
-        if poisoned.load(Ordering::Acquire) {
+        if shared.is_poisoned() {
             continue;
         }
         match store.commit(&job.snapshot, job.cursor) {
             Ok(()) => {
                 let committed = store.durable_cursor();
-                let mut watermark = lock_recovering(&durable_cursor);
+                let mut watermark = lock_recovering(&shared.durable_cursor.0);
                 // A commit supersedes whatever the store held, so the watermark
                 // tracks it down as well as up and always names what a reopen
                 // recovers. A resync commits older state and lowers it.
@@ -198,7 +221,7 @@ fn run_flusher<V: Vfs>(
                 drop(watermark);
                 job.token.complete(Ok(()));
             }
-            Err(error) => poison_and_report(&poisoned, &job.token, error),
+            Err(error) => shared.poison_and_report(&job.token, error),
         }
     }
     store
@@ -207,9 +230,7 @@ fn run_flusher<V: Vfs>(
 /// Background fsync thread; the commit point is the fsync return, not the write.
 pub struct Flusher<V: Vfs + Send + 'static> {
     sender: mpsc::SyncSender<Job>,
-    admission: Arc<Admission>,
-    durable_cursor: Arc<Mutex<Option<Position>>>,
-    poisoned: Arc<AtomicBool>,
+    shared: Arc<Shared>,
     handle: JoinHandle<SnapshotStore<V>>,
 }
 
@@ -217,19 +238,12 @@ impl<V: Vfs + Send + 'static> Flusher<V> {
     /// Spawns the background fsync thread over an opened store.
     pub fn spawn(store: SnapshotStore<V>, queue_depth: usize) -> Self {
         let (sender, receiver) = mpsc::sync_channel::<Job>(queue_depth);
-        let durable_cursor = Arc::new(Mutex::new(store.durable_cursor()));
-        let poisoned = Arc::new(AtomicBool::new(false));
-        let admission = Arc::new(Admission::new(queue_depth));
-        let thread_cursor = Arc::clone(&durable_cursor);
-        let thread_poisoned = Arc::clone(&poisoned);
-        let handle = thread::spawn(move || {
-            run_flusher(store, receiver, thread_cursor, thread_poisoned)
-        });
+        let shared = Arc::new(Shared::new(queue_depth, store.durable_cursor()));
+        let thread_shared = Arc::clone(&shared);
+        let handle = thread::spawn(move || run_flusher(store, receiver, thread_shared));
         Self {
             sender,
-            admission,
-            durable_cursor,
-            poisoned,
+            shared,
             handle,
         }
     }
@@ -240,16 +254,16 @@ impl<V: Vfs + Send + 'static> Flusher<V> {
         snapshot: Vec<u8>,
         cursor: Option<Position>,
     ) -> Result<DurabilityToken, FlushError> {
-        if self.poisoned.load(Ordering::Acquire) {
+        if self.shared.is_poisoned() {
             return Err(FlushError::Closed);
         }
-        self.admission.acquire();
+        self.shared.admission.0.acquire();
         let token = Arc::new(TokenState::default());
         let job = Job {
             snapshot,
             cursor,
             token: Arc::clone(&token),
-            admission: Arc::clone(&self.admission),
+            shared: Arc::clone(&self.shared),
         };
         if self.sender.send(job).is_err() {
             return Err(FlushError::Closed);
@@ -260,7 +274,7 @@ impl<V: Vfs + Send + 'static> Flusher<V> {
     /// Cursor a reopen of the store would recover; falls when a resync commits
     /// older state.
     pub fn durable_cursor(&self) -> Option<Position> {
-        *lock_recovering(&self.durable_cursor)
+        *lock_recovering(&self.shared.durable_cursor.0)
     }
 
     /// Stops the thread and returns the store; pending jobs complete first.
@@ -312,11 +326,7 @@ mod tests {
         vfs::Vfs,
     };
     use crate::{
-        batch::{
-            Batch,
-            BlockSpan,
-            LogEvent,
-        },
+        batch::Batch,
         engine::{
             Engine,
             EngineConfig,
@@ -357,18 +367,9 @@ mod tests {
     /// Advances the engine by one block carrying a single event.
     fn advance(engine: &mut Engine<RecordingFold>, number: u64) {
         let boundary = number.checked_sub(1).filter(|&n| n > 0).map(block_ref);
-        let batch = Batch {
-            boundary,
-            spans: vec![BlockSpan {
-                block: block_ref(number),
-                start: 0,
-                end: 1,
-            }],
-            events: vec![LogEvent {
-                log_index: 0,
-                event: number,
-            }],
-        };
+        let mut batch = Batch::new();
+        batch.boundary = boundary;
+        batch.push_block(block_ref(number), [(0u32, number)]);
         engine.apply_batch(&batch).unwrap();
     }
 

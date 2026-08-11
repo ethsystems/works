@@ -4,10 +4,8 @@
 use chainfold::{
     Batch,
     BlockRef,
-    BlockSpan,
     Engine,
     EngineConfig,
-    LogEvent,
     test_util::RecordingFold,
 };
 use proptest::prelude::*;
@@ -36,22 +34,12 @@ fn apply_block(engine: &mut Engine<RecordingFold>, number: u64, event_count: usi
         return;
     }
     let boundary = engine.cursor().map(|cursor| block_ref(cursor.block));
-    let events: Vec<LogEvent<u64>> = (0..event_count as u64)
-        .map(|log_index| LogEvent {
-            log_index,
-            event: log_index,
-        })
-        .collect();
-    let end = events.len() as u32;
-    let batch = Batch {
-        boundary,
-        spans: vec![BlockSpan {
-            block: block_ref(number),
-            start: 0,
-            end,
-        }],
-        events,
-    };
+    let mut batch = Batch::new();
+    batch.boundary = boundary;
+    batch.push_block(
+        block_ref(number),
+        (0..event_count as u32).map(|log_index| (log_index, u64::from(log_index))),
+    );
     engine.apply_batch(&batch).unwrap();
 }
 

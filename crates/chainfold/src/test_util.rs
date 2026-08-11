@@ -8,11 +8,7 @@ use std::vec::Vec;
 use core::fmt;
 
 use crate::{
-    batch::{
-        Batch,
-        BlockSpan,
-        LogEvent,
-    },
+    batch::Batch,
     engine::Engine,
     error::{
         DurabilityLost,
@@ -101,38 +97,19 @@ impl crate::snapshot::Persist for RecordingFold {
     }
 
     fn decode_state(bytes: &[u8]) -> Result<Self, Self::PersistError> {
-        const COUNT_LEN: usize = 8;
         const ENTRY_LEN: usize = 24;
-        if bytes.len() < COUNT_LEN {
+        let (count, entries) = bytes.split_first_chunk::<8>().ok_or(())?;
+        let count = usize::try_from(u64::from_le_bytes(*count)).map_err(|_| ())?;
+        if entries.len() != count.checked_mul(ENTRY_LEN).ok_or(())? {
             return Err(());
         }
-        let count_bytes: [u8; COUNT_LEN] =
-            bytes[..COUNT_LEN].try_into().map_err(|_| ())?;
-        let count = usize::try_from(u64::from_le_bytes(count_bytes)).map_err(|_| ())?;
-        let entries_len = count.checked_mul(ENTRY_LEN).ok_or(())?;
-        let total_len = COUNT_LEN.checked_add(entries_len).ok_or(())?;
-        if bytes.len() != total_len {
-            return Err(());
-        }
-        let mut applied = Vec::with_capacity(count);
-        let mut offset = COUNT_LEN;
-        for _ in 0..count {
-            let block_end = offset.checked_add(8).ok_or(())?;
-            let log_index_end = block_end.checked_add(8).ok_or(())?;
-            let event_end = log_index_end.checked_add(8).ok_or(())?;
-            let block =
-                u64::from_le_bytes(bytes[offset..block_end].try_into().map_err(|_| ())?);
-            let log_index = u64::from_le_bytes(
-                bytes[block_end..log_index_end].try_into().map_err(|_| ())?,
-            );
-            let event = u64::from_le_bytes(
-                bytes[log_index_end..event_end].try_into().map_err(|_| ())?,
-            );
-            applied.push((Position::new(block, log_index), event));
-            offset = event_end;
-        }
+        // The length check above makes every chunk exactly three 8-byte lanes.
+        let lane = |e: &[u8], i: usize| {
+            u64::from_le_bytes(e[i * 8..][..8].try_into().expect("three lanes"))
+        };
+        let entry = |e: &[u8]| (Position::new(lane(e, 0), lane(e, 1)), lane(e, 2));
         Ok(Self {
-            applied,
+            applied: entries.chunks_exact(ENTRY_LEN).map(entry).collect(),
             fail_at: None,
         })
     }
@@ -353,23 +330,15 @@ impl EventSource for ScriptedChain {
             if served >= self.batch_blocks {
                 break;
             }
-            let start = u32::try_from(out.events.len()).expect("event count fits in u32");
-            for (log_index, event) in block.events.iter().enumerate() {
-                let log_index = u64::try_from(log_index).expect("log index fits in u64");
-                out.events.push(LogEvent {
-                    log_index,
-                    event: *event,
-                });
-            }
-            let end = u32::try_from(out.events.len()).expect("event count fits in u32");
-            out.spans.push(BlockSpan {
-                block: BlockRef {
+            out.push_block(
+                BlockRef {
                     number: block.number,
                     hash: block.hash,
                 },
-                start,
-                end,
-            });
+                block.events.iter().enumerate().map(|(index, event)| {
+                    (u32::try_from(index).expect("log index fits in u32"), *event)
+                }),
+            );
             served += 1;
         }
         Ok(())
@@ -479,6 +448,28 @@ impl CrashVfs {
         }
     }
 
+    /// Consumes budget and reports how much of a `len`-byte effect this call keeps.
+    fn torn_write(&mut self, len: usize) -> (bool, usize) {
+        let crashing = self.consume_budget();
+        (
+            crashing,
+            if crashing {
+                len.min(self.torn_len)
+            } else {
+                len
+            },
+        )
+    }
+
+    /// Maps a crash flag onto the io result every mutating op returns.
+    fn outcome(crashing: bool) -> io::Result<()> {
+        if crashing {
+            Err(crash_budget_error())
+        } else {
+            Ok(())
+        }
+    }
+
     /// Resolves the inode a write targets, allocating a fresh one for a new name.
     fn inode_for_write(&mut self, path: &Path) -> u64 {
         if let Some(&inode) = self.volatile_names.get(path) {
@@ -510,47 +501,29 @@ impl Vfs for CrashVfs {
 
     fn write(&mut self, path: &Path, bytes: &[u8]) -> io::Result<()> {
         let inode = self.inode_for_write(path);
-        let crashing = self.consume_budget();
-        let keep = if crashing {
-            bytes.len().min(self.torn_len)
-        } else {
-            bytes.len()
-        };
+        let (crashing, keep) = self.torn_write(bytes.len());
         self.files
             .get_mut(&inode)
             .expect("write always registers its inode first")
             .volatile = bytes[..keep].to_vec();
-        if crashing {
-            Err(crash_budget_error())
-        } else {
-            Ok(())
-        }
+        Self::outcome(crashing)
     }
 
     fn write_at(&mut self, path: &Path, offset: u64, bytes: &[u8]) -> io::Result<()> {
         let inode = self.inode_for_write(path);
-        let crashing = self.consume_budget();
-        let apply_len = if crashing {
-            bytes.len().min(self.torn_len)
-        } else {
-            bytes.len()
-        };
+        let (crashing, keep) = self.torn_write(bytes.len());
         let offset =
             usize::try_from(offset).expect("offset fits in memory on this platform");
         let file = self
             .files
             .get_mut(&inode)
             .expect("write_at always registers its inode first");
-        let needed = offset + apply_len;
+        let needed = offset + keep;
         if file.volatile.len() < needed {
             file.volatile.resize(needed, 0);
         }
-        file.volatile[offset..offset + apply_len].copy_from_slice(&bytes[..apply_len]);
-        if crashing {
-            Err(crash_budget_error())
-        } else {
-            Ok(())
-        }
+        file.volatile[offset..needed].copy_from_slice(&bytes[..keep]);
+        Self::outcome(crashing)
     }
 
     fn fsync_file(&mut self, path: &Path) -> io::Result<()> {
@@ -558,26 +531,17 @@ impl Vfs for CrashVfs {
             .volatile_names
             .get(path)
             .ok_or_else(crash_not_found_error)?;
-        let crashing = self.consume_budget();
+        let target_len = self.files[&inode].volatile.len();
+        let (crashing, keep) = self.torn_write(target_len);
         let file = self
             .files
             .get_mut(&inode)
             .expect("fsync_file always resolves a registered inode");
-        let target_len = file.volatile.len();
         if file.durable.len() < target_len {
             file.durable.resize(target_len, 0);
         }
-        let keep = if crashing {
-            self.torn_len.min(target_len)
-        } else {
-            target_len
-        };
         file.durable[..keep].copy_from_slice(&file.volatile[..keep]);
-        if crashing {
-            Err(crash_budget_error())
-        } else {
-            Ok(())
-        }
+        Self::outcome(crashing)
     }
 
     fn rename(&mut self, from: &Path, to: &Path) -> io::Result<()> {
@@ -586,13 +550,9 @@ impl Vfs for CrashVfs {
             .remove(from)
             .ok_or_else(crash_not_found_error)?;
         let crashing = self.consume_budget();
-        if crashing {
-            self.volatile_names.insert(from.to_path_buf(), inode);
-            Err(crash_budget_error())
-        } else {
-            self.volatile_names.insert(to.to_path_buf(), inode);
-            Ok(())
-        }
+        let name = if crashing { from } else { to };
+        self.volatile_names.insert(name.to_path_buf(), inode);
+        Self::outcome(crashing)
     }
 
     fn remove(&mut self, path: &Path) -> io::Result<()> {
@@ -603,10 +563,8 @@ impl Vfs for CrashVfs {
         let crashing = self.consume_budget();
         if crashing {
             self.volatile_names.insert(path.to_path_buf(), inode);
-            Err(crash_budget_error())
-        } else {
-            Ok(())
         }
+        Self::outcome(crashing)
     }
 
     fn list(&mut self, dir: &Path) -> io::Result<Vec<PathBuf>> {
@@ -744,9 +702,10 @@ mod tests {
         // when polled
         chain.next_batch(Some(cursor), &mut batch).unwrap();
         // then one span for block 9 with the complete event set
-        assert_eq!(batch.spans.len(), 1);
-        assert_eq!(batch.spans[0].block.number, 9);
-        let events: Vec<u64> = batch.events.iter().map(|entry| entry.event).collect();
+        assert_eq!(batch.span_count(), 1);
+        let span = batch.spans().next().expect("one span");
+        assert_eq!(span.number, 9);
+        let events: Vec<u64> = span.events.to_vec();
         assert_eq!(events, vec![30, 31]);
     }
 
@@ -795,7 +754,7 @@ mod tests {
         // when polled
         chain.next_batch(None, &mut batch).unwrap();
         // then two spans
-        assert_eq!(batch.spans.len(), 2);
+        assert_eq!(batch.span_count(), 2);
     }
 
     #[test]
@@ -809,7 +768,7 @@ mod tests {
         // when polled
         chain.next_batch(Some(tip), &mut batch).unwrap();
         // then no spans
-        assert!(batch.spans.is_empty());
+        assert!(batch.is_empty());
     }
 
     #[test]

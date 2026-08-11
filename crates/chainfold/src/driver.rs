@@ -49,6 +49,11 @@ const DEFAULT_BACKOFF_MAX: Duration = Duration::from_secs(30);
 /// Default anchor divergence rollbacks tolerated before the typed terminal state.
 const DEFAULT_MAX_DIVERGENCE_RETRIES: u32 = 1;
 
+/// True when `block` has reached the next interval step past the last marked block.
+fn due(last: Option<u64>, block: u64, interval: u64) -> bool {
+    last.is_none_or(|last| block >= last.saturating_add(interval))
+}
+
 /// Poll loop state machine a harness drives; owns cadence, backoff, recovery.
 pub trait Tickable {
     /// Advances the loop by one poll, apply, and recovery step.
@@ -128,9 +133,7 @@ pub struct DriverConfig {
     /// nothing. None means caller-driven only.
     pub checkpoint_interval: Option<u64>,
     /// Blocks of durable-point progress between snapshot offers; None disables
-    /// offers. The durability margin of an offered snapshot is checkpoint coverage,
-    /// checkpoint_slots * checkpoint_interval blocks; size both for the deepest
-    /// reorg the fold must survive without a resync.
+    /// offers.
     pub snapshot_interval: Option<u64>,
     /// Anchor divergence rollbacks tolerated before the typed terminal state.
     pub max_divergence_retries: u32,
@@ -365,10 +368,11 @@ where
     fn auto_checkpoint(&mut self) -> Option<Tick> {
         let interval = self.config.checkpoint_interval?;
         let cursor = self.engine.cursor()?;
-        let due = self
-            .last_checkpoint_block
-            .is_none_or(|last| cursor.block >= last.saturating_add(interval));
-        if due { self.run_checkpoint() } else { None }
+        if due(self.last_checkpoint_block, cursor.block, interval) {
+            self.run_checkpoint()
+        } else {
+            None
+        }
     }
 
     /// Stores a checkpoint, records its block, then runs the anchor check.
@@ -387,10 +391,7 @@ where
         }
         let interval = self.config.snapshot_interval?;
         let point = self.engine.durable_point()?;
-        let due = self
-            .last_snapshot_block
-            .is_none_or(|last| point.block >= last.saturating_add(interval));
-        if !due {
+        if !due(self.last_snapshot_block, point.block, interval) {
             return None;
         }
         match self.sink.offer(&self.engine) {
@@ -778,18 +779,12 @@ mod tests {
         vec::Vec,
     };
 
-    use crate::{
-        batch::{
-            BlockSpan,
-            LogEvent,
-        },
-        test_util::{
-            FailKind,
-            PollFailure,
-            RecordingFold,
-            ScriptedChain,
-            WatermarkSink,
-        },
+    use crate::test_util::{
+        FailKind,
+        PollFailure,
+        RecordingFold,
+        ScriptedChain,
+        WatermarkSink,
     };
 
     /// Wraps a scripted chain, counting probes and optionally failing the next few.
@@ -857,15 +852,7 @@ mod tests {
         ) -> Result<(), PollFailure> {
             out.clear();
             out.boundary = cursor.map(|_| self.block);
-            out.spans.push(BlockSpan {
-                block: self.block,
-                start: 0,
-                end: 1,
-            });
-            out.events.push(LogEvent {
-                log_index: 0,
-                event: 1,
-            });
+            out.push_block(self.block, [(0u32, 1u64)]);
             Ok(())
         }
 
@@ -1341,11 +1328,35 @@ mod tests {
             checkpoint_interval: Some(4),
             ..DriverConfig::default()
         };
-        let mut driver = new_driver(chain, engine_config(8), config);
+        let engine = EngineConfig {
+            ring_capacity: 16,
+            checkpoint_slots: 8,
+        };
+        let mut driver = new_driver(chain, engine, config);
         // when driven to the tip
         run_to_idle(&mut driver);
         // then checkpoint_count is at least 3
         assert!(driver.engine().checkpoint_count() >= 3);
+    }
+
+    #[test]
+    fn checkpoints_expire_once_their_block_leaves_the_ring() {
+        // given checkpoint_interval 4 over twelve blocks with a ring holding only 8
+        let mut chain = ScriptedChain::new(1);
+        for value in 1..=12u64 {
+            chain.push_block(&[value]);
+        }
+        chain.set_batch_blocks(1);
+        let config = DriverConfig {
+            checkpoint_interval: Some(4),
+            ..DriverConfig::default()
+        };
+        let mut driver = new_driver(chain, engine_config(8), config);
+        // when driven to the tip, leaving the block 4 checkpoint outside the window
+        run_to_idle(&mut driver);
+        // then only the checkpoints the ring still observes are retained
+        assert_eq!(driver.engine().checkpoint_count(), 2);
+        assert_eq!(driver.engine().durable_point(), Some(Position::new(5, 0)));
     }
 
     #[test]

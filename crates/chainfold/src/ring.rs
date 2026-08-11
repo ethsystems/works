@@ -9,8 +9,6 @@ use std::{
     vec,
 };
 
-use core::cmp::Ordering;
-
 use crate::position::BlockRef;
 
 /// Bounded history of observed blocks, structure of arrays, power-of-two capacity.
@@ -43,11 +41,6 @@ impl BlockRing {
     }
 
     #[inline]
-    pub(crate) fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-
-    #[inline]
     fn physical(&self, logical: usize) -> usize {
         (self.head + logical) & (self.capacity() - 1)
     }
@@ -68,13 +61,11 @@ impl BlockRing {
         }
     }
 
+    /// Number of the newest entry, without reading the hash lane.
     #[inline]
-    pub(crate) fn newest(&self) -> Option<BlockRef> {
-        if self.is_empty() {
-            None
-        } else {
-            Some(self.get(self.len - 1))
-        }
+    pub(crate) fn newest_number(&self) -> Option<u64> {
+        let newest = self.len.checked_sub(1)?;
+        Some(self.numbers[self.physical(newest)])
     }
 
     /// Oldest-first access; index must be below len.
@@ -89,18 +80,57 @@ impl BlockRing {
 
     /// Hash for an exact number if still observed.
     pub(crate) fn hash_at(&self, number: u64) -> Option<[u8; 32]> {
+        let logical = self.index_of(number)?;
+        Some(self.hashes[self.physical(logical)])
+    }
+
+    /// Logical index of an exact number.
+    ///
+    /// Numbers ascend by at least one per entry, so the tip-relative guess is the
+    /// highest index the number can sit at; a gapped chain falls back to the search.
+    fn index_of(&self, number: u64) -> Option<usize> {
+        let newest = self.len.checked_sub(1)?;
+        let behind = self.numbers[self.physical(newest)].checked_sub(number)?;
+        let guess = usize::try_from(behind)
+            .ok()
+            .and_then(|behind| newest.checked_sub(behind))
+            .unwrap_or(0);
+        if self.numbers[self.physical(guess)] == number {
+            return Some(guess);
+        }
+        let logical = self.index_at_or_below(number)?;
+        (self.numbers[self.physical(logical)] == number).then_some(logical)
+    }
+
+    /// Drops entries with a number strictly above the argument.
+    #[cold]
+    pub(crate) fn truncate_above(&mut self, number: u64) {
+        self.len = match self.index_at_or_below(number) {
+            Some(logical) => logical + 1,
+            None => 0,
+        };
+        if self.len == 0 {
+            self.head = 0;
+        }
+    }
+
+    /// Logical index of the newest entry at or below the argument.
+    fn index_at_or_below(&self, number: u64) -> Option<usize> {
+        let newest = self.len.checked_sub(1)?;
+        if self.numbers[self.physical(newest)] <= number {
+            return Some(newest);
+        }
         let mut low = 0usize;
-        let mut high = self.len;
+        let mut high = newest;
         while low < high {
-            let mid = low + (high - low) / 2;
-            let physical = self.physical(mid);
-            match self.numbers[physical].cmp(&number) {
-                Ordering::Less => low = mid + 1,
-                Ordering::Equal => return Some(self.hashes[physical]),
-                Ordering::Greater => high = mid,
+            let mid = low + (high - low).div_ceil(2);
+            if self.numbers[self.physical(mid)] <= number {
+                low = mid;
+            } else {
+                high = mid - 1;
             }
         }
-        None
+        (self.numbers[self.physical(low)] <= number).then_some(low)
     }
 
     /// Empties the ring, keeping the allocation; stale slots stay unreachable below len.
@@ -115,6 +145,23 @@ impl BlockRing {
             next: 0,
             remaining: self.len,
         }
+    }
+
+    /// Oldest-first iterator over the entries at or below the argument.
+    #[cfg(any(feature = "wincode", test))]
+    pub(crate) fn iter_at_or_below(&self, number: u64) -> Observed<'_> {
+        Observed {
+            ring: self,
+            next: 0,
+            remaining: self
+                .index_at_or_below(number)
+                .map_or(0, |logical| logical + 1),
+        }
+    }
+
+    /// True when the exact number is still observed.
+    pub(crate) fn observes(&self, number: u64) -> bool {
+        self.index_of(number).is_some()
     }
 }
 
@@ -143,11 +190,7 @@ impl<'a> Iterator for Observed<'a> {
     }
 }
 
-impl<'a> ExactSizeIterator for Observed<'a> {
-    fn len(&self) -> usize {
-        self.remaining
-    }
-}
+impl ExactSizeIterator for Observed<'_> {}
 
 #[cfg(test)]
 mod tests {
@@ -178,7 +221,7 @@ mod tests {
         ring.push(block(2));
         ring.push(block(3));
         // when reading newest
-        let newest = ring.newest();
+        let newest = ring.iter().last();
         // then the last push returns
         assert_eq!(newest, Some(block(3)));
     }
@@ -211,6 +254,100 @@ mod tests {
     }
 
     #[test]
+    fn hash_at_finds_numbers_across_a_gapped_ring() {
+        // given a ring whose numbers skip, defeating the tip-relative guess
+        let mut ring = BlockRing::with_capacity(8);
+        for number in [1u64, 2, 5, 9, 10, 40] {
+            ring.push(block(number));
+        }
+        // when querying each stored number and two absent ones
+        let found: Vec<Option<[u8; 32]>> = [1u64, 2, 5, 9, 10, 40, 3, 39]
+            .iter()
+            .map(|n| ring.hash_at(*n))
+            .collect();
+        // then every stored number resolves and the gaps stay absent
+        assert_eq!(
+            found[..6],
+            [1u64, 2, 5, 9, 10, 40].map(|n| Some(block(n).hash))
+        );
+        assert_eq!(found[6], None);
+        assert_eq!(found[7], None);
+    }
+
+    #[test]
+    fn hash_at_rejects_numbers_above_the_tip() {
+        // given a ring topping out at block 3
+        let mut ring = BlockRing::with_capacity(4);
+        for number in 1..=3 {
+            ring.push(block(number));
+        }
+        // when querying above the tip and on an empty ring
+        let above = ring.hash_at(4);
+        let empty = BlockRing::with_capacity(4).hash_at(1);
+        // then both are absent
+        assert_eq!(above, None);
+        assert_eq!(empty, None);
+    }
+
+    #[test]
+    fn truncate_above_keeps_the_prefix_at_or_below() {
+        // given a wrapped ring holding blocks 3 through 6
+        let mut ring = BlockRing::with_capacity(4);
+        for number in 1..=6 {
+            ring.push(block(number));
+        }
+        // when truncating above block 4
+        ring.truncate_above(4);
+        // then only blocks 3 and 4 remain, newest first at 4
+        assert_eq!(ring.iter().collect::<Vec<_>>(), vec![block(3), block(4)]);
+        assert_eq!(ring.iter().last(), Some(block(4)));
+    }
+
+    #[test]
+    fn truncate_above_empties_when_every_entry_is_higher() {
+        // given a ring holding blocks 3 through 6
+        let mut ring = BlockRing::with_capacity(4);
+        for number in 1..=6 {
+            ring.push(block(number));
+        }
+        // when truncating below everything observed
+        ring.truncate_above(2);
+        // then the ring is empty and accepts pushes again
+        assert_eq!(ring.iter().len(), 0);
+        ring.push(block(9));
+        assert_eq!(ring.iter().last(), Some(block(9)));
+    }
+
+    #[test]
+    fn iter_at_or_below_yields_the_matching_prefix() {
+        // given a gapped ring
+        let mut ring = BlockRing::with_capacity(8);
+        for number in [2u64, 4, 7, 11] {
+            ring.push(block(number));
+        }
+        // when iterating at or below a number between entries
+        let prefix: Vec<BlockRef> = ring.iter_at_or_below(9).collect();
+        // then the entries up to and including 7 appear, oldest first
+        assert_eq!(prefix, vec![block(2), block(4), block(7)]);
+        assert_eq!(ring.iter_at_or_below(1).count(), 0);
+    }
+
+    #[test]
+    fn observes_reports_exact_membership() {
+        // given a ring holding blocks 3 through 6
+        let mut ring = BlockRing::with_capacity(4);
+        for number in 1..=6 {
+            ring.push(block(number));
+        }
+        // when asking about a retained and an evicted number
+        let retained = ring.observes(4);
+        let evicted = ring.observes(2);
+        // then only the retained one is observed
+        assert!(retained);
+        assert!(!evicted);
+    }
+
+    #[test]
     fn clone_is_independent() {
         // given a cloned ring
         let mut ring = BlockRing::with_capacity(4);
@@ -219,7 +356,7 @@ mod tests {
         // when pushing to the original
         ring.push(block(2));
         // then the clone is unchanged
-        assert_eq!(clone.newest(), Some(block(1)));
-        assert_eq!(ring.newest(), Some(block(2)));
+        assert_eq!(clone.iter().last(), Some(block(1)));
+        assert_eq!(ring.iter().last(), Some(block(2)));
     }
 }

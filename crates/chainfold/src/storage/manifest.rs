@@ -40,27 +40,37 @@ pub(crate) struct SlotRecord {
     pub(crate) snapshot_id: u64,
 }
 
-/// Splits a cursor into its slot flag and fields.
-fn cursor_flag_and_fields(cursor: Option<Position>) -> (u8, u64, u64) {
-    match cursor {
-        Some(pos) => (1, pos.block, pos.log_index),
-        None => (0, 0, 0),
-    }
+/// Writes a little-endian u64 field at a fixed offset within a slot.
+#[inline]
+fn put_u64(bytes: &mut [u8; SLOT_SIZE], offset: usize, value: u64) {
+    bytes[offset..offset + U64_LEN].copy_from_slice(&value.to_le_bytes());
+}
+
+/// Reads a little-endian u64 field at a fixed offset within a full-size slot.
+#[inline]
+fn get_u64(bytes: &[u8], offset: usize) -> u64 {
+    let field: [u8; U64_LEN] = bytes[offset..offset + U64_LEN]
+        .try_into()
+        .expect("slot is fixed size and every u64 field fits inside it");
+    u64::from_le_bytes(field)
 }
 
 /// Encodes a slot into its fixed layout with a CRC32C trailer over bytes `0..60`.
 pub(crate) fn encode_slot(record: &SlotRecord) -> [u8; SLOT_SIZE] {
     let mut bytes = [0u8; SLOT_SIZE];
-    bytes[VERSION_OFFSET..VERSION_OFFSET + U64_LEN]
-        .copy_from_slice(&record.version.to_le_bytes());
-    let (flag, block, log_index) = cursor_flag_and_fields(record.cursor);
-    bytes[CURSOR_FLAG_OFFSET] = flag;
-    bytes[CURSOR_BLOCK_OFFSET..CURSOR_BLOCK_OFFSET + U64_LEN]
-        .copy_from_slice(&block.to_le_bytes());
-    bytes[CURSOR_LOG_INDEX_OFFSET..CURSOR_LOG_INDEX_OFFSET + U64_LEN]
-        .copy_from_slice(&log_index.to_le_bytes());
-    bytes[SNAPSHOT_ID_OFFSET..SNAPSHOT_ID_OFFSET + U64_LEN]
-        .copy_from_slice(&record.snapshot_id.to_le_bytes());
+    put_u64(&mut bytes, VERSION_OFFSET, record.version);
+    bytes[CURSOR_FLAG_OFFSET] = u8::from(record.cursor.is_some());
+    put_u64(
+        &mut bytes,
+        CURSOR_BLOCK_OFFSET,
+        record.cursor.map_or(0, |pos| pos.block),
+    );
+    put_u64(
+        &mut bytes,
+        CURSOR_LOG_INDEX_OFFSET,
+        record.cursor.map_or(0, |pos| pos.log_index),
+    );
+    put_u64(&mut bytes, SNAPSHOT_ID_OFFSET, record.snapshot_id);
     let crc = crc32c(&bytes[..CRC_COVERED_LEN]);
     bytes[CRC_OFFSET..CRC_OFFSET + CRC_LEN].copy_from_slice(&crc.to_le_bytes());
     bytes
@@ -71,44 +81,24 @@ pub(crate) fn decode_slot(bytes: &[u8]) -> Option<SlotRecord> {
     if bytes.len() != SLOT_SIZE {
         return None;
     }
-    let expected_crc = u32::from_le_bytes(
-        bytes[CRC_OFFSET..CRC_OFFSET + CRC_LEN]
-            .try_into()
-            .expect("slice length matches the CRC field width"),
-    );
-    let computed_crc = crc32c(&bytes[..CRC_COVERED_LEN]);
-    if computed_crc != expected_crc {
+    let stored: [u8; CRC_LEN] = bytes[CRC_OFFSET..CRC_OFFSET + CRC_LEN]
+        .try_into()
+        .expect("slice length matches the CRC field width");
+    if crc32c(&bytes[..CRC_COVERED_LEN]) != u32::from_le_bytes(stored) {
         return None;
     }
-    let version = u64::from_le_bytes(
-        bytes[VERSION_OFFSET..VERSION_OFFSET + U64_LEN]
-            .try_into()
-            .expect("slice length matches a u64 field width"),
-    );
-    let block = u64::from_le_bytes(
-        bytes[CURSOR_BLOCK_OFFSET..CURSOR_BLOCK_OFFSET + U64_LEN]
-            .try_into()
-            .expect("slice length matches a u64 field width"),
-    );
-    let log_index = u64::from_le_bytes(
-        bytes[CURSOR_LOG_INDEX_OFFSET..CURSOR_LOG_INDEX_OFFSET + U64_LEN]
-            .try_into()
-            .expect("slice length matches a u64 field width"),
-    );
     let cursor = match bytes[CURSOR_FLAG_OFFSET] {
         0 => None,
-        1 => Some(Position::new(block, log_index)),
+        1 => Some(Position::new(
+            get_u64(bytes, CURSOR_BLOCK_OFFSET),
+            get_u64(bytes, CURSOR_LOG_INDEX_OFFSET),
+        )),
         _ => return None,
     };
-    let snapshot_id = u64::from_le_bytes(
-        bytes[SNAPSHOT_ID_OFFSET..SNAPSHOT_ID_OFFSET + U64_LEN]
-            .try_into()
-            .expect("slice length matches a u64 field width"),
-    );
     Some(SlotRecord {
-        version,
+        version: get_u64(bytes, VERSION_OFFSET),
         cursor,
-        snapshot_id,
+        snapshot_id: get_u64(bytes, SNAPSHOT_ID_OFFSET),
     })
 }
 

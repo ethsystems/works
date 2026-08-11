@@ -7,35 +7,39 @@ use core::fmt;
 
 use crate::position::BlockRef;
 
-/// One event with its log index; the block number lives on the owning span.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LogEvent<E> {
-    /// Index of the log within its block.
-    pub log_index: u64,
-    /// Consumer event decoded from the log.
-    pub event: E,
+/// One block's events within a batch.
+#[derive(Debug)]
+pub struct SpanView<'a, E> {
+    /// Number of the block the events belong to.
+    pub number: u64,
+    /// Hash of the block the events belong to.
+    pub hash: &'a [u8; 32],
+    /// Log index of each event within the block, strictly ascending.
+    pub log_indices: &'a [u32],
+    /// Consumer events, parallel to `log_indices`.
+    pub events: &'a [E],
 }
 
-/// Half-open range of events belonging to one observed block.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct BlockSpan {
-    /// Block the events belong to.
-    pub block: BlockRef,
-    /// First event index in the batch's event array.
-    pub start: u32,
-    /// One past the last event index in the batch's event array.
-    pub end: u32,
+impl<E> SpanView<'_, E> {
+    /// Owned header of the span's block.
+    pub fn block(&self) -> BlockRef {
+        BlockRef {
+            number: self.number,
+            hash: *self.hash,
+        }
+    }
 }
 
-/// One poll's worth of events in flat layout, reusable across polls.
+/// One poll's worth of events
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Batch<E> {
     /// Refetched header of the cursor block; None means the source could not produce it.
     pub boundary: Option<BlockRef>,
-    /// One span per observed block, ascending, each covering a contiguous event range.
-    pub spans: Vec<BlockSpan>,
-    /// Every event of the batch, ordered by block then log index.
-    pub events: Vec<LogEvent<E>>,
+    blocks: Vec<u64>,
+    hashes: Vec<[u8; 32]>,
+    ends: Vec<usize>,
+    log_indices: Vec<u32>,
+    events: Vec<E>,
 }
 
 impl<E> Batch<E> {
@@ -43,68 +47,136 @@ impl<E> Batch<E> {
     pub fn new() -> Self {
         Self {
             boundary: None,
-            spans: Vec::new(),
+            blocks: Vec::new(),
+            hashes: Vec::new(),
+            ends: Vec::new(),
+            log_indices: Vec::new(),
             events: Vec::new(),
         }
     }
 
-    /// Empties spans, events, and boundary while keeping capacity.
+    /// Empties every lane and the boundary while keeping capacity.
     pub fn clear(&mut self) {
         self.boundary = None;
-        self.spans.clear();
+        self.blocks.clear();
+        self.hashes.clear();
+        self.ends.clear();
+        self.log_indices.clear();
         self.events.clear();
     }
 
     /// True when the batch carries no spans.
     pub fn is_empty(&self) -> bool {
-        self.spans.is_empty()
+        self.ends.is_empty()
     }
 
-    /// Validates the flat batch shape against the rules of record.
-    pub fn validate(&self) -> Result<(), BatchShapeError> {
-        if u32::try_from(self.events.len()).is_err() {
-            return Err(BatchShapeError::TooManyEvents {
-                len: self.events.len(),
-            });
+    /// Spans the batch carries, one per observed block.
+    pub fn span_count(&self) -> usize {
+        self.ends.len()
+    }
+
+    /// Appends one block's complete event set in log order.
+    pub fn push_block(
+        &mut self,
+        block: BlockRef,
+        events: impl IntoIterator<Item = (u32, E)>,
+    ) {
+        self.blocks.push(block.number);
+        self.hashes.push(block.hash);
+        for (log_index, event) in events {
+            self.log_indices.push(log_index);
+            self.events.push(event);
         }
-        let mut previous: Option<&BlockSpan> = None;
-        for (span_index, span) in self.spans.iter().enumerate() {
-            if span.start >= span.end || span.end as usize > self.events.len() {
-                return Err(BatchShapeError::SpanBoundsInvalid { span: span_index });
+        self.ends.push(self.events.len());
+    }
+
+    /// Iterates spans oldest first with their event slices.
+    pub fn spans(&self) -> Spans<'_, E> {
+        Spans {
+            batch: self,
+            next: 0,
+            start: 0,
+        }
+    }
+
+    /// Validates the orderings a source controls, before any event reaches the fold.
+    pub fn validate(&self) -> Result<(), BatchShapeError> {
+        if let Some(span) = first_descent(&self.blocks) {
+            return Err(BatchShapeError::BlocksNotAscending { span });
+        }
+        let mut start = 0usize;
+        for (span, end) in self.ends.iter().copied().enumerate() {
+            if end <= start {
+                return Err(BatchShapeError::SpanEmpty { span });
             }
-            if span.start != previous.map_or(0, |previous| previous.end) {
-                return Err(BatchShapeError::SpansNotContiguous { span: span_index });
-            }
-            if previous.is_some_and(|previous| span.block.number <= previous.block.number)
-            {
-                return Err(BatchShapeError::BlocksNotAscending { span: span_index });
-            }
-            let events = &self.events[span.start as usize..span.end as usize];
-            let ascending = events
-                .iter()
-                .zip(&events[1..])
-                .fold(true, |acc, (a, b)| acc & (a.log_index < b.log_index));
-            if !ascending {
-                let offset = events
-                    .windows(2)
-                    .position(|pair| pair[1].log_index <= pair[0].log_index)
-                    .expect("a failed ascending sweep always has a locatable pair");
+            if let Some(offset) = first_descent(&self.log_indices[start..end]) {
                 return Err(BatchShapeError::LogIndexNotAscending {
-                    span: span_index,
-                    #[allow(clippy::cast_possible_truncation)]
-                    index: span.start + 1 + offset as u32,
+                    span,
+                    index: start + offset,
                 });
             }
-            previous = Some(span);
-        }
-        if previous.map_or(0, |span| span.end) as usize != self.events.len() {
-            return Err(BatchShapeError::SpansNotContiguous {
-                span: self.spans.len().saturating_sub(1),
-            });
+            start = end;
         }
         Ok(())
     }
 }
+
+/// Index of the first element that does not exceed its predecessor.
+///
+/// The sweep is branchless so it vectorizes; the cold locate pass runs only on failure.
+pub(crate) fn first_descent<T: Ord>(values: &[T]) -> Option<usize> {
+    let tail = values.get(1..).unwrap_or_default();
+    let ascending = values
+        .iter()
+        .zip(tail)
+        .fold(true, |acc, (a, b)| acc & (a < b));
+    if ascending {
+        return None;
+    }
+    locate_descent(values)
+}
+
+#[cold]
+fn locate_descent<T: Ord>(values: &[T]) -> Option<usize> {
+    values
+        .windows(2)
+        .position(|pair| pair[1] <= pair[0])
+        .map(|offset| offset + 1)
+}
+
+/// Oldest-first iterator over a batch's spans.
+#[derive(Debug)]
+pub struct Spans<'a, E> {
+    batch: &'a Batch<E>,
+    next: usize,
+    start: usize,
+}
+
+impl<'a, E> Iterator for Spans<'a, E> {
+    type Item = SpanView<'a, E>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let end = *self.batch.ends.get(self.next)?;
+        let range = self.start..end;
+        let number = self.batch.blocks[self.next];
+        let hash = &self.batch.hashes[self.next];
+        self.next += 1;
+        self.start = end;
+        Some(SpanView {
+            number,
+            hash,
+            log_indices: &self.batch.log_indices[range.clone()],
+            events: &self.batch.events[range],
+        })
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.batch.ends.len() - self.next;
+        (remaining, Some(remaining))
+    }
+}
+
+impl<E> ExactSizeIterator for Spans<'_, E> {}
 
 impl<E> Default for Batch<E> {
     fn default() -> Self {
@@ -115,18 +187,8 @@ impl<E> Default for Batch<E> {
 /// Batch layout violation found before any event reaches the fold.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BatchShapeError {
-    /// Batch carries more events than an index can address.
-    TooManyEvents {
-        /// Events the batch carries.
-        len: usize,
-    },
-    /// Span is empty or reaches past the event array.
-    SpanBoundsInvalid {
-        /// Index of the offending span.
-        span: usize,
-    },
-    /// Span does not start where its predecessor ended.
-    SpansNotContiguous {
+    /// Span carries no events; a block with none is left out of the batch.
+    SpanEmpty {
         /// Index of the offending span.
         span: usize,
     },
@@ -139,22 +201,16 @@ pub enum BatchShapeError {
     LogIndexNotAscending {
         /// Index of the offending span.
         span: usize,
-        /// Index of the offending event in the batch's event array.
-        index: u32,
+        /// Index of the offending event in the batch's event lane.
+        index: usize,
     },
 }
 
 impl fmt::Display for BatchShapeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::TooManyEvents { len } => {
-                write!(f, "batch carries {len} events, exceeding u32::MAX")
-            }
-            Self::SpanBoundsInvalid { span } => {
-                write!(f, "span {span} is empty or has out-of-range bounds")
-            }
-            Self::SpansNotContiguous { span } => {
-                write!(f, "span {span} is not contiguous with its neighbor")
+            Self::SpanEmpty { span } => {
+                write!(f, "span {span} carries no events")
             }
             Self::BlocksNotAscending { span } => {
                 write!(f, "span {span} block number is not strictly ascending")
@@ -176,19 +232,12 @@ mod tests {
     use super::{
         Batch,
         BatchShapeError,
-        BlockSpan,
     };
     use crate::position::BlockRef;
     #[cfg(not(feature = "std"))]
-    use alloc::{
-        vec,
-        vec::Vec,
-    };
+    use alloc::vec::Vec;
     #[cfg(feature = "std")]
-    use std::{
-        vec,
-        vec::Vec,
-    };
+    use std::vec::Vec;
 
     fn block(number: u64) -> BlockRef {
         BlockRef {
@@ -197,35 +246,22 @@ mod tests {
         }
     }
 
-    fn events(indices: &[u64]) -> Vec<super::LogEvent<u64>> {
-        indices
-            .iter()
-            .map(|&log_index| super::LogEvent {
-                log_index,
-                event: log_index,
-            })
-            .collect()
+    /// Builds a batch from one (block number, log indices) pair per span.
+    fn batch_of(spans: &[(u64, &[u32])]) -> Batch<u64> {
+        let mut batch = Batch::new();
+        for (number, indices) in spans {
+            batch.push_block(
+                block(*number),
+                indices.iter().map(|index| (*index, u64::from(*index))),
+            );
+        }
+        batch
     }
 
     #[test]
     fn valid_batch_passes_validation() {
-        // given two spans covering four events contiguously
-        let batch = Batch {
-            boundary: None,
-            spans: vec![
-                BlockSpan {
-                    block: block(1),
-                    start: 0,
-                    end: 2,
-                },
-                BlockSpan {
-                    block: block(2),
-                    start: 2,
-                    end: 4,
-                },
-            ],
-            events: events(&[0, 1, 0, 1]),
-        };
+        // given two spans covering four events
+        let batch = batch_of(&[(1, &[0, 1]), (2, &[0, 1])]);
         // when validated
         let result = batch.validate();
         // then Ok
@@ -233,49 +269,9 @@ mod tests {
     }
 
     #[test]
-    fn batch_with_gap_between_spans_fails() {
-        // given span end 2 and next start 3
-        let batch = Batch {
-            boundary: None,
-            spans: vec![
-                BlockSpan {
-                    block: block(1),
-                    start: 0,
-                    end: 2,
-                },
-                BlockSpan {
-                    block: block(2),
-                    start: 3,
-                    end: 4,
-                },
-            ],
-            events: events(&[0, 1, 0, 1]),
-        };
-        // when validated
-        let result = batch.validate();
-        // then SpansNotContiguous at span 1
-        assert_eq!(result, Err(BatchShapeError::SpansNotContiguous { span: 1 }));
-    }
-
-    #[test]
     fn batch_with_descending_blocks_fails() {
         // given spans at blocks 7 then 5
-        let batch = Batch {
-            boundary: None,
-            spans: vec![
-                BlockSpan {
-                    block: block(7),
-                    start: 0,
-                    end: 1,
-                },
-                BlockSpan {
-                    block: block(5),
-                    start: 1,
-                    end: 2,
-                },
-            ],
-            events: events(&[0, 0]),
-        };
+        let batch = batch_of(&[(7, &[0]), (5, &[0])]);
         // when validated
         let result = batch.validate();
         // then BlocksNotAscending at span 1
@@ -285,15 +281,7 @@ mod tests {
     #[test]
     fn batch_with_repeated_log_index_fails() {
         // given one span with log indices 3, 3
-        let batch = Batch {
-            boundary: None,
-            spans: vec![BlockSpan {
-                block: block(1),
-                start: 0,
-                end: 2,
-            }],
-            events: events(&[3, 3]),
-        };
+        let batch = batch_of(&[(1, &[3, 3])]);
         // when validated
         let result = batch.validate();
         // then LogIndexNotAscending at span 0, event index 1
@@ -305,64 +293,49 @@ mod tests {
 
     #[test]
     fn batch_with_an_eventless_span_fails() {
-        // given a second span whose start equals its end
-        let batch = Batch {
-            boundary: None,
-            spans: vec![
-                BlockSpan {
-                    block: block(1),
-                    start: 0,
-                    end: 1,
-                },
-                BlockSpan {
-                    block: block(2),
-                    start: 1,
-                    end: 1,
-                },
-            ],
-            events: events(&[0]),
-        };
+        // given a second span pushed with no events
+        let batch = batch_of(&[(1, &[0]), (2, &[])]);
         // when validated
         let result = batch.validate();
-        // then SpanBoundsInvalid at span 1
-        assert_eq!(result, Err(BatchShapeError::SpanBoundsInvalid { span: 1 }));
+        // then SpanEmpty at span 1
+        assert_eq!(result, Err(BatchShapeError::SpanEmpty { span: 1 }));
     }
 
     #[test]
-    fn batch_with_events_but_no_spans_fails() {
-        // given one event and zero spans
-        let batch = Batch {
-            boundary: None,
-            spans: vec![],
-            events: events(&[0]),
-        };
-        // when validated
-        let result = batch.validate();
-        // then SpansNotContiguous at span 0
-        assert_eq!(result, Err(BatchShapeError::SpansNotContiguous { span: 0 }));
+    fn spans_yield_their_own_event_slices() {
+        // given three spans of differing width
+        let batch = batch_of(&[(1, &[0, 1, 2]), (4, &[7]), (9, &[0, 5])]);
+        // when iterating the spans
+        let seen: Vec<(u64, Vec<u32>, Vec<u64>)> = batch
+            .spans()
+            .map(|span| (span.number, span.log_indices.to_vec(), span.events.to_vec()))
+            .collect();
+        // then each span carries exactly the events pushed with its block
+        assert_eq!(
+            seen,
+            [
+                (1, [0, 1, 2].to_vec(), [0u64, 1, 2].to_vec()),
+                (4, [7].to_vec(), [7u64].to_vec()),
+                (9, [0, 5].to_vec(), [0u64, 5].to_vec()),
+            ]
+        );
+        assert_eq!(batch.spans().len(), batch.span_count());
     }
 
     #[test]
     fn batch_clear_keeps_capacity() {
         // given a filled batch
-        let mut batch = Batch {
-            boundary: Some(block(1)),
-            spans: vec![BlockSpan {
-                block: block(1),
-                start: 0,
-                end: 1,
-            }],
-            events: events(&[0]),
-        };
-        let spans_capacity = batch.spans.capacity();
+        let mut batch = batch_of(&[(1, &[0])]);
+        batch.boundary = Some(block(1));
+        let spans_capacity = batch.blocks.capacity();
         let events_capacity = batch.events.capacity();
         // when cleared
         batch.clear();
         // then empty with prior capacities
         assert!(batch.is_empty());
         assert_eq!(batch.boundary, None);
-        assert!(batch.events.is_empty());
-        assert_eq!(batch.spans.capacity(), spans_capacity);
+        assert_eq!(batch.spans().count(), 0);
+        assert_eq!(batch.blocks.capacity(), spans_capacity);
         assert_eq!(batch.events.capacity(), events_capacity);
     }
 }
