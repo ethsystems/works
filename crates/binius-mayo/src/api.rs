@@ -34,9 +34,9 @@ use std::fmt;
 use aes::{
     Aes128,
     cipher::{
-        BlockEncrypt,
+        Block,
+        BlockCipherEncrypt,
         KeyInit,
-        generic_array::GenericArray,
     },
 };
 use binius_core::word::Word;
@@ -666,7 +666,7 @@ fn expand_pk_to_lanes(cpk: &[u8; CPK_BYTES]) -> PkLanes {
         .expect("CPK_BYTES >= PK_SEED_BYTES");
     let p3_packed = &cpk[PK_SEED_BYTES..CPK_BYTES];
 
-    let cipher = Aes128::new(GenericArray::from_slice(pk_seed));
+    let cipher = Aes128::new_from_slice(pk_seed).expect("pk_seed must be 16 bytes");
     let mut counter: u32 = 0;
 
     let mut fill_entry = |entry: &mut [u8; M]| {
@@ -674,7 +674,8 @@ fn expand_pk_to_lanes(cpk: &[u8; CPK_BYTES]) -> PkLanes {
             let mut block = [0u8; 16];
             block[12..16].copy_from_slice(&counter.to_be_bytes());
             counter = counter.wrapping_add(1);
-            let mut blk = GenericArray::clone_from_slice(&block);
+            let mut blk = Block::<Aes128>::default();
+            blk.copy_from_slice(&block);
             cipher.encrypt_block(&mut blk);
             let off = half * 32;
             for b in 0..16 {
