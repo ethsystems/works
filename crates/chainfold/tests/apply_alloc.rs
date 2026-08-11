@@ -21,10 +21,8 @@ use std::{
 use chainfold::{
     Batch,
     BlockRef,
-    BlockSpan,
     Engine,
     EngineConfig,
-    LogEvent,
     test_util::NoopFold,
 };
 
@@ -59,21 +57,13 @@ fn block_ref(number: u64) -> BlockRef {
 
 /// Builds a single-span batch of `count` events over one block.
 fn block_batch(boundary: Option<BlockRef>, number: u64, count: u32) -> Batch<u64> {
-    let events: Vec<LogEvent<u64>> = (0..count as u64)
-        .map(|log_index| LogEvent {
-            log_index,
-            event: log_index,
-        })
-        .collect();
-    Batch {
-        boundary,
-        spans: vec![BlockSpan {
-            block: block_ref(number),
-            start: 0,
-            end: count,
-        }],
-        events,
-    }
+    let mut batch = Batch::new();
+    batch.boundary = boundary;
+    batch.push_block(
+        block_ref(number),
+        (0..count).map(|log_index| (log_index, u64::from(log_index))),
+    );
+    batch
 }
 
 #[test]

@@ -19,7 +19,11 @@ pub(crate) struct CheckpointRing<F> {
 pub(crate) struct Slot<F> {
     pub(crate) fold: F,
     pub(crate) cursor: Option<Position>,
-    pub(crate) ring: BlockRing,
+}
+
+/// True when the engine's ring can still serve the slot's window.
+fn live<F>(slot: &Slot<F>, ring: &BlockRing) -> bool {
+    slot.cursor.is_none_or(|cursor| ring.observes(cursor.block))
 }
 
 impl<F> CheckpointRing<F> {
@@ -30,14 +34,21 @@ impl<F> CheckpointRing<F> {
         }
     }
 
-    /// Occupied slots oldest first, since the next write position holds the oldest.
-    fn oldest_first(&self) -> impl DoubleEndedIterator<Item = &Slot<F>> {
+    /// Live slots oldest first, since the next write position holds the oldest.
+    fn oldest_first<'a>(
+        &'a self,
+        ring: &'a BlockRing,
+    ) -> impl DoubleEndedIterator<Item = &'a Slot<F>> {
         let (newest, oldest) = self.slots.split_at(self.next);
-        oldest.iter().chain(newest).flatten()
+        oldest
+            .iter()
+            .chain(newest)
+            .flatten()
+            .filter(move |slot| live(slot, ring))
     }
 
-    pub(crate) fn count(&self) -> usize {
-        self.oldest_first().count()
+    pub(crate) fn count(&self, ring: &BlockRing) -> usize {
+        self.oldest_first(ring).count()
     }
 
     /// Stores a slot at the next write position; overwrites the oldest when full.
@@ -50,15 +61,20 @@ impl<F> CheckpointRing<F> {
         self.next = (self.next + 1) % len;
     }
 
-    /// Oldest retained slot; the mirror of best_at_or_below's newest-first scan.
-    pub(crate) fn oldest(&self) -> Option<&Slot<F>> {
-        self.oldest_first().next()
+    /// Oldest live slot; the mirror of best_at_or_below's newest-first scan.
+    pub(crate) fn oldest<'a>(&'a self, ring: &'a BlockRing) -> Option<&'a Slot<F>> {
+        self.oldest_first(ring).next()
     }
 
-    /// Newest slot with cursor block at or below the argument; empty-cursor slots always qualify.
+    /// Newest live slot with cursor block at or below the argument; empty-cursor slots
+    /// always qualify.
     #[cold]
-    pub(crate) fn best_at_or_below(&self, block: u64) -> Option<&Slot<F>> {
-        self.oldest_first()
+    pub(crate) fn best_at_or_below<'a>(
+        &'a self,
+        block: u64,
+        ring: &'a BlockRing,
+    ) -> Option<&'a Slot<F>> {
+        self.oldest_first(ring)
             .rev()
             .find(|slot| slot.cursor.is_none_or(|cursor| cursor.block <= block))
     }

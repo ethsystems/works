@@ -96,22 +96,28 @@ impl<T> Handle<T> {
         *self.status.borrow()
     }
 
-    /// Returns when caught up or terminal, regardless of when the transition happened.
-    pub async fn wait_caught_up(&mut self) -> DriverStatus {
+    /// Returns the first published status the predicate accepts, or the last one
+    /// published once the loop thread has dropped its sender.
+    async fn settled(
+        &mut self,
+        accept: impl FnMut(&DriverStatus) -> bool,
+    ) -> DriverStatus {
         self.status
-            .wait_for(|s| s.caught_up || s.is_terminal())
+            .wait_for(accept)
             .await
             .map(|status| *status)
             .unwrap_or_else(|_| *self.status.borrow())
     }
 
+    /// Returns when caught up or terminal, regardless of when the transition happened.
+    pub async fn wait_caught_up(&mut self) -> DriverStatus {
+        self.settled(|s| s.caught_up || s.is_terminal()).await
+    }
+
     /// Returns when the cursor reaches `pos` or the driver is terminal.
     pub async fn wait_past(&mut self, pos: Position) -> DriverStatus {
-        self.status
-            .wait_for(|s| s.is_terminal() || s.cursor.is_some_and(|cursor| cursor >= pos))
+        self.settled(|s| s.is_terminal() || s.cursor.is_some_and(|c| c >= pos))
             .await
-            .map(|status| *status)
-            .unwrap_or_else(|_| *self.status.borrow())
     }
 
     /// Returns when the durable cursor reaches `pos` or the driver is terminal.
@@ -119,13 +125,8 @@ impl<T> Handle<T> {
     /// A later resync lowers the durable cursor, so the answer holds for the
     /// instant it resolves.
     pub async fn wait_durable(&mut self, pos: Position) -> DriverStatus {
-        self.status
-            .wait_for(|s| {
-                s.is_terminal() || s.durable_cursor.is_some_and(|cursor| cursor >= pos)
-            })
+        self.settled(|s| s.is_terminal() || s.durable_cursor.is_some_and(|c| c >= pos))
             .await
-            .map(|status| *status)
-            .unwrap_or_else(|_| *self.status.borrow())
     }
 
     /// Asks the loop to checkpoint before its next tick.

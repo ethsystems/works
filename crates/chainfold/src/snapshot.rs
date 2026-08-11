@@ -8,6 +8,7 @@ use std::vec::Vec;
 use core::fmt;
 
 use crate::{
+    batch::first_descent,
     engine::{
         Engine,
         EngineConfig,
@@ -269,11 +270,11 @@ impl<F: Persist> Engine<F> {
         encode_envelope(self.fold(), self.cursor(), self.observed(), out)
     }
 
-    /// Encodes the oldest retained checkpoint; Ok(None) means nothing is retained and
-    /// nothing was appended.
+    /// Encodes the oldest live checkpoint; Ok(None) means nothing is live and nothing
+    /// was appended.
     ///
     /// The returned point is the encoded snapshot's cursor, trailing the live cursor by
-    /// the ring's checkpoint coverage.
+    /// the checkpoint span.
     pub fn encode_durable_snapshot(
         &self,
         out: &mut Vec<u8>,
@@ -284,7 +285,8 @@ impl<F: Persist> Engine<F> {
         let Some(point) = slot.cursor else {
             return Ok(None);
         };
-        encode_envelope(&slot.fold, slot.cursor, slot.ring.iter(), out)?;
+        let window = self.observed_at_or_below(point.block);
+        encode_envelope(&slot.fold, slot.cursor, window, out)?;
         Ok(Some(point))
     }
 
@@ -329,11 +331,7 @@ impl<F: Persist> Engine<F> {
                 capacity: config.ring_capacity,
             });
         }
-        if envelope
-            .ring_numbers
-            .windows(2)
-            .any(|pair| pair[0] >= pair[1])
-        {
+        if first_descent(&envelope.ring_numbers).is_some() {
             return Err(SnapshotError::RingNotAscending);
         }
         // The capacity check above bounds the count, so the product cannot overflow;
@@ -354,17 +352,12 @@ impl<F: Persist> Engine<F> {
         let fold = F::decode_state(&envelope.state).map_err(SnapshotError::State)?;
 
         let mut ring = BlockRing::with_capacity(config.ring_capacity);
-        let lanes = envelope
-            .ring_numbers
-            .iter()
-            .zip(envelope.ring_hashes.chunks_exact(HASH_LEN));
-        for (&number, hash) in lanes {
-            ring.push(BlockRef {
-                number,
-                hash: hash
-                    .try_into()
-                    .map_err(|_| SnapshotError::RingHashLenMismatch)?,
-            });
+        let hashes = envelope.ring_hashes.chunks_exact(HASH_LEN);
+        for (&number, hash) in envelope.ring_numbers.iter().zip(hashes) {
+            let hash = hash
+                .try_into()
+                .map_err(|_| SnapshotError::RingHashLenMismatch)?;
+            ring.push(BlockRef { number, hash });
         }
 
         let mut engine = Engine::new(fold, config).map_err(SnapshotError::Config)?;
@@ -409,11 +402,7 @@ mod tests {
         encode_custom,
     };
     use crate::{
-        batch::{
-            Batch,
-            BlockSpan,
-            LogEvent,
-        },
+        batch::Batch,
         engine::{
             Engine,
             EngineConfig,
@@ -455,26 +444,19 @@ mod tests {
 
     fn batch_of(
         boundary: Option<BlockRef>,
-        spans: Vec<(BlockRef, Vec<u64>)>,
+        spans: Vec<(BlockRef, Vec<u32>)>,
     ) -> Batch<u64> {
-        let mut events = Vec::new();
-        let mut built_spans = Vec::new();
+        let mut batch = Batch::new();
+        batch.boundary = boundary;
         for (block, log_indices) in spans {
-            let start = events.len() as u32;
-            for log_index in log_indices {
-                events.push(LogEvent {
-                    log_index,
-                    event: log_index,
-                });
-            }
-            let end = events.len() as u32;
-            built_spans.push(BlockSpan { block, start, end });
+            batch.push_block(
+                block,
+                log_indices
+                    .into_iter()
+                    .map(|index| (index, u64::from(index))),
+            );
         }
-        Batch {
-            boundary,
-            spans: built_spans,
-            events,
-        }
+        batch
     }
 
     fn test_engine() -> Engine<RecordingFold> {

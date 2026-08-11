@@ -61,8 +61,8 @@ pub use anchor::{
 pub use batch::{
     Batch,
     BatchShapeError,
-    BlockSpan,
-    LogEvent,
+    SpanView,
+    Spans,
 };
 pub use driver::{
     Driver,

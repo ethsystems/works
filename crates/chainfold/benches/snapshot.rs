@@ -5,10 +5,8 @@ use std::hint::black_box;
 use chainfold::{
     Batch,
     BlockRef,
-    BlockSpan,
     Engine,
     EngineConfig,
-    LogEvent,
     test_util::RecordingFold,
 };
 use criterion::{
@@ -21,7 +19,7 @@ use criterion::{
 /// Observed-block ring window; only one block is ever observed in this benchmark.
 const RING_CAPACITY: usize = 8;
 /// Recorded-fold entries the envelope carries.
-const ENTRY_COUNT: u64 = 4096;
+const ENTRY_COUNT: u32 = 4096;
 
 /// Builds a distinguishable header for a block number.
 fn block_ref(number: u64) -> BlockRef {
@@ -38,23 +36,11 @@ fn recorded_engine() -> Engine<RecordingFold> {
     };
     let mut engine =
         Engine::new(RecordingFold::default(), config).expect("engine config is valid");
-    let mut events = Vec::with_capacity(ENTRY_COUNT as usize);
-    for log_index in 0..ENTRY_COUNT {
-        events.push(LogEvent {
-            log_index,
-            event: log_index,
-        });
-    }
-    let end = events.len() as u32;
-    let batch = Batch {
-        boundary: None,
-        spans: vec![BlockSpan {
-            block: block_ref(1),
-            start: 0,
-            end,
-        }],
-        events,
-    };
+    let mut batch = Batch::new();
+    batch.push_block(
+        block_ref(1),
+        (0..ENTRY_COUNT).map(|log_index| (log_index, u64::from(log_index))),
+    );
     engine.apply_batch(&batch).expect("apply_batch succeeds");
     engine
 }

@@ -7,12 +7,10 @@ use std::path::PathBuf;
 use chainfold::{
     Batch,
     BlockRef,
-    BlockSpan,
     Driver,
     DriverConfig,
     Engine,
     EngineConfig,
-    LogEvent,
     Position,
     Tickable,
     storage::{
@@ -67,18 +65,9 @@ fn block_ref(number: u64) -> BlockRef {
 /// Advances the reference engine by one block carrying a single event.
 fn advance(engine: &mut Engine<RecordingFold>, number: u64) {
     let boundary = number.checked_sub(1).filter(|&n| n > 0).map(block_ref);
-    let batch = Batch {
-        boundary,
-        spans: vec![BlockSpan {
-            block: block_ref(number),
-            start: 0,
-            end: 1,
-        }],
-        events: vec![LogEvent {
-            log_index: 0,
-            event: number,
-        }],
-    };
+    let mut batch = Batch::new();
+    batch.boundary = boundary;
+    batch.push_block(block_ref(number), [(0u32, number)]);
     engine.apply_batch(&batch).unwrap();
 }
 

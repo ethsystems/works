@@ -86,11 +86,6 @@ impl core::error::Error for EngineStatus {}
 pub enum DivergenceCause {
     /// Fork deeper than the oldest observed block in the ring.
     ForkBeyondWindow,
-    /// A canonical ancestor exists but no retained checkpoint sits at or below it.
-    NoCheckpointBelowAncestor {
-        /// Deepest still-canonical observed block.
-        ancestor: u64,
-    },
     /// Replay is required but the source's horizon no longer covers the start block.
     HorizonExceeded {
         /// Block replay must start from.
@@ -109,9 +104,6 @@ impl fmt::Display for DivergenceCause {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::ForkBeyondWindow => write!(f, "fork deeper than the observed window"),
-            Self::NoCheckpointBelowAncestor { ancestor } => {
-                write!(f, "no checkpoint at or below ancestor block {ancestor}")
-            }
             Self::HorizonExceeded { needed, horizon } => {
                 write!(
                     f,
