@@ -305,13 +305,10 @@ impl<F: Persist> Engine<F> {
             return Err(SnapshotError::BadVersion { got: version });
         }
 
-        let split = bytes
-            .len()
-            .checked_sub(CRC_LEN)
-            .ok_or(SnapshotError::TooShort)?;
-        let (payload, trailer) = bytes.split_at(split);
-        let expected_crc =
-            u32::from_le_bytes([trailer[0], trailer[1], trailer[2], trailer[3]]);
+        let Some((payload, trailer)) = bytes.split_last_chunk::<CRC_LEN>() else {
+            return Err(SnapshotError::TooShort);
+        };
+        let expected_crc = u32::from_le_bytes(*trailer);
         let computed_crc = crc32c(payload);
         if computed_crc != expected_crc {
             return Err(SnapshotError::Crc {
@@ -339,22 +336,15 @@ impl<F: Persist> Engine<F> {
         {
             return Err(SnapshotError::RingNotAscending);
         }
-        let expected_hash_len = envelope
-            .ring_numbers
-            .len()
-            .checked_mul(HASH_LEN)
-            .ok_or(SnapshotError::RingHashLenMismatch)?;
-        if envelope.ring_hashes.len() != expected_hash_len {
+        // The capacity check above bounds the count, so the product cannot overflow;
+        // saturation would still fail the comparison.
+        if envelope.ring_hashes.len()
+            != envelope.ring_numbers.len().saturating_mul(HASH_LEN)
+        {
             return Err(SnapshotError::RingHashLenMismatch);
         }
-        let cursor = if envelope.cursor_set != 0 {
-            Some(Position::new(
-                envelope.cursor_block,
-                envelope.cursor_log_index,
-            ))
-        } else {
-            None
-        };
+        let cursor = (envelope.cursor_set != 0)
+            .then(|| Position::new(envelope.cursor_block, envelope.cursor_log_index));
         if let Some(pos) = cursor
             && envelope.ring_numbers.last() != Some(&pos.block)
         {
@@ -364,16 +354,17 @@ impl<F: Persist> Engine<F> {
         let fold = F::decode_state(&envelope.state).map_err(SnapshotError::State)?;
 
         let mut ring = BlockRing::with_capacity(config.ring_capacity);
-        for (index, &number) in envelope.ring_numbers.iter().enumerate() {
-            let start = index
-                .checked_mul(HASH_LEN)
-                .ok_or(SnapshotError::RingHashLenMismatch)?;
-            let end = start
-                .checked_add(HASH_LEN)
-                .ok_or(SnapshotError::RingHashLenMismatch)?;
-            let mut hash = [0u8; HASH_LEN];
-            hash.copy_from_slice(&envelope.ring_hashes[start..end]);
-            ring.push(BlockRef { number, hash });
+        let lanes = envelope
+            .ring_numbers
+            .iter()
+            .zip(envelope.ring_hashes.chunks_exact(HASH_LEN));
+        for (&number, hash) in lanes {
+            ring.push(BlockRef {
+                number,
+                hash: hash
+                    .try_into()
+                    .map_err(|_| SnapshotError::RingHashLenMismatch)?,
+            });
         }
 
         let mut engine = Engine::new(fold, config).map_err(SnapshotError::Config)?;

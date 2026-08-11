@@ -62,55 +62,45 @@ impl<E> Batch<E> {
 
     /// Validates the flat batch shape against the rules of record.
     pub fn validate(&self) -> Result<(), BatchShapeError> {
-        if self.events.len() > u32::MAX as usize {
+        if u32::try_from(self.events.len()).is_err() {
             return Err(BatchShapeError::TooManyEvents {
                 len: self.events.len(),
             });
         }
-        if self.spans.is_empty() {
-            return if self.events.is_empty() {
-                Ok(())
-            } else {
-                Err(BatchShapeError::SpansNotContiguous { span: 0 })
-            };
-        }
-        if self.spans[0].start != 0 {
-            return Err(BatchShapeError::SpansNotContiguous { span: 0 });
-        }
-        for (index, span) in self.spans.iter().enumerate() {
+        let mut previous: Option<&BlockSpan> = None;
+        for (span_index, span) in self.spans.iter().enumerate() {
             if span.start >= span.end || span.end as usize > self.events.len() {
-                return Err(BatchShapeError::SpanBoundsInvalid { span: index });
+                return Err(BatchShapeError::SpanBoundsInvalid { span: span_index });
             }
-        }
-        for index in 1..self.spans.len() {
-            if self.spans[index].start != self.spans[index - 1].end {
-                return Err(BatchShapeError::SpansNotContiguous { span: index });
+            if span.start != previous.map_or(0, |previous| previous.end) {
+                return Err(BatchShapeError::SpansNotContiguous { span: span_index });
             }
+            if previous.is_some_and(|previous| span.block.number <= previous.block.number)
+            {
+                return Err(BatchShapeError::BlocksNotAscending { span: span_index });
+            }
+            let events = &self.events[span.start as usize..span.end as usize];
+            let ascending = events
+                .iter()
+                .zip(&events[1..])
+                .fold(true, |acc, (a, b)| acc & (a.log_index < b.log_index));
+            if !ascending {
+                let offset = events
+                    .windows(2)
+                    .position(|pair| pair[1].log_index <= pair[0].log_index)
+                    .expect("a failed ascending sweep always has a locatable pair");
+                return Err(BatchShapeError::LogIndexNotAscending {
+                    span: span_index,
+                    #[allow(clippy::cast_possible_truncation)]
+                    index: span.start + 1 + offset as u32,
+                });
+            }
+            previous = Some(span);
         }
-        if self.spans[self.spans.len() - 1].end as usize != self.events.len() {
+        if previous.map_or(0, |span| span.end) as usize != self.events.len() {
             return Err(BatchShapeError::SpansNotContiguous {
-                span: self.spans.len() - 1,
+                span: self.spans.len().saturating_sub(1),
             });
-        }
-        for index in 1..self.spans.len() {
-            if self.spans[index].block.number <= self.spans[index - 1].block.number {
-                return Err(BatchShapeError::BlocksNotAscending { span: index });
-            }
-        }
-        for (index, span) in self.spans.iter().enumerate() {
-            let mut previous_log_index: Option<u64> = None;
-            for event_index in span.start..span.end {
-                let log_index = self.events[event_index as usize].log_index;
-                if let Some(previous_log_index) = previous_log_index
-                    && log_index <= previous_log_index
-                {
-                    return Err(BatchShapeError::LogIndexNotAscending {
-                        span: index,
-                        index: event_index,
-                    });
-                }
-                previous_log_index = Some(log_index);
-            }
         }
         Ok(())
     }

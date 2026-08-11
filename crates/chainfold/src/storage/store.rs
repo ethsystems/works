@@ -1,7 +1,6 @@
 //! Durable snapshot home: temp-fsync-rename commits, dual-slot manifest.
 
 use std::{
-    collections::BTreeSet,
     io,
     path::{
         Path,
@@ -16,7 +15,9 @@ use crate::{
     storage::{
         manifest::{
             MANIFEST_FILE,
+            MANIFEST_SIZE,
             SLOT_SIZE,
+            SLOT_STRIDE,
             SlotRecord,
             decode_slot,
             encode_slot,
@@ -40,10 +41,12 @@ fn snapshot_file_name(id: u64) -> String {
 /// Recovers a snapshot id from a file name, or None if it doesn't match the pattern.
 fn snapshot_id_from_path(path: &Path) -> Option<u64> {
     let name = path.file_name()?.to_str()?;
-    name.strip_prefix(SNAPSHOT_PREFIX)?
+    let id: u64 = name
+        .strip_prefix(SNAPSHOT_PREFIX)?
         .strip_suffix(SNAPSHOT_SUFFIX)?
         .parse()
-        .ok()
+        .ok()?;
+    (snapshot_file_name(id) == name).then_some(id)
 }
 
 /// True when the manifest carries no slot any commit ever wrote: short or all zero.
@@ -52,6 +55,17 @@ fn snapshot_id_from_path(path: &Path) -> Option<u64> {
 /// are only ever overwritten in place, so this shape means the store is still fresh.
 fn manifest_is_uninitialized(bytes: &[u8]) -> bool {
     bytes.len() < SLOT_SIZE * 2 || bytes.iter().all(|byte| *byte == 0)
+}
+
+/// Maps a missing path to None so callers act once instead of checking then acting.
+///
+/// Every caller races an unlink: a prior crash repair, a concurrent prune, or an
+/// operator clearing the directory. Checking first only widens the window.
+fn missing_ok<T>(result: io::Result<T>) -> io::Result<Option<T>> {
+    match result {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        other => other.map(Some),
+    }
 }
 
 /// Directory home for a snapshot store and how many superseded snapshots to keep.
@@ -86,6 +100,8 @@ pub enum StoreError {
     },
     /// Configured retain count keeps no snapshot.
     RetainZero,
+    /// A prior commit failed, so this store refuses further commits.
+    Poisoned,
 }
 
 impl fmt::Display for StoreError {
@@ -99,6 +115,9 @@ impl fmt::Display for StoreError {
                 write!(f, "manifest points at missing snapshot {id}")
             }
             Self::RetainZero => write!(f, "retain must keep at least one snapshot"),
+            Self::Poisoned => {
+                write!(f, "store refuses commits after an earlier commit failed")
+            }
         }
     }
 }
@@ -107,9 +126,10 @@ impl core::error::Error for StoreError {
     fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
         match self {
             Self::Io(error) => Some(error),
-            Self::CorruptManifest | Self::MissingSnapshot { .. } | Self::RetainZero => {
-                None
-            }
+            Self::CorruptManifest
+            | Self::MissingSnapshot { .. }
+            | Self::RetainZero
+            | Self::Poisoned => None,
         }
     }
 }
@@ -127,6 +147,7 @@ pub struct SnapshotStore<V: Vfs> {
     retain: usize,
     slots: [Option<SlotRecord>; 2],
     active: usize,
+    poisoned: bool,
 }
 
 impl<V: Vfs> SnapshotStore<V> {
@@ -141,27 +162,30 @@ impl<V: Vfs> SnapshotStore<V> {
         vfs.create_dir_all(&config.dir)?;
 
         let temp_path = config.dir.join(TEMP_FILE);
-        if vfs.exists(&temp_path)? {
-            vfs.remove(&temp_path)?;
+        if missing_ok(vfs.remove(&temp_path))?.is_some() {
             // Syncs the repair so the removal survives a later crash.
             vfs.fsync_dir(&config.dir)?;
         }
 
         let manifest_path = config.dir.join(MANIFEST_FILE);
-        let slots = if vfs.exists(&manifest_path)? {
-            let bytes = vfs.read(&manifest_path)?;
-            let left = bytes.get(0..SLOT_SIZE).and_then(decode_slot);
-            let right = bytes.get(SLOT_SIZE..SLOT_SIZE * 2).and_then(decode_slot);
-            if left.is_none() && right.is_none() && !manifest_is_uninitialized(&bytes) {
-                return Err(StoreError::CorruptManifest);
+        let slots = match missing_ok(vfs.read(&manifest_path))? {
+            Some(bytes) => {
+                let left = bytes.get(0..SLOT_SIZE).and_then(decode_slot);
+                let right = bytes
+                    .get(SLOT_STRIDE..SLOT_STRIDE + SLOT_SIZE)
+                    .and_then(decode_slot);
+                if left.is_none() && right.is_none() && !manifest_is_uninitialized(&bytes)
+                {
+                    return Err(StoreError::CorruptManifest);
+                }
+                [left, right]
             }
-            [left, right]
-        } else {
             // Creates the manifest with blank slots so it exists before any commit;
             // the first commit's own directory fsync durably registers its name.
-            let blank = vec![0u8; SLOT_SIZE * 2];
-            vfs.write(&manifest_path, &blank)?;
-            [None, None]
+            None => {
+                vfs.write(&manifest_path, &[0u8; MANIFEST_SIZE])?;
+                [None, None]
+            }
         };
 
         let active = match (slots[0], slots[1]) {
@@ -175,12 +199,11 @@ impl<V: Vfs> SnapshotStore<V> {
             Some(record) => {
                 let snapshot_path =
                     config.dir.join(snapshot_file_name(record.snapshot_id));
-                if !vfs.exists(&snapshot_path)? {
-                    return Err(StoreError::MissingSnapshot {
+                let snapshot = missing_ok(vfs.read(&snapshot_path))?.ok_or(
+                    StoreError::MissingSnapshot {
                         id: record.snapshot_id,
-                    });
-                }
-                let snapshot = vfs.read(&snapshot_path)?;
+                    },
+                )?;
                 Some(Recovered {
                     snapshot,
                     cursor: record.cursor,
@@ -194,6 +217,7 @@ impl<V: Vfs> SnapshotStore<V> {
             retain: config.retain,
             slots,
             active,
+            poisoned: false,
         };
         // Reclaiming space is best effort; the next open retries whatever it leaves.
         let _ = store.prune();
@@ -212,6 +236,21 @@ impl<V: Vfs> SnapshotStore<V> {
     /// | after the manifest fsync | both slots valid | new snapshot serves |
     /// | during pruning | unreferenced files linger | pruned on next open |
     pub fn commit(
+        &mut self,
+        snapshot: &[u8],
+        cursor: Option<Position>,
+    ) -> Result<(), StoreError> {
+        if self.poisoned {
+            return Err(StoreError::Poisoned);
+        }
+        let result = self.commit_once(snapshot, cursor);
+        if result.is_err() {
+            self.poisoned = true;
+        }
+        result
+    }
+
+    fn commit_once(
         &mut self,
         snapshot: &[u8],
         cursor: Option<Position>,
@@ -236,7 +275,7 @@ impl<V: Vfs> SnapshotStore<V> {
         };
         let slot_bytes = encode_slot(&record);
         let slot_offset =
-            u64::try_from(older * SLOT_SIZE).expect("slot offset fits in a u64");
+            u64::try_from(older * SLOT_STRIDE).expect("slot offset fits in a u64");
         let manifest_path = self.dir.join(MANIFEST_FILE);
         self.vfs
             .write_at(&manifest_path, slot_offset, &slot_bytes)?;
@@ -265,23 +304,18 @@ impl<V: Vfs> SnapshotStore<V> {
     /// `retain` extras; the pointer removal became durable in the manifest fsync
     /// above, so unlinking an unreferenced file here never loses acknowledged data.
     fn prune(&mut self) -> Result<(), StoreError> {
-        let referenced: BTreeSet<u64> = self
-            .slots
-            .iter()
-            .flatten()
-            .map(|slot| slot.snapshot_id)
-            .collect();
+        let referenced = self.slots.map(|slot| slot.map(|slot| slot.snapshot_id));
         let mut unreferenced: Vec<u64> = self
             .vfs
             .list(&self.dir)?
             .iter()
             .filter_map(|path| snapshot_id_from_path(path))
-            .filter(|id| !referenced.contains(id))
+            .filter(|id| !referenced.contains(&Some(*id)))
             .collect();
         unreferenced.sort_unstable();
         let remove_count = unreferenced.len().saturating_sub(self.retain);
         for id in &unreferenced[..remove_count] {
-            self.vfs.remove(&self.dir.join(snapshot_file_name(*id)))?;
+            missing_ok(self.vfs.remove(&self.dir.join(snapshot_file_name(*id))))?;
         }
         if remove_count > 0 {
             // Syncs the unlinks so repeated crash-open cycles converge.

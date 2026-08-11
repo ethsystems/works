@@ -249,17 +249,6 @@ where
     ) -> Result<Self, ConfigError> {
         Self::build(fold, source, Some(anchor), NoSink, engine, config)
     }
-
-    /// Resumes from a recovered engine with an anchor checked at every checkpoint.
-    pub fn resume_with_anchor(
-        engine: Engine<F>,
-        source: S,
-        anchor: A,
-        genesis: F,
-        config: DriverConfig,
-    ) -> Result<Self, ConfigError> {
-        Self::around(engine, source, Some(anchor), NoSink, genesis, config)
-    }
 }
 
 impl<F, S, A, K> Driver<F, S, A, K>
@@ -376,10 +365,9 @@ where
     fn auto_checkpoint(&mut self) -> Option<Tick> {
         let interval = self.config.checkpoint_interval?;
         let cursor = self.engine.cursor()?;
-        let due = match self.last_checkpoint_block {
-            None => true,
-            Some(last) => cursor.block >= last.saturating_add(interval),
-        };
+        let due = self
+            .last_checkpoint_block
+            .is_none_or(|last| cursor.block >= last.saturating_add(interval));
         if due { self.run_checkpoint() } else { None }
     }
 
@@ -399,10 +387,9 @@ where
         }
         let interval = self.config.snapshot_interval?;
         let point = self.engine.durable_point()?;
-        let due = match self.last_snapshot_block {
-            None => true,
-            Some(last) => point.block >= last.saturating_add(interval),
-        };
+        let due = self
+            .last_snapshot_block
+            .is_none_or(|last| point.block >= last.saturating_add(interval));
         if !due {
             return None;
         }
@@ -425,13 +412,10 @@ where
     /// Lowers the snapshot mark to the restore point so the next offer is not suppressed.
     #[cold]
     fn clamp_snapshot_mark(&mut self, to: Option<Position>) {
-        match (self.last_snapshot_block, to) {
-            (Some(last), Some(point)) => {
-                self.last_snapshot_block = Some(last.min(point.block));
-            }
-            (Some(_), None) => self.last_snapshot_block = None,
-            (None, _) => {}
-        }
+        self.last_snapshot_block = self
+            .last_snapshot_block
+            .zip(to)
+            .map(|(last, point)| last.min(point.block));
     }
 
     /// Compares the fold view against the anchor's expectation at the last verified block.
@@ -455,10 +439,18 @@ where
                 .mark_unrecoverable(DivergenceCause::AnchorDivergence { at: at.number });
             return Tick::Terminal(self.engine.status());
         }
-        let ancestor = at.number.saturating_sub(1);
+        let tick = self.roll_back_to(at.number.saturating_sub(1));
+        if matches!(tick, Tick::RolledBack { .. }) {
+            self.divergence_retries = self.divergence_retries.saturating_add(1);
+        }
+        tick
+    }
+
+    /// Rolls back to the newest checkpoint at or below the ancestor, else escalates.
+    #[cold]
+    fn roll_back_to(&mut self, ancestor: u64) -> Tick {
         match self.engine.rollback_at_or_below(ancestor) {
             Ok(to) => {
-                self.divergence_retries = self.divergence_retries.saturating_add(1);
                 self.caught_up = false;
                 self.clamp_snapshot_mark(to);
                 Tick::RolledBack { to }
@@ -475,11 +467,8 @@ where
     #[cold]
     fn resync_or_terminal(&mut self) -> Tick {
         match self.source.horizon() {
-            ReplayHorizon::Genesis => self.resync(),
-            ReplayHorizon::FromBlock(horizon) if horizon <= self.config.start_block => {
-                self.resync()
-            }
-            ReplayHorizon::FromBlock(horizon) => {
+            // The same shortfall `around` rejects at construction, reached at runtime.
+            ReplayHorizon::FromBlock(horizon) if horizon > self.config.start_block => {
                 self.engine
                     .mark_unrecoverable(DivergenceCause::HorizonExceeded {
                         needed: self.config.start_block,
@@ -487,6 +476,7 @@ where
                     });
                 Tick::Terminal(self.engine.status())
             }
+            _ => self.resync(),
         }
     }
 
@@ -537,10 +527,10 @@ where
         match self.engine.apply_batch(&self.batch) {
             Ok(summary) => {
                 self.caught_up = self.batch.is_empty();
-                if let Some(tick) = self.auto_checkpoint() {
-                    return tick;
-                }
-                if let Some(tick) = self.offer_snapshot() {
+                // A checkpoint tick overrides a snapshot tick, which overrides progress.
+                if let Some(tick) =
+                    self.auto_checkpoint().or_else(|| self.offer_snapshot())
+                {
                     return tick;
                 }
                 if self.batch.is_empty() {
@@ -607,14 +597,13 @@ where
                 self.config.poll_interval
             };
         }
-        let exponent = self.consecutive_errors - 1;
-        let factor = 1u32.checked_shl(exponent).unwrap_or(u32::MAX);
-        let backoff = self
-            .config
+        let factor = 1u32
+            .checked_shl(self.consecutive_errors - 1)
+            .unwrap_or(u32::MAX);
+        self.config
             .backoff_base
-            .checked_mul(factor)
-            .unwrap_or(self.config.backoff_max);
-        backoff.min(self.config.backoff_max)
+            .saturating_mul(factor)
+            .min(self.config.backoff_max)
     }
 }
 
@@ -645,18 +634,7 @@ where
         if lo == 0 {
             return self.resync_or_terminal();
         }
-        let ancestor = observed[lo - 1].number;
-        match self.engine.rollback_at_or_below(ancestor) {
-            Ok(to) => {
-                self.caught_up = false;
-                self.clamp_snapshot_mark(to);
-                Tick::RolledBack { to }
-            }
-            Err(RollbackError::NoCheckpointAtOrBelow { .. }) => self.resync_or_terminal(),
-            Err(RollbackError::Unrecoverable { cause }) => {
-                Tick::Terminal(EngineStatus::Unrecoverable { cause })
-            }
-        }
+        self.roll_back_to(observed[lo - 1].number)
     }
 }
 
@@ -722,39 +700,6 @@ where
             inner: Driver::with_sink(fold, source, sink, engine, config)?,
         })
     }
-
-    /// Resumes from a recovered engine, offering durable snapshots to the sink.
-    pub fn resume_with_sink(
-        engine: Engine<F>,
-        source: S,
-        sink: K,
-        genesis: F,
-        config: DriverConfig,
-    ) -> Result<Self, ConfigError> {
-        Ok(Self {
-            inner: Driver::resume_with_sink(engine, source, sink, genesis, config)?,
-        })
-    }
-}
-
-impl<F, S, A> Probed<F, S, A, NoSink>
-where
-    F: Fold + Clone,
-    S: ProbeSource<Event = F::Event>,
-    A: Anchor<View = F::View>,
-{
-    /// Builds a probe-capable driver with an anchor whose view is checked at checkpoints.
-    pub fn with_anchor(
-        fold: F,
-        source: S,
-        anchor: A,
-        engine: EngineConfig,
-        config: DriverConfig,
-    ) -> Result<Self, ConfigError> {
-        Ok(Self {
-            inner: Driver::with_anchor(fold, source, anchor, engine, config)?,
-        })
-    }
 }
 
 impl<F, S, A, K> Probed<F, S, A, K>
@@ -764,38 +709,6 @@ where
     A: Anchor<View = F::View>,
     K: SnapshotSink<F>,
 {
-    /// Builds an anchored probe-capable driver that offers snapshots to the sink.
-    pub fn with_anchor_and_sink(
-        fold: F,
-        source: S,
-        anchor: A,
-        sink: K,
-        engine: EngineConfig,
-        config: DriverConfig,
-    ) -> Result<Self, ConfigError> {
-        Ok(Self {
-            inner: Driver::with_anchor_and_sink(
-                fold, source, anchor, sink, engine, config,
-            )?,
-        })
-    }
-
-    /// Resumes an anchored probe-capable driver that offers snapshots to the sink.
-    pub fn resume_with_anchor_and_sink(
-        engine: Engine<F>,
-        source: S,
-        anchor: A,
-        sink: K,
-        genesis: F,
-        config: DriverConfig,
-    ) -> Result<Self, ConfigError> {
-        Ok(Self {
-            inner: Driver::resume_with_anchor_and_sink(
-                engine, source, anchor, sink, genesis, config,
-            )?,
-        })
-    }
-
     /// Borrows the durability sink.
     pub fn sink(&self) -> &K {
         self.inner.sink()

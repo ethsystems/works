@@ -7,6 +7,7 @@ use std::{
         Arc,
         Condvar,
         Mutex,
+        MutexGuard,
         atomic::{
             AtomicBool,
             Ordering,
@@ -69,8 +70,14 @@ impl From<StoreError> for FlushError {
             StoreError::CorruptManifest
             | StoreError::MissingSnapshot { .. }
             | StoreError::RetainZero => Self::Corrupt,
+            StoreError::Poisoned => Self::Closed,
         }
     }
+}
+
+/// Locks past a poisoned mutex, since every mutex here guards plain settled state.
+fn lock_recovering<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|error| error.into_inner())
 }
 
 /// Counting gate bounding jobs admitted but not yet fully processed.
@@ -89,17 +96,17 @@ impl Admission {
 
     /// Blocks until a slot is available, then takes it.
     fn acquire(&self) {
-        let available = self.available.lock().expect("admission mutex poisoned");
+        let available = lock_recovering(&self.available);
         let mut available = self
             .ready
             .wait_while(available, |slots| *slots == 0)
-            .expect("admission mutex poisoned");
+            .unwrap_or_else(|error| error.into_inner());
         *available -= 1;
     }
 
     /// Returns a slot and wakes one waiter.
     fn release(&self) {
-        let mut available = self.available.lock().expect("admission mutex poisoned");
+        let mut available = lock_recovering(&self.available);
         *available += 1;
         self.ready.notify_one();
     }
@@ -113,10 +120,13 @@ struct TokenState {
 }
 
 impl TokenState {
+    /// Settles the token, keeping the first outcome recorded.
     fn complete(&self, result: Result<(), FlushError>) {
-        let mut guard = self.result.lock().expect("durability token mutex poisoned");
-        *guard = Some(result);
-        self.ready.notify_all();
+        let mut guard = lock_recovering(&self.result);
+        if guard.is_none() {
+            *guard = Some(result);
+            self.ready.notify_all();
+        }
     }
 }
 
@@ -129,26 +139,18 @@ pub struct DurabilityToken {
 impl DurabilityToken {
     /// Blocks until the flush completes or fails.
     pub fn wait(&self) -> Result<(), FlushError> {
-        let guard = self
-            .state
-            .result
-            .lock()
-            .expect("durability token mutex poisoned");
+        let guard = lock_recovering(&self.state.result);
         let guard = self
             .state
             .ready
             .wait_while(guard, |result| result.is_none())
-            .expect("durability token mutex poisoned");
+            .unwrap_or_else(|error| error.into_inner());
         (*guard).expect("condvar wakes only after the result is set")
     }
 
     /// Non-blocking read of the flush outcome, if it has completed.
     pub fn try_result(&self) -> Option<Result<(), FlushError>> {
-        *self
-            .state
-            .result
-            .lock()
-            .expect("durability token mutex poisoned")
+        *lock_recovering(&self.state.result)
     }
 }
 
@@ -157,6 +159,14 @@ struct Job {
     snapshot: Vec<u8>,
     cursor: Option<Position>,
     token: Arc<TokenState>,
+    admission: Arc<Admission>,
+}
+
+impl Drop for Job {
+    fn drop(&mut self) {
+        self.token.complete(Err(FlushError::Closed));
+        self.admission.release();
+    }
 }
 
 /// Marks the flusher poisoned and completes the failing job's own token with its error.
@@ -172,20 +182,15 @@ fn run_flusher<V: Vfs>(
     receiver: mpsc::Receiver<Job>,
     durable_cursor: Arc<Mutex<Option<Position>>>,
     poisoned: Arc<AtomicBool>,
-    admission: Arc<Admission>,
 ) -> SnapshotStore<V> {
     while let Ok(job) = receiver.recv() {
         if poisoned.load(Ordering::Acquire) {
-            job.token.complete(Err(FlushError::Closed));
-            admission.release();
             continue;
         }
         match store.commit(&job.snapshot, job.cursor) {
             Ok(()) => {
                 let committed = store.durable_cursor();
-                let mut watermark = durable_cursor
-                    .lock()
-                    .expect("durable cursor mutex poisoned");
+                let mut watermark = lock_recovering(&durable_cursor);
                 // A commit supersedes whatever the store held, so the watermark
                 // tracks it down as well as up and always names what a reopen
                 // recovers. A resync commits older state and lowers it.
@@ -195,7 +200,6 @@ fn run_flusher<V: Vfs>(
             }
             Err(error) => poison_and_report(&poisoned, &job.token, error),
         }
-        admission.release();
     }
     store
 }
@@ -218,15 +222,8 @@ impl<V: Vfs + Send + 'static> Flusher<V> {
         let admission = Arc::new(Admission::new(queue_depth));
         let thread_cursor = Arc::clone(&durable_cursor);
         let thread_poisoned = Arc::clone(&poisoned);
-        let thread_admission = Arc::clone(&admission);
         let handle = thread::spawn(move || {
-            run_flusher(
-                store,
-                receiver,
-                thread_cursor,
-                thread_poisoned,
-                thread_admission,
-            )
+            run_flusher(store, receiver, thread_cursor, thread_poisoned)
         });
         Self {
             sender,
@@ -252,9 +249,9 @@ impl<V: Vfs + Send + 'static> Flusher<V> {
             snapshot,
             cursor,
             token: Arc::clone(&token),
+            admission: Arc::clone(&self.admission),
         };
         if self.sender.send(job).is_err() {
-            self.admission.release();
             return Err(FlushError::Closed);
         }
         Ok(DurabilityToken { state: token })
@@ -263,10 +260,7 @@ impl<V: Vfs + Send + 'static> Flusher<V> {
     /// Cursor a reopen of the store would recover; falls when a resync commits
     /// older state.
     pub fn durable_cursor(&self) -> Option<Position> {
-        *self
-            .durable_cursor
-            .lock()
-            .expect("durable cursor mutex poisoned")
+        *lock_recovering(&self.durable_cursor)
     }
 
     /// Stops the thread and returns the store; pending jobs complete first.

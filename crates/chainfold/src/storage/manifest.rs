@@ -23,6 +23,12 @@ const CRC_OFFSET: usize = CRC_COVERED_LEN;
 
 /// Byte length of one encoded manifest slot.
 pub(crate) const SLOT_SIZE: usize = CRC_OFFSET + CRC_LEN;
+
+/// Byte offset between the two slots: one page, so they never share a failure domain
+pub(crate) const SLOT_STRIDE: usize = 4096;
+
+/// Byte length of the whole manifest: the second slot one stride in.
+pub(crate) const MANIFEST_SIZE: usize = SLOT_STRIDE + SLOT_SIZE;
 /// Manifest file name within a store directory; read by the snapshot store.
 pub(crate) const MANIFEST_FILE: &str = "manifest";
 

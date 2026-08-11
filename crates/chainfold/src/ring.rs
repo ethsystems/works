@@ -103,6 +103,12 @@ impl BlockRing {
         None
     }
 
+    /// Empties the ring, keeping the allocation; stale slots stay unreachable below len.
+    pub(crate) fn clear(&mut self) {
+        self.head = 0;
+        self.len = 0;
+    }
+
     pub(crate) fn iter(&self) -> Observed<'_> {
         Observed {
             ring: self,

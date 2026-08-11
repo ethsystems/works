@@ -91,6 +91,7 @@ impl crate::snapshot::Persist for RecordingFold {
     fn encode_state(&self, out: &mut Vec<u8>) {
         let count =
             u64::try_from(self.applied.len()).expect("recorded entry count fits in u64");
+        out.reserve(8 + 24 * self.applied.len());
         out.extend_from_slice(&count.to_le_bytes());
         for (pos, event) in &self.applied {
             out.extend_from_slice(&pos.block.to_le_bytes());
