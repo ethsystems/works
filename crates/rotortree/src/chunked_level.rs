@@ -10,6 +10,8 @@ use std::{
     vec::Vec,
 };
 
+use core::mem::MaybeUninit;
+
 use crate::{
     Hash,
     TreeError,
@@ -37,15 +39,51 @@ impl Chunk {
         Arc::make_mut(&mut self.0)
     }
 
+    /// Allocate a chunk and let `f` write its `CHUNK_SIZE` hashes in place.
     #[inline]
-    pub(crate) fn new_memory(data: [Hash; CHUNK_SIZE]) -> Self {
-        Self(Arc::new(data))
+    pub(crate) fn from_fn(f: impl FnOnce(&mut [MaybeUninit<Hash>])) -> Self {
+        Self(new_arc_from_fn(f))
     }
 
     #[cfg(test)]
     pub(crate) fn ptr_eq(a: &Self, b: &Self) -> bool {
         Arc::ptr_eq(&a.0, &b.0)
     }
+}
+
+/// Allocate a chunk and let `f` write its contents in place.
+#[inline]
+fn new_arc_from_fn(f: impl FnOnce(&mut [MaybeUninit<Hash>])) -> Arc<[Hash; CHUNK_SIZE]> {
+    let mut arc = Arc::<[Hash; CHUNK_SIZE]>::new_uninit();
+    // SAFETY: freshly allocated so uniquely owned, and `MaybeUninit<Hash>` has
+    // the same layout as `Hash`.
+    let out = unsafe {
+        &mut *(Arc::get_mut(&mut arc).unwrap_unchecked().as_mut_ptr()
+            as *mut [MaybeUninit<Hash>; CHUNK_SIZE])
+    };
+    f(out);
+    // SAFETY: `f` is contracted to initialise all CHUNK_SIZE elements.
+    unsafe { arc.assume_init() }
+}
+
+/// Minimum chunks to parallelize.
+#[cfg(feature = "parallel")]
+const PAR_MIN_CHUNKS: usize = 16;
+
+#[inline]
+fn build_chunks(n: usize, build: impl Fn(usize) -> Chunk + Send + Sync) -> Vec<Chunk> {
+    #[cfg(feature = "parallel")]
+    if n >= PAR_MIN_CHUNKS {
+        use rayon::prelude::*;
+        return (0..n).into_par_iter().map(build).collect();
+    }
+    (0..n).map(build).collect()
+}
+
+#[inline]
+pub(crate) fn as_uninit_mut(s: &mut [Hash]) -> &mut [MaybeUninit<Hash>] {
+    // SAFETY: `MaybeUninit<Hash>` has the same layout as `Hash`.
+    unsafe { &mut *(s as *mut [Hash] as *mut [MaybeUninit<Hash>]) }
 }
 
 #[cfg(feature = "storage")]
@@ -87,9 +125,10 @@ impl Chunk {
         }
     }
 
+    /// Allocate a chunk and let `f` write its `CHUNK_SIZE` hashes in place.
     #[inline]
-    pub(crate) fn new_memory(data: [Hash; CHUNK_SIZE]) -> Self {
-        Self(ChunkInner::Memory(Arc::new(data)))
+    pub(crate) fn from_fn(f: impl FnOnce(&mut [MaybeUninit<Hash>])) -> Self {
+        Self(ChunkInner::Memory(new_arc_from_fn(f)))
     }
 
     pub(crate) fn new_mapped(
@@ -114,8 +153,7 @@ impl Chunk {
     }
 }
 
-/// A single level of the tree stored as segmented chunks plus a
-/// fixed-size tail buffer.
+/// A single level of the tree, stored as segmented chunks.
 #[derive(Clone)]
 pub(crate) struct ChunkedLevel {
     /// Immutable segments of committed chunks, shared with snapshots.
@@ -123,10 +161,6 @@ pub(crate) struct ChunkedLevel {
     /// Mutable buffer of committed chunks not yet frozen into a segment.
     /// At most `CHUNKS_PER_SEGMENT - 1` items.
     pending: Vec<Chunk>,
-    /// Fixed-size tail buffer (partially filled).
-    tail: [Hash; CHUNK_SIZE],
-    /// Number of valid entries in `tail`.
-    tail_len: usize,
     /// Total number of hashes in this level.
     len: usize,
 }
@@ -136,8 +170,6 @@ impl ChunkedLevel {
         Self {
             segments: Vec::new(),
             pending: Vec::new(),
-            tail: [[0u8; 32]; CHUNK_SIZE],
-            tail_len: 0,
             len: 0,
         }
     }
@@ -145,12 +177,7 @@ impl ChunkedLevel {
     /// Construct a level from checkpoint data, partitioning chunks into
     /// segments and pending.
     #[cfg(feature = "storage")]
-    pub(crate) fn from_parts(
-        chunks: Vec<Chunk>,
-        tail: [Hash; CHUNK_SIZE],
-        tail_len: usize,
-        len: usize,
-    ) -> Self {
+    pub(crate) fn from_parts(chunks: Vec<Chunk>, len: usize) -> Self {
         let full_segments = chunks.len() / CHUNKS_PER_SEGMENT;
         let mut segments = Vec::with_capacity(full_segments);
         let mut drain = chunks.into_iter();
@@ -167,8 +194,6 @@ impl ChunkedLevel {
         Self {
             segments,
             pending,
-            tail,
-            tail_len,
             len,
         }
     }
@@ -179,23 +204,28 @@ impl ChunkedLevel {
         self.len
     }
 
-    /// Total number of committed chunks (segments + pending).
+    /// Total number of chunks, i.e. `len` rounded up to a whole chunk.
+    #[cfg(any(feature = "storage", test))]
     #[inline]
     pub(crate) fn chunk_count(&self) -> usize {
         self.segments.len() * CHUNKS_PER_SEGMENT + self.pending.len()
     }
 
-    /// Resolve a chunk index to a slice reference.
+    /// The only place that knows chunks live in frozen segments below
+    /// `committed` and in `pending` above it.
     #[inline(always)]
-    fn chunk_slice(&self, chunk_idx: usize) -> &[Hash; CHUNK_SIZE] {
+    pub(crate) fn chunk(&self, chunk_idx: usize) -> &Chunk {
         let committed = self.segments.len() * CHUNKS_PER_SEGMENT;
         if chunk_idx < committed {
-            let seg_idx = chunk_idx / CHUNKS_PER_SEGMENT;
-            let seg_off = chunk_idx % CHUNKS_PER_SEGMENT;
-            self.segments[seg_idx][seg_off].as_slice()
+            &self.segments[chunk_idx / CHUNKS_PER_SEGMENT][chunk_idx % CHUNKS_PER_SEGMENT]
         } else {
-            self.pending[chunk_idx - committed].as_slice()
+            &self.pending[chunk_idx - committed]
         }
+    }
+
+    #[inline(always)]
+    fn chunk_slice(&self, chunk_idx: usize) -> &[Hash; CHUNK_SIZE] {
+        self.chunk(chunk_idx).as_slice()
     }
 
     /// Read a hash at the given index.
@@ -207,57 +237,42 @@ impl ChunkedLevel {
                 size: self.len as u64,
             });
         }
-        let chunk_idx = index / CHUNK_SIZE;
-        let offset = index % CHUNK_SIZE;
-        if chunk_idx < self.chunk_count() {
-            Ok(self.chunk_slice(chunk_idx)[offset])
-        } else {
-            Ok(self.tail[offset])
-        }
+        Ok(self.chunk_slice(index / CHUNK_SIZE)[index % CHUNK_SIZE])
     }
 
-    /// Copy a contiguous group of hashes into `out`.
-    /// Fast path when the group falls within a single chunk or tail.
+    /// Copy `[start, start + count)` into `out`.
     #[inline(always)]
     pub(crate) fn get_group(&self, start: usize, count: usize, out: &mut [Hash]) {
-        let chunk_idx = start / CHUNK_SIZE;
-        let offset = start % CHUNK_SIZE;
-        if offset + count <= CHUNK_SIZE {
-            let src = if chunk_idx < self.chunk_count() {
-                &self.chunk_slice(chunk_idx)[offset..offset + count]
-            } else {
-                &self.tail[offset..offset + count]
-            };
-            out[..count].copy_from_slice(src);
-        } else {
-            for (i, item) in out.iter_mut().enumerate().take(count) {
-                *item = self.get(start + i).expect("checked prev; qed");
-            }
+        let mut at = 0;
+        for run in self.runs(start, count) {
+            out[at..at + run.len()].copy_from_slice(run);
+            at += run.len();
         }
     }
 
-    /// Borrow a contiguous group of `count` hashes starting at `start`,
-    /// when it lies wholly within a single chunk or the tail.
-    ///
-    /// Returns `None` if the group straddles a chunk/tail boundary, in which
-    /// case the caller must fall back to a copying read. For the batched
-    /// parent path, full groups of arity N in {2,4,8,16} are chunk-aligned
-    /// (`CHUNK_SIZE % N == 0`), so this always returns `Some`.
+    /// Borrow `[start, start + count)` as contiguous runs, one per chunk.
     #[inline]
-    pub(crate) fn group_slice(&self, start: usize, count: usize) -> Option<&[Hash]> {
-        if start + count > self.len {
-            return None;
-        }
-        let chunk_idx = start / CHUNK_SIZE;
-        let offset = start % CHUNK_SIZE;
-        if offset + count > CHUNK_SIZE {
-            return None;
-        }
-        if chunk_idx < self.chunk_count() {
-            Some(&self.chunk_slice(chunk_idx)[offset..offset + count])
-        } else {
-            Some(&self.tail[offset..offset + count])
-        }
+    pub(crate) fn runs(
+        &self,
+        start: usize,
+        count: usize,
+    ) -> impl Iterator<Item = &[Hash]> {
+        debug_assert!(
+            start + count <= self.len,
+            "runs: {start}+{count} > len {}",
+            self.len
+        );
+        let mut done = 0;
+        core::iter::from_fn(move || {
+            if done == count {
+                return None;
+            }
+            let idx = start + done;
+            let offset = idx % CHUNK_SIZE;
+            let take = (CHUNK_SIZE - offset).min(count - done);
+            done += take;
+            Some(&self.chunk_slice(idx / CHUNK_SIZE)[offset..offset + take])
+        })
     }
 
     /// Write a hash at the given index
@@ -278,125 +293,123 @@ impl ChunkedLevel {
             "set_preallocated: index {index} >= len {}",
             self.len
         );
-        let chunk_idx = index / CHUNK_SIZE;
-        let offset = index % CHUNK_SIZE;
+        self.chunk_slice_mut(index / CHUNK_SIZE)[index % CHUNK_SIZE] = value;
+    }
+
+    /// Resolve a chunk index to a mutable slice, copy-on-writing it.
+    #[inline(always)]
+    fn chunk_slice_mut(&mut self, chunk_idx: usize) -> &mut [Hash; CHUNK_SIZE] {
         let committed = self.segments.len() * CHUNKS_PER_SEGMENT;
         if chunk_idx < committed {
             let seg_idx = chunk_idx / CHUNKS_PER_SEGMENT;
             let seg_off = chunk_idx % CHUNKS_PER_SEGMENT;
-            Arc::make_mut(&mut self.segments[seg_idx])[seg_off].make_mut()[offset] =
-                value;
-        } else if chunk_idx - committed < self.pending.len() {
-            self.pending[chunk_idx - committed].make_mut()[offset] = value;
+            Arc::make_mut(&mut self.segments[seg_idx])[seg_off].make_mut()
         } else {
-            self.tail[offset] = value;
+            self.pending[chunk_idx - committed].make_mut()
         }
     }
 
-    /// Append a hash. Promotes the tail when it reaches
-    /// `CHUNK_SIZE`.
-    #[cfg(test)]
-    #[inline]
-    pub(crate) fn push(&mut self, value: Hash) -> Result<(), TreeError> {
-        self.tail[self.tail_len] = value;
-        self.tail_len = self.tail_len.checked_add(1).ok_or(TreeError::MathError)?;
-        self.len = self.len.checked_add(1).ok_or(TreeError::MathError)?;
-        if self.tail_len == CHUNK_SIZE {
-            self.promote_tail();
+    /// Overwrite `[start, start + count)` with hashes produced by `fill`.
+    pub(crate) fn write_with(
+        &mut self,
+        start: usize,
+        count: usize,
+        fill: impl Fn(usize, &mut [MaybeUninit<Hash>]),
+    ) {
+        debug_assert!(
+            start + count <= self.len,
+            "write_with: {start}+{count} > len {}",
+            self.len
+        );
+        let mut done = 0;
+        while done < count {
+            let idx = start + done;
+            let offset = idx % CHUNK_SIZE;
+            let take = (CHUNK_SIZE - offset).min(count - done);
+            let chunk = self.chunk_slice_mut(idx / CHUNK_SIZE);
+            fill(done, as_uninit_mut(&mut chunk[offset..offset + take]));
+            done += take;
         }
-        Ok(())
     }
 
-    pub(crate) fn extend(&mut self, values: &[Hash]) -> Result<(), TreeError> {
-        if values.is_empty() {
+    /// Append `count` hashes produced by `fill`, writing each chunk straight
+    /// into its final allocation.
+    pub(crate) fn extend_with<F>(
+        &mut self,
+        count: usize,
+        fill: F,
+    ) -> Result<(), TreeError>
+    where
+        F: Fn(usize, &mut [MaybeUninit<Hash>]) + Sync,
+    {
+        if count == 0 {
             return Ok(());
         }
-        let new_len = self
-            .len
-            .checked_add(values.len())
-            .ok_or(TreeError::MathError)?;
+        let new_len = self.len.checked_add(count).ok_or(TreeError::MathError)?;
 
-        let mut remaining = values;
+        let offset = self.len % CHUNK_SIZE;
+        let done = if offset > 0 {
+            let take = (CHUNK_SIZE - offset).min(count);
+            let chunk = self.chunk_slice_mut(self.len / CHUNK_SIZE);
+            fill(0, as_uninit_mut(&mut chunk[offset..offset + take]));
+            take
+        } else {
+            0
+        };
 
-        // fill current tail
-        if self.tail_len > 0 {
-            let space = CHUNK_SIZE - self.tail_len;
-            let to_copy = space.min(remaining.len());
-            self.tail[self.tail_len..self.tail_len + to_copy]
-                .copy_from_slice(&remaining[..to_copy]);
-            self.tail_len += to_copy;
-            remaining = &remaining[to_copy..];
-            if self.tail_len == CHUNK_SIZE {
-                self.promote_tail();
+        // fill into allocations
+        if done < count {
+            let n = (count - done).div_ceil(CHUNK_SIZE);
+            self.pending.reserve(n.min(CHUNKS_PER_SEGMENT));
+            let built = build_chunks(n, |ci| {
+                let base = done + ci * CHUNK_SIZE;
+                let take = (count - base).min(CHUNK_SIZE);
+                Chunk::from_fn(|out| {
+                    fill(base, &mut out[..take]);
+                    out[take..].fill(MaybeUninit::new([0u8; 32]));
+                })
+            });
+            for chunk in built {
+                self.push_chunk(chunk);
             }
-        }
-
-        // full chunks — bypass tail
-        let full_chunks = remaining.len() / CHUNK_SIZE;
-        if full_chunks > 0 {
-            self.pending.reserve(full_chunks.min(CHUNKS_PER_SEGMENT));
-            for i in 0..full_chunks {
-                let start = i * CHUNK_SIZE;
-                let chunk: [Hash; CHUNK_SIZE] = remaining[start..start + CHUNK_SIZE]
-                    .try_into()
-                    .expect("slice len == CHUNK_SIZE; qed");
-                self.push_chunk(Chunk::new_memory(chunk));
-            }
-            remaining = &remaining[full_chunks * CHUNK_SIZE..];
-        }
-
-        // tail remainder
-        if !remaining.is_empty() {
-            self.tail[..remaining.len()].copy_from_slice(remaining);
-            self.tail_len = remaining.len();
         }
 
         self.len = new_len;
         Ok(())
     }
 
+    #[cfg(test)]
+    #[inline]
+    pub(crate) fn push(&mut self, value: Hash) -> Result<(), TreeError> {
+        self.extend(&[value])
+    }
+
+    #[inline]
+    pub(crate) fn extend(&mut self, values: &[Hash]) -> Result<(), TreeError> {
+        self.extend_with(values.len(), |off, out| {
+            // SAFETY: `extend_with` only ever asks for disjoint sub-ranges of
+            // the `count` it was given, so `off + out.len() <= values.len()`;
+            // `Hash` and `MaybeUninit<Hash>` share a layout; and `out` is either
+            // a fresh allocation or `self.tail`, neither of which can overlap
+            // the caller's `values`.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    values.as_ptr().add(off),
+                    out.as_mut_ptr().cast::<Hash>(),
+                    out.len(),
+                );
+            }
+        })
+    }
+
+    /// Grow to `target`, zero-filling the new slots.
     pub(crate) fn ensure_len(&mut self, target: usize) -> Result<(), TreeError> {
         if self.len >= target {
             return Ok(());
         }
-        let needed = target - self.len;
-
-        let tail_space = CHUNK_SIZE - self.tail_len;
-        let fill_tail = tail_space.min(needed);
-        debug_assert!(
-            self.tail[self.tail_len..self.tail_len + fill_tail]
-                .iter()
-                .all(|h| *h == [0u8; 32]),
-            "ensure_len: tail slots must be zeroed"
-        );
-        self.tail_len += fill_tail;
-        let mut filled = fill_tail;
-        if self.tail_len == CHUNK_SIZE {
-            self.promote_tail();
-        }
-
-        let remaining = needed - filled;
-        let full_chunks = remaining / CHUNK_SIZE;
-        if full_chunks > 0 {
-            for _ in 0..full_chunks {
-                self.push_chunk(Chunk::new_memory([[0u8; 32]; CHUNK_SIZE]));
-            }
-            filled += full_chunks * CHUNK_SIZE;
-        }
-
-        let leftover = needed - filled;
-        self.tail_len += leftover;
-
-        self.len = target;
-        Ok(())
-    }
-
-    /// Promote the full tail into a chunk, freezing pending if full
-    fn promote_tail(&mut self) {
-        debug_assert_eq!(self.tail_len, CHUNK_SIZE);
-        self.push_chunk(Chunk::new_memory(self.tail));
-        self.tail = [[0u8; 32]; CHUNK_SIZE];
-        self.tail_len = 0;
+        self.extend_with(target - self.len, |_, out| {
+            out.fill(MaybeUninit::new([0u8; 32]));
+        })
     }
 
     /// Push a chunk to pending, freezing into a segment when full
@@ -421,34 +434,9 @@ impl ChunkedLevel {
     /// Collect chunks from index `already` onward
     #[cfg(feature = "storage")]
     pub(crate) fn chunks_since(&self, already: usize) -> Vec<Chunk> {
-        let total = self.chunk_count();
-        if already >= total {
-            return Vec::new();
-        }
-        let committed = self.segments.len() * CHUNKS_PER_SEGMENT;
-        let mut result = Vec::with_capacity(total - already);
-
-        // Collect from segments
-        if already < committed {
-            let start_seg = already / CHUNKS_PER_SEGMENT;
-            let start_off = already % CHUNKS_PER_SEGMENT;
-            for (seg_i, segment) in self.segments.iter().enumerate().skip(start_seg) {
-                let from = if seg_i == start_seg { start_off } else { 0 };
-                for chunk in &segment[from..] {
-                    result.push(chunk.clone());
-                }
-            }
-        }
-
-        // Collect from pending
-        let pending_start = already.saturating_sub(committed);
-        if pending_start < self.pending.len() {
-            for chunk in &self.pending[pending_start..] {
-                result.push(chunk.clone());
-            }
-        }
-
-        result
+        (already..self.chunk_count())
+            .map(|i| self.chunk(i).clone())
+            .collect()
     }
 
     /// Remap the first `count` chunks to mmap-backed chunks (one region per shard)
@@ -466,18 +454,7 @@ impl ChunkedLevel {
             return;
         }
 
-        let committed = self.segments.len() * CHUNKS_PER_SEGMENT;
-        let mut unmapped: Vec<Chunk> =
-            Vec::with_capacity(total.saturating_sub(remap_count));
-        for chunk_idx in remap_count..total {
-            if chunk_idx < committed {
-                let seg_idx = chunk_idx / CHUNKS_PER_SEGMENT;
-                let seg_off = chunk_idx % CHUNKS_PER_SEGMENT;
-                unmapped.push(self.segments[seg_idx][seg_off].clone());
-            } else {
-                unmapped.push(self.pending[chunk_idx - committed].clone());
-            }
-        }
+        let unmapped: Vec<Chunk> = self.chunks_since(remap_count);
 
         self.segments.clear();
         self.pending.clear();
@@ -489,26 +466,5 @@ impl ChunkedLevel {
             })
             .chain(unmapped)
             .for_each(|chunk| self.push_chunk(chunk));
-    }
-
-    /// Access the tail buffer
-    #[cfg(feature = "storage")]
-    pub(crate) fn tail_data(&self) -> &[Hash; CHUNK_SIZE] {
-        &self.tail
-    }
-
-    #[cfg(test)]
-    pub(crate) fn tail_len(&self) -> usize {
-        self.tail_len
-    }
-
-    #[cfg(test)]
-    pub(crate) fn get_chunk(&self, idx: usize) -> &Chunk {
-        let committed = self.segments.len() * CHUNKS_PER_SEGMENT;
-        if idx < committed {
-            &self.segments[idx / CHUNKS_PER_SEGMENT][idx % CHUNKS_PER_SEGMENT]
-        } else {
-            &self.pending[idx - committed]
-        }
     }
 }

@@ -454,7 +454,6 @@ fn checkpoint_round_trip() {
 
     assert!(dir.path().join("data").join("header.bin").exists());
     assert!(dir.path().join("data").join("checkpoint.meta").exists());
-    assert!(dir.path().join("data").join("tails.bin").exists());
 
     tree.close().unwrap();
 

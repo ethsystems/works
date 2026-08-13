@@ -197,51 +197,6 @@ pub(crate) fn read_meta(data_dir: &Path) -> Result<Option<CheckpointMeta>, Stora
     }))
 }
 
-/// Write all level tails atomically (tmp -> fsync -> rename).
-pub(crate) fn write_tails(
-    data_dir: &Path,
-    tails: &[[Hash; CHUNK_SIZE]],
-    max_depth: usize,
-) -> io::Result<()> {
-    let total_size = max_depth * CHUNK_BYTE_SIZE;
-    let mut buf = vec![0u8; total_size];
-
-    for (i, tail) in tails.iter().enumerate() {
-        let base = i * CHUNK_BYTE_SIZE;
-        buf[base..base + CHUNK_BYTE_SIZE].copy_from_slice(tail.as_flattened());
-    }
-
-    atomic_write(&data_dir.join("tails.bin"), &buf)
-}
-
-/// Read all tails from disk. Returns `None` if the file is missing or wrong size
-pub(crate) fn read_tails(
-    data_dir: &Path,
-    max_depth: usize,
-) -> io::Result<Option<Vec<[Hash; CHUNK_SIZE]>>> {
-    let path = data_dir.join("tails.bin");
-    let data = match fs::read(&path) {
-        Ok(d) => d,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e),
-    };
-    let expected = max_depth * CHUNK_BYTE_SIZE;
-    if data.len() != expected {
-        return Ok(None);
-    }
-
-    let mut tails = Vec::with_capacity(max_depth);
-    for i in 0..max_depth {
-        let base = i * CHUNK_BYTE_SIZE;
-        let chunk = &data[base..base + CHUNK_BYTE_SIZE];
-        let mut tail = [[0u8; 32]; CHUNK_SIZE];
-        tail.as_flattened_mut().copy_from_slice(chunk);
-        tails.push(tail);
-    }
-
-    Ok(Some(tails))
-}
-
 pub(crate) fn level_dir_path(data_dir: &Path, level_idx: usize) -> PathBuf {
     data_dir.join(format!("level_{level_idx}"))
 }
