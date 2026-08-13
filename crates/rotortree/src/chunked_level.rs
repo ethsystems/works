@@ -217,8 +217,7 @@ impl ChunkedLevel {
     pub(crate) fn chunk(&self, chunk_idx: usize) -> &Chunk {
         let committed = self.segments.len() * CHUNKS_PER_SEGMENT;
         if chunk_idx < committed {
-            &self.segments[chunk_idx / CHUNKS_PER_SEGMENT]
-                [chunk_idx % CHUNKS_PER_SEGMENT]
+            &self.segments[chunk_idx / CHUNKS_PER_SEGMENT][chunk_idx % CHUNKS_PER_SEGMENT]
         } else {
             &self.pending[chunk_idx - committed]
         }
@@ -253,7 +252,11 @@ impl ChunkedLevel {
 
     /// Borrow `[start, start + count)` as contiguous runs, one per chunk.
     #[inline]
-    pub(crate) fn runs(&self, start: usize, count: usize) -> impl Iterator<Item = &[Hash]> {
+    pub(crate) fn runs(
+        &self,
+        start: usize,
+        count: usize,
+    ) -> impl Iterator<Item = &[Hash]> {
         debug_assert!(
             start + count <= self.len,
             "runs: {start}+{count} > len {}",
@@ -331,7 +334,11 @@ impl ChunkedLevel {
 
     /// Append `count` hashes produced by `fill`, writing each chunk straight
     /// into its final allocation.
-    pub(crate) fn extend_with<F>(&mut self, count: usize, fill: F) -> Result<(), TreeError>
+    pub(crate) fn extend_with<F>(
+        &mut self,
+        count: usize,
+        fill: F,
+    ) -> Result<(), TreeError>
     where
         F: Fn(usize, &mut [MaybeUninit<Hash>]) + Sync,
     {
@@ -460,5 +467,4 @@ impl ChunkedLevel {
             .chain(unmapped)
             .for_each(|chunk| self.push_chunk(chunk));
     }
-
 }

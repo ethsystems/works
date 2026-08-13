@@ -224,8 +224,7 @@ impl<H: Hasher, const N: usize, const MAX_DEPTH: usize> Shared<H, N, MAX_DEPTH> 
             for level_idx in 0..active_levels {
                 // Count only whole chunks as done. The last chunk may be
                 // partially filled and still growing
-                let total_chunks =
-                    state.inner.levels[level_idx].len() / CHUNK_SIZE;
+                let total_chunks = state.inner.levels[level_idx].len() / CHUNK_SIZE;
                 let already = if level_idx < state.checkpointed_chunks.len() {
                     state.checkpointed_chunks[level_idx]
                 } else {
