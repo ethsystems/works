@@ -65,8 +65,8 @@ struct LevelCheckpointData {
     new_chunks: Vec<Chunk>,
     /// start from
     from_chunk: usize,
+    /// Complete chunks only: a partial last chunk is rewritten each checkpoint.
     total_chunks: usize,
-    tail: [Hash; CHUNK_SIZE],
 }
 
 /// checkpoint snapshot
@@ -222,7 +222,10 @@ impl<H: Hasher, const N: usize, const MAX_DEPTH: usize> Shared<H, N, MAX_DEPTH> 
             let mut level_data = Vec::with_capacity(active_levels);
 
             for level_idx in 0..active_levels {
-                let total_chunks = state.inner.levels[level_idx].chunk_count();
+                // Count only whole chunks as done. The last chunk may be
+                // partially filled and still growing
+                let total_chunks =
+                    state.inner.levels[level_idx].len() / CHUNK_SIZE;
                 let already = if level_idx < state.checkpointed_chunks.len() {
                     state.checkpointed_chunks[level_idx]
                 } else {
@@ -232,13 +235,10 @@ impl<H: Hasher, const N: usize, const MAX_DEPTH: usize> Shared<H, N, MAX_DEPTH> 
                 let new_chunks: Vec<Chunk> =
                     state.inner.levels[level_idx].chunks_since(already);
 
-                let tail = *state.inner.levels[level_idx].tail_data();
-
                 level_data.push(LevelCheckpointData {
                     new_chunks,
                     from_chunk: already,
                     total_chunks,
-                    tail,
                 });
             }
 
@@ -279,10 +279,6 @@ impl<H: Hasher, const N: usize, const MAX_DEPTH: usize> Shared<H, N, MAX_DEPTH> 
         for file in &files_to_sync {
             file.sync_data()?;
         }
-
-        let tails: Vec<[Hash; CHUNK_SIZE]> =
-            snap.level_data.iter().map(|ld| ld.tail).collect();
-        checkpoint::write_tails(&self.data_dir, &tails, MAX_DEPTH)?;
 
         #[allow(clippy::cast_possible_truncation)]
         checkpoint::write_meta(

@@ -2,11 +2,17 @@ use crate::{
     Hash,
     Hasher,
     TreeError,
-    chunked_level::ChunkedLevel,
+    chunked_level::{
+        CHUNK_SIZE,
+        ChunkedLevel,
+    },
 };
 
-/// Number of parents per rayon task
-#[cfg(feature = "parallel")]
+/// Parents gathered per `hash_many_into` call.
+const PARENT_WINDOW: usize = 16;
+
+/// Number of parents per rayon task in [`TreeInner::recompute_root`].
+#[cfg(all(feature = "parallel", feature = "storage"))]
 const PAR_CHUNK_SIZE: usize = 64;
 
 #[cfg(feature = "parallel")]
@@ -117,11 +123,9 @@ impl<const N: usize, const MAX_DEPTH: usize> TreeInner<N, MAX_DEPTH> {
         &mut self,
         level_idx: usize,
         chunks: Vec<crate::chunked_level::Chunk>,
-        tail: [Hash; crate::chunked_level::CHUNK_SIZE],
-        tail_len: usize,
         len: usize,
     ) {
-        self.levels[level_idx] = ChunkedLevel::from_parts(chunks, tail, tail_len, len);
+        self.levels[level_idx] = ChunkedLevel::from_parts(chunks, len);
     }
 
     /// Recompute the root hash from level 0 data bottom-up
@@ -431,22 +435,22 @@ impl<H: Hasher, const N: usize, const MAX_DEPTH: usize> LeanIMT<H, N, MAX_DEPTH>
         let next_level = level + 1;
 
         if next_level < levels.len() {
+            levels[next_level].ensure_len(num_parents)?;
             // Split so the child level is borrowed immutably while the parent
             // level is written mutably.
             let (head, tail) = levels.split_at_mut(next_level);
             let child = &head[level];
             let parent = &mut tail[0];
 
-            // Leading full groups (count == N) batch through hash_many_into.
-            // The final group is full iff `level_len` is a multiple of N.
-            let full_parents = (level_len / N).max(start_parent);
-            Self::_batch_full_groups(child, parent, start_parent, full_parents, hasher);
-
-            // Trailing partial group / lift (empty range when level_len % N == 0).
-            for parent_idx in full_parents..num_parents {
-                let p = Self::_compute_parent(child, parent_idx, level_len, hasher)?;
-                parent.set_preallocated(parent_idx, p);
-            }
+            parent.write_with(start_parent, num_parents - start_parent, |off, out| {
+                Self::_compute_parents_batched(
+                    child,
+                    start_parent + off,
+                    level_len,
+                    hasher,
+                    out,
+                );
+            });
 
             // At the root level there is exactly one parent; it is the root.
             if is_root_level {
@@ -465,59 +469,57 @@ impl<H: Hasher, const N: usize, const MAX_DEPTH: usize> LeanIMT<H, N, MAX_DEPTH>
         Ok(())
     }
 
-    /// Hash the full groups `start_parent..full_parents` of `child` into
-    /// `parent`, batching eligible runs through [`Hasher::hash_many_into`].
+    /// Fill `out` with parents `start_parent .. start_parent + out.len()`,
+    /// batching full groups through [`Hasher::hash_many_into`] and falling back
+    /// to the scalar [`Self::_compute_parent`] for the trailing partial group
+    /// and the lift.
     #[inline]
-    fn _batch_full_groups(
+    fn _compute_parents_batched(
         child: &ChunkedLevel,
-        parent: &mut ChunkedLevel,
         start_parent: usize,
-        full_parents: usize,
+        level_len: usize,
         hasher: &H,
+        out: &mut [core::mem::MaybeUninit<Hash>],
     ) {
-        /// Parents gathered per `hash_many_into` call. The Blake3 override
-        /// re-splits this into `simd_degree`-sized SIMD calls internally.
-        const WINDOW: usize = 16;
+        let full = if CHUNK_SIZE.is_multiple_of(N) {
+            (level_len / N).saturating_sub(start_parent).min(out.len())
+        } else {
+            0
+        };
 
-        let mut parent_idx = start_parent;
-        let mut refs: [&[Hash]; WINDOW] = [&[]; WINDOW];
-        let mut out: [Hash; WINDOW] = [[0u8; 32]; WINDOW];
-        while parent_idx < full_parents {
-            let take = (full_parents - parent_idx).min(WINDOW);
-            let mut filled = 0;
-            for slot in refs.iter_mut().take(take) {
-                let start = (parent_idx + filled) * N;
-                match child.group_slice(start, N) {
-                    Some(g) => *slot = g,
-                    // Group straddles a boundary (cannot happen for eligible N
-                    // since CHUNK_SIZE % N == 0, but stay correct anyway):
-                    // stop the window here and let the scalar tail finish it.
-                    None => break,
+        let mut refs: [&[Hash]; PARENT_WINDOW] = [&[]; PARENT_WINDOW];
+        let mut staging: [Hash; PARENT_WINDOW] = [[0u8; 32]; PARENT_WINDOW];
+        let mut i = 0;
+        let mut win = 0;
+        for run in child.runs(start_parent * N, full * N) {
+            for group in run.chunks_exact(N) {
+                refs[win] = group;
+                win += 1;
+                if win == PARENT_WINDOW {
+                    hasher.hash_many_into(&refs, &mut staging);
+                    for (k, &h) in staging.iter().enumerate() {
+                        out[i + k].write(h);
+                    }
+                    i += win;
+                    win = 0;
                 }
-                filled += 1;
             }
-            if filled == 0 {
-                // Could not borrow even one group contiguously; scalar.
-                let p = hasher.hash_children(&Self::_copy_group(child, parent_idx));
-                parent.set_preallocated(parent_idx, p);
-                parent_idx += 1;
-                continue;
-            }
-            hasher.hash_many_into(&refs[..filled], &mut out[..filled]);
-            for (i, &h) in out[..filled].iter().enumerate() {
-                parent.set_preallocated(parent_idx + i, h);
-            }
-            parent_idx += filled;
         }
-    }
+        if win > 0 {
+            hasher.hash_many_into(&refs[..win], &mut staging[..win]);
+            for (k, &h) in staging[..win].iter().enumerate() {
+                out[i + k].write(h);
+            }
+            i += win;
+        }
 
-    /// Copy a full N-child group into a stack buffer (boundary-straddling
-    /// fallback for `_batch_full_groups`).
-    #[inline]
-    fn _copy_group(child: &ChunkedLevel, parent_idx: usize) -> [Hash; N] {
-        let mut buf = [[0u8; 32]; N];
-        child.get_group(parent_idx * N, N, &mut buf);
-        buf
+        // remainder
+        while i < out.len() {
+            let p = Self::_compute_parent(child, start_parent + i, level_len, hasher)
+                .expect("ensure_len guarantees valid indices");
+            out[i].write(p);
+            i += 1;
+        }
     }
 
     pub(crate) fn _insert_many(
@@ -543,18 +545,6 @@ impl<H: Hasher, const N: usize, const MAX_DEPTH: usize> LeanIMT<H, N, MAX_DEPTH>
 
         inner.levels[0].extend(leaves)?;
 
-        // allocate upfront
-        {
-            let mut level_len = inner.levels[0].len();
-            for level in 0..depth {
-                let num_parents = level_len.div_ceil(N);
-                if level + 1 < MAX_DEPTH {
-                    inner.levels[level + 1].ensure_len(num_parents)?;
-                }
-                level_len = num_parents;
-            }
-        }
-
         let old_size_usize = u64_to_usize(inner.size)?;
         let mut start_parent = old_size_usize / N;
 
@@ -564,8 +554,6 @@ impl<H: Hasher, const N: usize, const MAX_DEPTH: usize> LeanIMT<H, N, MAX_DEPTH>
             [0u8; 32]
         };
 
-        #[cfg(feature = "parallel")]
-        let mut par_buf: std::vec::Vec<Hash> = std::vec::Vec::new();
         #[cfg(feature = "parallel")]
         let par_threshold = parallel_threshold();
 
@@ -577,47 +565,39 @@ impl<H: Hasher, const N: usize, const MAX_DEPTH: usize> LeanIMT<H, N, MAX_DEPTH>
             #[cfg(feature = "parallel")]
             {
                 let work = num_parents - start_parent;
-                if work >= par_threshold {
-                    use rayon::prelude::*;
-
+                if work >= par_threshold && level + 1 < MAX_DEPTH {
                     let split_at = level + 1;
                     let (child_levels, parent_levels) =
                         inner.levels.split_at_mut(split_at);
                     let child_level = &child_levels[level];
+                    let parent = &mut parent_levels[0];
 
-                    par_buf.clear();
-                    par_buf.reserve(work);
+                    let overlap = usize::from(start_parent < parent.len());
+                    if overlap == 1 {
+                        parent.write_with(start_parent, 1, |_, out| {
+                            Self::_compute_parents_batched(
+                                child_level,
+                                start_parent,
+                                level_len,
+                                hasher,
+                                out,
+                            );
+                        });
+                    }
 
-                    let spare = &mut par_buf.spare_capacity_mut()[..work];
-                    spare.par_chunks_mut(PAR_CHUNK_SIZE).enumerate().for_each(
-                        |(ci, chunk)| {
-                            let base = start_parent + ci * PAR_CHUNK_SIZE;
-                            for (i, slot) in chunk.iter_mut().enumerate() {
-                                slot.write(
-                                    Self::_compute_parent(
-                                        child_level,
-                                        base + i,
-                                        level_len,
-                                        hasher,
-                                    )
-                                    .expect("ensure_len guarantees valid indices"),
-                                );
-                            }
-                        },
-                    );
-                    // SAFETY: the parallel loop above initialised every
-                    // element in `spare[..work]` via `MaybeUninit::write`.
-                    unsafe { par_buf.set_len(work) };
+                    let appended = start_parent + overlap;
+                    parent.extend_with(work - overlap, |off, out| {
+                        Self::_compute_parents_batched(
+                            child_level,
+                            appended + off,
+                            level_len,
+                            hasher,
+                            out,
+                        );
+                    })?;
 
-                    let parent_level = &mut parent_levels[0];
-                    for (i, &parent) in par_buf.iter().enumerate() {
-                        let parent_idx = start_parent + i;
-                        if split_at < MAX_DEPTH {
-                            parent_level.set_preallocated(parent_idx, parent);
-                        }
-                        if is_root_level {
-                            root = parent;
-                        }
+                    if is_root_level {
+                        root = parent.get(num_parents - 1)?;
                     }
                 } else {
                     Self::_insert_many_level_seq(
@@ -727,20 +707,23 @@ mod tests {
     }
 
     #[test]
-    fn chunked_level_promotes_at_chunk_size() {
+    fn chunked_level_pads_partial_chunk_with_zeros() {
         let mut level = ChunkedLevel::new();
         for i in 0..CHUNK_SIZE {
             level.push(leaf(i as u32)).unwrap();
         }
         assert_eq!(level.chunk_count(), 1);
-        assert_eq!(level.tail_len(), 0);
         assert_eq!(level.len(), CHUNK_SIZE);
 
-        // One more goes into the new tail.
+        // One more opens a second, partially filled chunk.
         level.push(leaf(0xFF)).unwrap();
-        assert_eq!(level.chunk_count(), 1);
-        assert_eq!(level.tail_len(), 1);
+        assert_eq!(level.chunk_count(), 2);
         assert_eq!(level.len(), CHUNK_SIZE + 1);
+        assert!(
+            level.chunk(1).as_slice()[1..]
+                .iter()
+                .all(|h| *h == [0u8; 32])
+        );
     }
 
     #[test]
@@ -752,7 +735,7 @@ mod tests {
         let snap = level.clone();
         assert_eq!(snap.len(), level.len());
         // The completed chunk Arc is shared.
-        assert!(Chunk::ptr_eq(level.get_chunk(0), snap.get_chunk(0)));
+        assert!(Chunk::ptr_eq(level.chunk(0), snap.chunk(0)));
         // Data matches.
         for i in 0..level.len() {
             assert_eq!(level.get(i).unwrap(), snap.get(i).unwrap());

@@ -168,21 +168,16 @@ where
         }
     }
 
-    let tails = match checkpoint::read_tails(data_dir, MAX_DEPTH)? {
-        Some(t) => t,
-        None => return recover(wal_file, hasher),
-    };
-
     let mut inner = TreeInner::<N, MAX_DEPTH>::new();
 
-    for level_idx in 0..=depth.min(MAX_DEPTH - 1) {
-        let len = level_lens[level_idx];
+    let active = depth.min(MAX_DEPTH - 1) + 1;
+    for (level_idx, &len) in level_lens.iter().enumerate().take(active) {
         if len == 0 {
             continue;
         }
 
-        let num_chunks = len / CHUNK_SIZE;
-        let tail_len = len % CHUNK_SIZE;
+        // Every chunk on disk, including a zero-padded partial last one.
+        let num_chunks = len.div_ceil(CHUNK_SIZE);
 
         let regions = if num_chunks > 0 {
             checkpoint::mmap_level_shards(data_dir, level_idx, num_chunks)?
@@ -202,7 +197,7 @@ where
                 .collect()
         };
 
-        inner.set_level_from_parts(level_idx, chunks, tails[level_idx], tail_len, len);
+        inner.set_level_from_parts(level_idx, chunks, len);
     }
 
     inner.root = if leaf_count > 0 {
