@@ -28,7 +28,7 @@ use criterion::{
     criterion_main,
 };
 
-const KAT_PATH: &str = "tests/kat/mayo2.rsp";
+const KAT_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/kat/mayo2.rsp");
 const SIG_BYTES: usize = 186;
 const CPK_BYTES: usize = 4912;
 const N_KATS: usize = 10;
