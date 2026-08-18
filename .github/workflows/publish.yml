@@ -140,7 +140,7 @@ jobs:
 
       # This action lives outside the privileged job on purpose. It fetches
       # prebuilt binaries, so it never runs where an OIDC token is reachable.
-      - uses: taiki-e/install-action@6c6fd71fe4fb72c3697d269963d0e15df8adedad # v2
+      - uses: taiki-e/install-action@288e746965032cfcc232e09af2daf5f23c14d780 # v2
         with:
           tool: cargo-hack,cargo-nextest,cargo-audit,cargo-semver-checks
 
