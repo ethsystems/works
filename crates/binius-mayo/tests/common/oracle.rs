@@ -11,9 +11,9 @@
 use aes::{
     Aes128,
     cipher::{
-        BlockEncrypt,
+        Block,
+        BlockCipherEncrypt,
         KeyInit,
-        generic_array::GenericArray,
     },
 };
 use sha3::{
@@ -299,26 +299,23 @@ pub fn mul_gf16(a: u8, b: u8) -> u8 {
 /// fallback `aes_c.c`: `iv[16] = {0}` and `ivw[3] = swap32(cc)` →
 /// counter occupies bytes 12..15 big-endian, starting at 0).
 fn aes128_ctr_keystream(pk_seed: &[u8; PK_SEED_BYTES], output_len: usize) -> Vec<u8> {
-    let key = GenericArray::from_slice(pk_seed);
-    let cipher = Aes128::new(key);
+    let cipher = Aes128::new_from_slice(pk_seed).expect("pk_seed must be 16 bytes");
 
     let n_full = output_len / 16;
     let tail = output_len % 16;
     let mut out = vec![0u8; output_len];
 
     for i in 0..n_full {
-        let mut block = [0u8; 16];
+        let mut block = Block::<Aes128>::default();
         block[12..16].copy_from_slice(&(i as u32).to_be_bytes());
-        let mut blk = GenericArray::clone_from_slice(&block);
-        cipher.encrypt_block(&mut blk);
-        out[i * 16..(i + 1) * 16].copy_from_slice(blk.as_slice());
+        cipher.encrypt_block(&mut block);
+        out[i * 16..(i + 1) * 16].copy_from_slice(block.as_slice());
     }
     if tail > 0 {
-        let mut block = [0u8; 16];
+        let mut block = Block::<Aes128>::default();
         block[12..16].copy_from_slice(&(n_full as u32).to_be_bytes());
-        let mut blk = GenericArray::clone_from_slice(&block);
-        cipher.encrypt_block(&mut blk);
-        out[n_full * 16..n_full * 16 + tail].copy_from_slice(&blk.as_slice()[..tail]);
+        cipher.encrypt_block(&mut block);
+        out[n_full * 16..n_full * 16 + tail].copy_from_slice(&block.as_slice()[..tail]);
     }
     out
 }

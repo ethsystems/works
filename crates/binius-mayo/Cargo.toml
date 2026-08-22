@@ -29,7 +29,7 @@ binius-prover     = { git = "https://github.com/binius-zk/binius64", rev = "3bc7
 binius-verifier   = { git = "https://github.com/binius-zk/binius64", rev = "3bc7451dc3c52af6383fcd99892c6892f57e89b0" }
 binius-hash       = { git = "https://github.com/binius-zk/binius64", rev = "3bc7451dc3c52af6383fcd99892c6892f57e89b0" }
 sha3              = "=0.10.9"
-aes               = "=0.8.4"
+aes               = "=0.9.2"
 rand              = "0.10"
 
 [dev-dependencies]
