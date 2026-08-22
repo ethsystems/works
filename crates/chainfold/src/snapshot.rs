@@ -540,7 +540,7 @@ mod tests {
         // given a durable snapshot taken at the block 2 checkpoint after folding to block 4
         let mut engine = engine_checkpointed_at_block_two();
         engine.checkpoint();
-        let checkpoint_view = engine.view();
+        let checkpoint_view = engine.fold().applied.clone();
         let checkpoint_ring: Vec<BlockRef> = engine.observed().collect();
         fold_on_to_block_four(&mut engine);
         let mut durable = Vec::new();
@@ -551,7 +551,7 @@ mod tests {
                 .unwrap();
         // then cursor, view, and observed ring equal the checkpoint-time state
         assert_eq!(decoded.cursor(), Some(Position::new(2, 0)));
-        assert_eq!(decoded.view(), checkpoint_view);
+        assert_eq!(decoded.fold().applied, checkpoint_view);
         assert_eq!(decoded.observed().collect::<Vec<_>>(), checkpoint_ring);
     }
 
@@ -590,7 +590,7 @@ mod tests {
             decoded.observed().collect::<Vec<_>>(),
             engine.observed().collect::<Vec<_>>()
         );
-        assert_eq!(decoded.view(), engine.view());
+        assert_eq!(decoded.fold().applied, engine.fold().applied);
         let mut re_encoded = Vec::new();
         decoded.encode_snapshot(&mut re_encoded).unwrap();
         assert_eq!(re_encoded, encoded);
@@ -629,7 +629,7 @@ mod tests {
             Engine::<RecordingFold>::decode_snapshot(&encoded, test_config()).unwrap();
         // then the payload exceeds 4 MiB and the view survives the round trip
         assert!(encoded.len() > 4 << 20);
-        assert_eq!(decoded.view(), engine.view());
+        assert_eq!(decoded.fold().applied, engine.fold().applied);
     }
 
     #[test]

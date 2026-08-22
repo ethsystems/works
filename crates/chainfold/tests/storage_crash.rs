@@ -12,7 +12,6 @@ use chainfold::{
     Engine,
     EngineConfig,
     Position,
-    Tickable,
     storage::{
         Flusher,
         SnapshotStore,
@@ -146,13 +145,13 @@ proptest! {
     }
 }
 
-/// Builds a ten-block chain serving four event-bearing blocks per poll.
+/// Builds a ten-block chain the driver reads four blocks at a time.
 fn resume_chain() -> ScriptedChain {
     let mut chain = ScriptedChain::new(1);
     for value in 1..=10u64 {
         chain.push_block(&[value]);
     }
-    chain.set_batch_blocks(4);
+    chain.set_window(4);
     chain
 }
 
@@ -170,7 +169,7 @@ fn flusher_sink_persists_and_resumes() {
         DriverConfig {
             checkpoint_interval: Some(2),
             snapshot_interval: Some(1),
-            ..DriverConfig::default()
+            ..DriverConfig::from_block(1)
         },
     )
     .unwrap();
@@ -193,7 +192,7 @@ fn flusher_sink_persists_and_resumes() {
         engine,
         resume_chain(),
         RecordingFold::default(),
-        DriverConfig::default(),
+        DriverConfig::from_block(1),
     )
     .unwrap();
     let resume_cursor = resumed.engine().cursor();
@@ -208,5 +207,5 @@ fn flusher_sink_persists_and_resumes() {
     let expected: Vec<(Position, u64)> = (1..=10u64)
         .map(|value| (Position::new(value, 0), value))
         .collect();
-    assert_eq!(resumed.engine().view(), expected);
+    assert_eq!(resumed.engine().fold().applied, expected);
 }

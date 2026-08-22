@@ -1,17 +1,16 @@
 //! End to end: fold a chain to the tip while a flusher persists trailing snapshots,
 //! recover from a reorg, then restart from the durable cursor. Doubles as the manual
-//! `Tickable` loop a non-tokio consumer writes.
+//! tick loop a non-tokio consumer writes.
 
 use std::time::Duration;
 
 use chainfold::{
+    Driver,
     DriverConfig,
     Engine,
     EngineConfig,
     Position,
-    Probed,
     Tick,
-    Tickable,
     harness,
     storage::{
         Flusher,
@@ -52,7 +51,7 @@ fn build_chain() -> ScriptedChain {
             chain.push_block(&[]);
         }
     }
-    chain.set_batch_blocks(1);
+    chain.set_window(1);
     chain
 }
 
@@ -75,7 +74,7 @@ async fn main() {
         poll_interval: Duration::from_millis(10),
         ..DriverConfig::default()
     };
-    let driver = Probed::with_sink(
+    let driver = Driver::with_sink(
         RecordingFold::default(),
         chain,
         Flusher::spawn(store, QUEUE_DEPTH),
@@ -94,7 +93,10 @@ async fn main() {
     println!("durable cursor: {:?}", durable.durable_cursor);
 
     let mut driver = handle.shutdown().await;
-    println!("view length before reorg: {}", driver.engine().view().len());
+    println!(
+        "view length before reorg: {}",
+        driver.engine().fold().applied.len()
+    );
 
     // replace the last four blocks with five, so the post-reorg chain is taller
     let replacements: [&[u64]; 5] = [&[900, 901], &[], &[], &[910, 911], &[]];
@@ -116,7 +118,7 @@ async fn main() {
         }
     }
 
-    let live_view = driver.engine().view();
+    let live_view = driver.engine().fold().applied.clone();
     println!("view length after recovery: {}", live_view.len());
     let post_reorg_chain = driver.source_mut().clone();
     let store = driver
@@ -131,7 +133,7 @@ async fn main() {
     let engine =
         Engine::<RecordingFold>::decode_snapshot(&recovered.snapshot, engine_config())
             .expect("snapshot decodes cleanly");
-    let mut resumed = Probed::resume(
+    let mut resumed = Driver::resume(
         engine,
         post_reorg_chain,
         RecordingFold::default(),
@@ -139,7 +141,7 @@ async fn main() {
     )
     .expect("resume configuration is valid");
     while !matches!(resumed.tick(), Tick::Idle) {}
-    assert_eq!(resumed.engine().view(), live_view);
+    assert_eq!(resumed.engine().fold().applied, live_view);
     println!(
         "restart from the durable cursor converged, {} entries",
         live_view.len()

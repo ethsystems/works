@@ -7,8 +7,6 @@ use crate::{
 pub trait Fold {
     /// Event the fold consumes.
     type Event;
-    /// Comparable projection of the state, used for anchor checks.
-    type View: PartialEq;
     /// Failure the fold classifies as skip, halt, or poison.
     type Error;
 
@@ -18,6 +16,4 @@ pub trait Fold {
         pos: Position,
         event: &Self::Event,
     ) -> Result<(), FoldError<Self::Error>>;
-    /// Reads the comparable projection of the current state.
-    fn view(&self) -> Self::View;
 }

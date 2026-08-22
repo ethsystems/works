@@ -6,10 +6,6 @@ use std::vec::Vec;
 use core::time::Duration;
 
 use crate::{
-    anchor::{
-        Anchor,
-        NoAnchor,
-    },
     batch::Batch,
     engine::{
         ApplySummary,
@@ -34,9 +30,8 @@ use crate::{
         SnapshotSink,
     },
     source::{
-        EventSource,
-        ProbeSource,
         ReplayHorizon,
+        Source,
     },
 };
 
@@ -46,25 +41,12 @@ const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const DEFAULT_BACKOFF_BASE: Duration = Duration::from_millis(200);
 /// Default ceiling on exponential backoff.
 const DEFAULT_BACKOFF_MAX: Duration = Duration::from_secs(30);
-/// Default anchor divergence rollbacks tolerated before the typed terminal state.
-const DEFAULT_MAX_DIVERGENCE_RETRIES: u32 = 1;
+/// Default blocks between checkpoints.
+const DEFAULT_CHECKPOINT_INTERVAL: u64 = 64;
 
 /// True when `block` has reached the next interval step past the last marked block.
 fn due(last: Option<u64>, block: u64, interval: u64) -> bool {
     last.is_none_or(|last| block >= last.saturating_add(interval))
-}
-
-/// Poll loop state machine a harness drives; owns cadence, backoff, recovery.
-pub trait Tickable {
-    /// Advances the loop by one poll, apply, and recovery step.
-    fn tick(&mut self) -> Tick;
-    /// Forces a checkpoint now, followed by the anchor check.
-    fn checkpoint(&mut self);
-    /// Snapshots the current driver and engine state.
-    fn status(&self) -> DriverStatus;
-    /// Delay before the next tick: zero while catching up, the poll interval at
-    /// the tip, or capped exponential backoff after a source error.
-    fn next_delay(&self) -> Duration;
 }
 
 /// Outcome of one driver tick.
@@ -74,7 +56,7 @@ pub enum Tick {
     Progressed(ApplySummary),
     /// Poll returned nothing new.
     Idle,
-    /// Fork or anchor divergence rolled the engine back to a checkpoint.
+    /// A fork rolled the engine back to a checkpoint.
     RolledBack {
         /// Cursor the rollback restored.
         to: Option<Position>,
@@ -135,8 +117,6 @@ pub struct DriverConfig {
     /// Blocks of durable-point progress between snapshot offers; None disables
     /// offers.
     pub snapshot_interval: Option<u64>,
-    /// Anchor divergence rollbacks tolerated before the typed terminal state.
-    pub max_divergence_retries: u32,
 }
 
 impl Default for DriverConfig {
@@ -146,32 +126,40 @@ impl Default for DriverConfig {
             poll_interval: DEFAULT_POLL_INTERVAL,
             backoff_base: DEFAULT_BACKOFF_BASE,
             backoff_max: DEFAULT_BACKOFF_MAX,
-            checkpoint_interval: None,
-            snapshot_interval: None,
-            max_divergence_retries: DEFAULT_MAX_DIVERGENCE_RETRIES,
+            checkpoint_interval: Some(DEFAULT_CHECKPOINT_INTERVAL),
+            snapshot_interval: Some(DEFAULT_CHECKPOINT_INTERVAL),
         }
     }
 }
 
-/// Driver over a plain source; fork suspicion escalates straight to resync or terminal.
-pub struct Driver<F, S, A = NoAnchor<<F as Fold>::View>, K = NoSink>
+impl DriverConfig {
+    /// Defaults, folding from `start_block`.
+    pub fn from_block(start_block: u64) -> Self {
+        Self {
+            start_block,
+            ..Self::default()
+        }
+    }
+}
+
+/// Poll loop over one source: owns cadence, backoff, scanning, and fork recovery.
+pub struct Driver<F, S, K = NoSink>
 where
     F: Fold,
-    S: EventSource<Event = F::Event>,
-    A: Anchor<View = F::View>,
+    S: Source<Event = F::Event>,
     K: SnapshotSink<F>,
 {
     engine: Engine<F>,
     source: S,
-    anchor: Option<A>,
     sink: K,
     config: DriverConfig,
     batch: Batch<F::Event>,
+    scratch: Vec<(BlockRef, u32, F::Event)>,
+    scanned_to: Option<u64>,
     initial: F,
     consecutive_errors: u32,
     caught_up: bool,
     generation: u64,
-    divergence_retries: u32,
     last_checkpoint_block: Option<u64>,
     last_snapshot_block: Option<u64>,
     durability_lost: bool,
@@ -181,16 +169,16 @@ where
 impl<F, S> Driver<F, S>
 where
     F: Fold + Clone,
-    S: EventSource<Event = F::Event>,
+    S: Source<Event = F::Event>,
 {
-    /// Builds a driver with no anchor; anchor divergence checks never fire.
+    /// Builds a driver that persists nothing.
     pub fn new(
         fold: F,
         source: S,
         engine: EngineConfig,
         config: DriverConfig,
     ) -> Result<Self, ConfigError> {
-        Self::build(fold, source, None, NoSink, engine, config)
+        Self::build(fold, source, NoSink, engine, config)
     }
 
     /// Resumes from a recovered engine, polling onward from its cursor.
@@ -203,14 +191,14 @@ where
         genesis: F,
         config: DriverConfig,
     ) -> Result<Self, ConfigError> {
-        Self::around(engine, source, None, NoSink, genesis, config)
+        Self::around(engine, source, NoSink, genesis, config)
     }
 }
 
-impl<F, S, K> Driver<F, S, NoAnchor<<F as Fold>::View>, K>
+impl<F, S, K> Driver<F, S, K>
 where
     F: Fold + Clone,
-    S: EventSource<Event = F::Event>,
+    S: Source<Event = F::Event>,
     K: SnapshotSink<F>,
 {
     /// Builds a driver that offers durable snapshots to the sink.
@@ -221,7 +209,7 @@ where
         engine: EngineConfig,
         config: DriverConfig,
     ) -> Result<Self, ConfigError> {
-        Self::build(fold, source, None, sink, engine, config)
+        Self::build(fold, source, sink, engine, config)
     }
 
     /// Resumes from a recovered engine, offering durable snapshots to the sink.
@@ -232,53 +220,32 @@ where
         genesis: F,
         config: DriverConfig,
     ) -> Result<Self, ConfigError> {
-        Self::around(engine, source, None, sink, genesis, config)
+        Self::around(engine, source, sink, genesis, config)
     }
 }
 
-impl<F, S, A> Driver<F, S, A, NoSink>
+impl<F, S, K> Driver<F, S, K>
 where
     F: Fold + Clone,
-    S: EventSource<Event = F::Event>,
-    A: Anchor<View = F::View>,
-{
-    /// Builds a driver with an anchor whose view is checked at every checkpoint.
-    pub fn with_anchor(
-        fold: F,
-        source: S,
-        anchor: A,
-        engine: EngineConfig,
-        config: DriverConfig,
-    ) -> Result<Self, ConfigError> {
-        Self::build(fold, source, Some(anchor), NoSink, engine, config)
-    }
-}
-
-impl<F, S, A, K> Driver<F, S, A, K>
-where
-    F: Fold + Clone,
-    S: EventSource<Event = F::Event>,
-    A: Anchor<View = F::View>,
+    S: Source<Event = F::Event>,
     K: SnapshotSink<F>,
 {
     fn build(
         fold: F,
         source: S,
-        anchor: Option<A>,
         sink: K,
         engine_config: EngineConfig,
         driver_config: DriverConfig,
     ) -> Result<Self, ConfigError> {
         let initial = fold.clone();
         let engine = Engine::new(fold, engine_config)?;
-        Self::around(engine, source, anchor, sink, initial, driver_config)
+        Self::around(engine, source, sink, initial, driver_config)
     }
 
     /// Wraps an engine, checking the source horizon against the configured start block.
     fn around(
         engine: Engine<F>,
         source: S,
-        anchor: Option<A>,
         sink: K,
         initial: F,
         driver_config: DriverConfig,
@@ -294,44 +261,20 @@ where
         Ok(Self {
             engine,
             source,
-            anchor,
             sink,
             config: driver_config,
             batch: Batch::new(),
+            scratch: Vec::new(),
+            scanned_to: None,
             initial,
             consecutive_errors: 0,
             caught_up: false,
             generation: 0,
-            divergence_retries: 0,
             last_checkpoint_block: None,
             last_snapshot_block: None,
             durability_lost: false,
             advanced: false,
         })
-    }
-
-    /// Builds an anchored driver that offers durable snapshots to the sink.
-    pub fn with_anchor_and_sink(
-        fold: F,
-        source: S,
-        anchor: A,
-        sink: K,
-        engine: EngineConfig,
-        config: DriverConfig,
-    ) -> Result<Self, ConfigError> {
-        Self::build(fold, source, Some(anchor), sink, engine, config)
-    }
-
-    /// Resumes an anchored driver that offers durable snapshots to the sink.
-    pub fn resume_with_anchor_and_sink(
-        engine: Engine<F>,
-        source: S,
-        anchor: A,
-        sink: K,
-        genesis: F,
-        config: DriverConfig,
-    ) -> Result<Self, ConfigError> {
-        Self::around(engine, source, Some(anchor), sink, genesis, config)
     }
 
     /// Borrows the durability sink.
@@ -364,24 +307,25 @@ where
         self.caught_up
     }
 
-    /// Runs the interval-based checkpoint rule; returns the overriding tick, if any.
-    fn auto_checkpoint(&mut self) -> Option<Tick> {
-        let interval = self.config.checkpoint_interval?;
-        let cursor = self.engine.cursor()?;
+    /// Runs the interval-based checkpoint rule.
+    fn auto_checkpoint(&mut self) {
+        let Some(interval) = self.config.checkpoint_interval else {
+            return;
+        };
+        let Some(cursor) = self.engine.cursor() else {
+            return;
+        };
         if due(self.last_checkpoint_block, cursor.block, interval) {
-            self.run_checkpoint()
-        } else {
-            None
+            self.run_checkpoint();
         }
     }
 
-    /// Stores a checkpoint, records its block, then runs the anchor check.
-    fn run_checkpoint(&mut self) -> Option<Tick> {
+    /// Stores a checkpoint and records the block it was taken at.
+    fn run_checkpoint(&mut self) {
         self.engine.checkpoint();
         if let Some(cursor) = self.engine.cursor() {
             self.last_checkpoint_block = Some(cursor.block);
         }
-        self.check_anchor()
     }
 
     /// Runs the interval-based snapshot rule; returns the overriding tick, if any.
@@ -417,34 +361,6 @@ where
             .last_snapshot_block
             .zip(to)
             .map(|(last, point)| last.min(point.block));
-    }
-
-    /// Compares the fold view against the anchor's expectation at the last verified block.
-    fn check_anchor(&mut self) -> Option<Tick> {
-        let anchor = self.anchor.as_ref()?;
-        let at = self.engine.last_verified()?;
-        let expected = anchor.expected(&at)?;
-        if self.engine.view() == expected {
-            self.divergence_retries = 0;
-            None
-        } else {
-            Some(self.handle_anchor_divergence(at))
-        }
-    }
-
-    /// Rolls back to the block before the divergent anchor, or escalates.
-    #[cold]
-    fn handle_anchor_divergence(&mut self, at: BlockRef) -> Tick {
-        if self.divergence_retries >= self.config.max_divergence_retries {
-            self.engine
-                .mark_unrecoverable(DivergenceCause::AnchorDivergence { at: at.number });
-            return Tick::Terminal(self.engine.status());
-        }
-        let tick = self.roll_back_to(at.number.saturating_sub(1));
-        if matches!(tick, Tick::RolledBack { .. }) {
-            self.divergence_retries = self.divergence_retries.saturating_add(1);
-        }
-        tick
     }
 
     /// Rolls back to the newest checkpoint at or below the ancestor, else escalates.
@@ -486,18 +402,15 @@ where
         self.engine.reset(self.initial.clone());
         self.caught_up = false;
         self.consecutive_errors = 0;
-        self.divergence_retries = 0;
+        self.scanned_to = None;
         self.last_checkpoint_block = None;
         self.last_snapshot_block = None;
         Tick::Resynced
     }
 
     /// Runs one poll-apply step, then records whether the cursor moved forward.
-    fn step<Fork>(&mut self, on_fork: Fork) -> Tick
-    where
-        Fork: FnOnce(&mut Self) -> Tick,
-    {
-        let tick = self.poll_apply(on_fork);
+    fn step(&mut self) -> Tick {
+        let tick = self.poll_apply();
         // Only forward cursor movement earns an immediate re-poll; a batch the
         // engine fully deduped leaves the loop on its poll interval.
         self.advanced = matches!(
@@ -507,20 +420,13 @@ where
         tick
     }
 
-    /// Polls the source and applies the batch, deferring fork recovery to `on_fork`.
-    fn poll_apply<Fork>(&mut self, on_fork: Fork) -> Tick
-    where
-        Fork: FnOnce(&mut Self) -> Tick,
-    {
+    /// Scans the source and applies the batch, recovering from a fork by bisection.
+    fn poll_apply(&mut self) -> Tick {
         self.generation = self.generation.wrapping_add(1);
         if !self.engine.status().is_active() {
             return Tick::Terminal(self.engine.status());
         }
-        if self
-            .source
-            .next_batch(self.engine.cursor(), &mut self.batch)
-            .is_err()
-        {
+        if self.scan().is_err() {
             self.consecutive_errors = self.consecutive_errors.saturating_add(1);
             return Tick::SourceError;
         }
@@ -528,10 +434,9 @@ where
         match self.engine.apply_batch(&self.batch) {
             Ok(summary) => {
                 self.caught_up = self.batch.is_empty();
-                // A checkpoint tick overrides a snapshot tick, which overrides progress.
-                if let Some(tick) =
-                    self.auto_checkpoint().or_else(|| self.offer_snapshot())
-                {
+                // A snapshot refusal overrides progress; a checkpoint is silent.
+                self.auto_checkpoint();
+                if let Some(tick) = self.offer_snapshot() {
                     return tick;
                 }
                 if self.batch.is_empty() {
@@ -544,7 +449,7 @@ where
                 ApplyError::ForkSuspected { .. }
                 | ApplyError::MissingBoundary
                 | ApplyError::CursorBlockUnobserved { .. },
-            ) => on_fork(self),
+            ) => self.recover_via_bisection(),
             Err(ApplyError::Halted { .. } | ApplyError::Poisoned { .. }) => {
                 Tick::Terminal(self.engine.status())
             }
@@ -559,62 +464,41 @@ where
             }
         }
     }
-}
 
-impl<F, S, A, K> Tickable for Driver<F, S, A, K>
-where
-    F: Fold + Clone,
-    S: EventSource<Event = F::Event>,
-    A: Anchor<View = F::View>,
-    K: SnapshotSink<F>,
-{
-    fn tick(&mut self) -> Tick {
-        self.step(Self::resync_or_terminal)
-    }
+    /// Fills `batch` with the blocks strictly after the cursor, plus the cursor block's
+    /// header as the source reports it now.
+    fn scan(&mut self) -> Result<(), S::Error> {
+        self.batch.clear();
+        let cursor = self.engine.cursor();
+        self.batch.boundary = match cursor {
+            Some(cursor) => self.source.header_at(cursor.block)?,
+            None => None,
+        };
 
-    fn checkpoint(&mut self) {
-        self.run_checkpoint();
-    }
+        let head = self.source.head()?;
+        let mut from = match cursor {
+            Some(cursor) => self
+                .scanned_to
+                .map_or(cursor.block + 1, |to| to.saturating_add(1))
+                .min(cursor.block + 1),
+            None => self.config.start_block,
+        };
 
-    fn status(&self) -> DriverStatus {
-        DriverStatus {
-            cursor: self.engine.cursor(),
-            last_verified: self.engine.last_verified(),
-            engine: self.engine.status(),
-            caught_up: self.caught_up,
-            skips: self.engine.skip_count(),
-            durable_cursor: self.sink.durable_cursor(),
-            durability_lost: self.durability_lost,
-            generation: self.generation,
+        let window = self.source.window().max(1);
+        while from <= head {
+            let to = head.min(from.saturating_add(window - 1));
+            self.scratch.clear();
+            self.source.events_in(from, to, &mut self.scratch)?;
+            self.scanned_to = Some(to);
+            from = to.saturating_add(1);
+            if !self.scratch.is_empty() {
+                group_into(&mut self.batch, &mut self.scratch);
+                break;
+            }
         }
+        Ok(())
     }
 
-    fn next_delay(&self) -> Duration {
-        if self.consecutive_errors == 0 {
-            // Catch-up polls run back to back; the poll interval paces the tip.
-            return if self.advanced {
-                Duration::ZERO
-            } else {
-                self.config.poll_interval
-            };
-        }
-        let factor = 1u32
-            .checked_shl(self.consecutive_errors - 1)
-            .unwrap_or(u32::MAX);
-        self.config
-            .backoff_base
-            .saturating_mul(factor)
-            .min(self.config.backoff_max)
-    }
-}
-
-impl<F, S, A, K> Driver<F, S, A, K>
-where
-    F: Fold + Clone,
-    S: ProbeSource<Event = F::Event>,
-    A: Anchor<View = F::View>,
-    K: SnapshotSink<F>,
-{
     /// Bisects the observed ring for the deepest still-canonical block, then rolls back.
     #[cold]
     fn recover_via_bisection(&mut self) -> Tick {
@@ -637,131 +521,70 @@ where
         }
         self.roll_back_to(observed[lo - 1].number)
     }
-}
 
-/// Probe-capable driver: fork suspicion bisects to the ancestor and rolls back.
-pub struct Probed<F, S, A = NoAnchor<<F as Fold>::View>, K = NoSink>
-where
-    F: Fold,
-    S: ProbeSource<Event = F::Event>,
-    A: Anchor<View = F::View>,
-    K: SnapshotSink<F>,
-{
-    inner: Driver<F, S, A, K>,
-}
-
-impl<F, S> Probed<F, S>
-where
-    F: Fold + Clone,
-    S: ProbeSource<Event = F::Event>,
-{
-    /// Builds a probe-capable driver with no anchor.
-    pub fn new(
-        fold: F,
-        source: S,
-        engine: EngineConfig,
-        config: DriverConfig,
-    ) -> Result<Self, ConfigError> {
-        Ok(Self {
-            inner: Driver::new(fold, source, engine, config)?,
-        })
+    /// Advances the loop by one poll, apply, and recovery step.
+    pub fn tick(&mut self) -> Tick {
+        self.step()
     }
 
-    /// Resumes from a recovered engine, polling onward from its cursor.
-    ///
-    /// `genesis` is the fold a resync restarts from, so it is empty state rather than
-    /// the recovered state.
-    pub fn resume(
-        engine: Engine<F>,
-        source: S,
-        genesis: F,
-        config: DriverConfig,
-    ) -> Result<Self, ConfigError> {
-        Ok(Self {
-            inner: Driver::resume(engine, source, genesis, config)?,
-        })
+    /// Forces a checkpoint now.
+    pub fn checkpoint(&mut self) {
+        self.run_checkpoint();
     }
-}
 
-impl<F, S, K> Probed<F, S, NoAnchor<<F as Fold>::View>, K>
-where
-    F: Fold + Clone,
-    S: ProbeSource<Event = F::Event>,
-    K: SnapshotSink<F>,
-{
-    /// Builds a probe-capable driver that offers durable snapshots to the sink.
-    pub fn with_sink(
-        fold: F,
-        source: S,
-        sink: K,
-        engine: EngineConfig,
-        config: DriverConfig,
-    ) -> Result<Self, ConfigError> {
-        Ok(Self {
-            inner: Driver::with_sink(fold, source, sink, engine, config)?,
-        })
+    /// Snapshots the current driver and engine state.
+    pub fn status(&self) -> DriverStatus {
+        DriverStatus {
+            cursor: self.engine.cursor(),
+            last_verified: self.engine.last_verified(),
+            engine: self.engine.status(),
+            caught_up: self.caught_up,
+            skips: self.engine.skip_count(),
+            durable_cursor: self.sink.durable_cursor(),
+            durability_lost: self.durability_lost,
+            generation: self.generation,
+        }
+    }
+
+    /// How long to wait before the next tick.
+    pub fn next_delay(&self) -> Duration {
+        if self.consecutive_errors == 0 {
+            // Catch-up polls run back to back; the poll interval paces the tip.
+            return if self.advanced {
+                Duration::ZERO
+            } else {
+                self.config.poll_interval
+            };
+        }
+        let factor = 1u32
+            .checked_shl(self.consecutive_errors - 1)
+            .unwrap_or(u32::MAX);
+        self.config
+            .backoff_base
+            .saturating_mul(factor)
+            .min(self.config.backoff_max)
     }
 }
 
-impl<F, S, A, K> Probed<F, S, A, K>
-where
-    F: Fold + Clone,
-    S: ProbeSource<Event = F::Event>,
-    A: Anchor<View = F::View>,
-    K: SnapshotSink<F>,
-{
-    /// Borrows the durability sink.
-    pub fn sink(&self) -> &K {
-        self.inner.sink()
-    }
+/// Drains `entries` into `batch`
+fn group_into<E>(batch: &mut Batch<E>, entries: &mut Vec<(BlockRef, u32, E)>) {
+    entries.sort_by_key(|(block, log_index, _)| (block.number, *log_index));
 
-    /// Consumes the driver, returning the sink for joining or inspection.
-    pub fn into_sink(self) -> K {
-        self.inner.into_sink()
+    let mut span: Vec<(u32, E)> = Vec::new();
+    let mut current: Option<BlockRef> = None;
+    for (block, log_index, event) in entries.drain(..) {
+        match current {
+            Some(open) if open.number != block.number => {
+                batch.push_block(open, span.drain(..));
+                current = Some(block);
+            }
+            None => current = Some(block),
+            _ => {}
+        }
+        span.push((log_index, event));
     }
-
-    /// Borrows the underlying engine.
-    pub fn engine(&self) -> &Engine<F> {
-        self.inner.engine()
-    }
-
-    /// Manual recovery access: rollback out of Halted or Poisoned, then keep ticking.
-    pub fn engine_mut(&mut self) -> &mut Engine<F> {
-        self.inner.engine_mut()
-    }
-
-    /// Mutable access to the underlying event source.
-    pub fn source_mut(&mut self) -> &mut S {
-        self.inner.source_mut()
-    }
-
-    /// True once the most recent poll returned no new blocks.
-    pub fn is_caught_up(&self) -> bool {
-        self.inner.is_caught_up()
-    }
-}
-
-impl<F, S, A, K> Tickable for Probed<F, S, A, K>
-where
-    F: Fold + Clone,
-    S: ProbeSource<Event = F::Event>,
-    A: Anchor<View = F::View>,
-    K: SnapshotSink<F>,
-{
-    fn tick(&mut self) -> Tick {
-        self.inner.step(Driver::recover_via_bisection)
-    }
-
-    fn checkpoint(&mut self) {
-        self.inner.checkpoint();
-    }
-
-    fn status(&self) -> DriverStatus {
-        self.inner.status()
-    }
-
-    fn next_delay(&self) -> Duration {
-        self.inner.next_delay()
+    if let Some(open) = current {
+        batch.push_block(open, span);
     }
 }
 
@@ -808,24 +631,14 @@ mod tests {
         }
     }
 
-    impl EventSource for Probe {
+    impl Source for Probe {
         type Event = u64;
         type Error = PollFailure;
 
-        fn next_batch(
-            &mut self,
-            cursor: Option<Position>,
-            out: &mut Batch<u64>,
-        ) -> Result<(), PollFailure> {
-            self.inner.next_batch(cursor, out)
+        fn head(&mut self) -> Result<u64, PollFailure> {
+            self.inner.head()
         }
 
-        fn horizon(&self) -> ReplayHorizon {
-            self.inner.horizon()
-        }
-    }
-
-    impl ProbeSource for Probe {
         fn header_at(&mut self, number: u64) -> Result<Option<BlockRef>, PollFailure> {
             self.calls += 1;
             if self.fail_next > 0 {
@@ -834,52 +647,52 @@ mod tests {
             }
             self.inner.header_at(number)
         }
+
+        fn events_in(
+            &mut self,
+            from: u64,
+            to: u64,
+            out: &mut Vec<(BlockRef, u32, u64)>,
+        ) -> Result<(), PollFailure> {
+            self.inner.events_in(from, to, out)
+        }
+
+        fn horizon(&self) -> ReplayHorizon {
+            self.inner.horizon()
+        }
+
+        fn window(&self) -> u64 {
+            self.inner.window()
+        }
     }
 
-    /// Source that re-serves the same one-event block on every poll.
+    /// Source that re-serves the same one-event block whatever range is asked for,
+    /// so the engine dedupes every poll after the first.
     struct Stuck {
         block: BlockRef,
     }
 
-    impl EventSource for Stuck {
+    impl Source for Stuck {
         type Event = u64;
         type Error = PollFailure;
 
-        fn next_batch(
+        fn head(&mut self) -> Result<u64, PollFailure> {
+            // above the block, so the scan keeps querying and keeps being re-served it
+            Ok(self.block.number + 1)
+        }
+
+        fn header_at(&mut self, _number: u64) -> Result<Option<BlockRef>, PollFailure> {
+            Ok(Some(self.block))
+        }
+
+        fn events_in(
             &mut self,
-            cursor: Option<Position>,
-            out: &mut Batch<u64>,
+            _from: u64,
+            _to: u64,
+            out: &mut Vec<(BlockRef, u32, u64)>,
         ) -> Result<(), PollFailure> {
-            out.clear();
-            out.boundary = cursor.map(|_| self.block);
-            out.push_block(self.block, [(0u32, 1u64)]);
+            out.push((self.block, 0, 1));
             Ok(())
-        }
-
-        fn horizon(&self) -> ReplayHorizon {
-            ReplayHorizon::Genesis
-        }
-    }
-
-    /// Anchor matching a one-event-per-block chain folded from genesis in full.
-    struct ExactAnchor;
-
-    impl Anchor for ExactAnchor {
-        type View = Vec<(Position, u64)>;
-
-        fn expected(&self, at: &BlockRef) -> Option<Self::View> {
-            Some((1..=at.number).map(|n| (Position::new(n, 0), n)).collect())
-        }
-    }
-
-    /// Anchor whose expectation never matches, forcing divergence on every checkpoint.
-    struct DisagreeingAnchor;
-
-    impl Anchor for DisagreeingAnchor {
-        type View = Vec<(Position, u64)>;
-
-        fn expected(&self, _at: &BlockRef) -> Option<Self::View> {
-            Some(Vec::new())
         }
     }
 
@@ -898,7 +711,12 @@ mod tests {
         Driver::new(RecordingFold::default(), chain, engine, config).unwrap()
     }
 
-    fn run_to_idle<D: Tickable>(driver: &mut D) -> Tick {
+    fn run_to_idle<F, S, K>(driver: &mut Driver<F, S, K>) -> Tick
+    where
+        F: Fold + Clone,
+        S: Source<Event = F::Event>,
+        K: SnapshotSink<F>,
+    {
         let mut outcome = driver.tick();
         while !matches!(outcome, Tick::Idle) {
             outcome = driver.tick();
@@ -906,7 +724,12 @@ mod tests {
         outcome
     }
 
-    fn collect_to_idle<D: Tickable>(driver: &mut D) -> Vec<Tick> {
+    fn collect_to_idle<F, S, K>(driver: &mut Driver<F, S, K>) -> Vec<Tick>
+    where
+        F: Fold + Clone,
+        S: Source<Event = F::Event>,
+        K: SnapshotSink<F>,
+    {
         let mut ticks = vec![driver.tick()];
         while !matches!(ticks.last(), Some(Tick::Idle)) {
             ticks.push(driver.tick());
@@ -920,7 +743,7 @@ mod tests {
         for value in 1..=blocks {
             chain.push_block(&[value]);
         }
-        chain.set_batch_blocks(1);
+        chain.set_window(1);
         chain
     }
 
@@ -933,20 +756,7 @@ mod tests {
     }
 
     /// Recording fold over a scripted chain, offering snapshots to a watermark sink.
-    type SinkDriver = Driver<
-        RecordingFold,
-        ScriptedChain,
-        NoAnchor<Vec<(Position, u64)>>,
-        WatermarkSink,
-    >;
-
-    /// Probe-capable counterpart of `SinkDriver`, so a fork bisects before rolling back.
-    type ProbedSinkDriver = Probed<
-        RecordingFold,
-        ScriptedChain,
-        NoAnchor<Vec<(Position, u64)>>,
-        WatermarkSink,
-    >;
+    type SinkDriver = Driver<RecordingFold, ScriptedChain, WatermarkSink>;
 
     fn sink_driver(blocks: u64, slots: usize, config: DriverConfig) -> SinkDriver {
         Driver::with_sink(
@@ -959,12 +769,8 @@ mod tests {
         .unwrap()
     }
 
-    fn probed_sink_driver(
-        blocks: u64,
-        slots: usize,
-        config: DriverConfig,
-    ) -> ProbedSinkDriver {
-        Probed::with_sink(
+    fn probed_sink_driver(blocks: u64, slots: usize, config: DriverConfig) -> SinkDriver {
+        Driver::with_sink(
             RecordingFold::default(),
             one_event_chain(blocks),
             WatermarkSink::default(),
@@ -1073,7 +879,7 @@ mod tests {
         let expected: Vec<(Position, u64)> = (1..=6u64)
             .map(|value| (Position::new(value, 0), value))
             .collect();
-        assert_eq!(driver.engine().view(), expected);
+        assert_eq!(driver.engine().fold().applied, expected);
     }
 
     #[test]
@@ -1126,7 +932,7 @@ mod tests {
         let expected: Vec<(Position, u64)> = (1..=10u64)
             .map(|value| (Position::new(value, 0), value))
             .collect();
-        assert_eq!(driver.engine().view(), expected);
+        assert_eq!(driver.engine().fold().applied, expected);
         assert!(driver.is_caught_up());
     }
 
@@ -1204,6 +1010,59 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_window_does_not_report_caught_up_while_behind_head() {
+        // given ten blocks where only the last carries events, read one block per query
+        let mut chain = ScriptedChain::new(1);
+        for _ in 1..10 {
+            chain.push_block(&[]);
+        }
+        chain.push_block(&[42]);
+        chain.set_window(1);
+        let mut driver = new_driver(chain, engine_config(0), DriverConfig::from_block(1));
+        // when polled once
+        let tick = driver.tick();
+        // then the scan walked every empty window instead of stopping at the first
+        assert!(matches!(tick, Tick::Progressed(_)), "got {tick:?}");
+        assert!(!driver.is_caught_up());
+        assert_eq!(
+            driver.engine().fold().applied,
+            vec![(Position::new(10, 0), 42)]
+        );
+    }
+
+    #[test]
+    fn rollback_replays_from_the_restored_cursor_not_the_scan_mark() {
+        // given a driver caught up on ten blocks, checkpointing every block
+        let mut chain = ScriptedChain::new(1);
+        for value in 1..=10u64 {
+            chain.push_block(&[value]);
+        }
+        chain.set_window(1);
+        let mut driver = new_driver(
+            chain,
+            engine_config(4),
+            DriverConfig {
+                checkpoint_interval: Some(1),
+                ..DriverConfig::from_block(1)
+            },
+        );
+        run_to_idle(&mut driver);
+        // when the last three blocks are replaced
+        driver.source_mut().reorg(3, &[&[80], &[90], &[100]]);
+        run_to_idle(&mut driver);
+        // then the scan restarted at the restored cursor, so the replacements folded;
+        // resuming at the high-water mark instead would have skipped them entirely
+        let applied: Vec<u64> = driver
+            .engine()
+            .fold()
+            .applied
+            .iter()
+            .map(|(_, event)| *event)
+            .collect();
+        assert_eq!(applied, vec![1, 2, 3, 4, 5, 6, 7, 80, 90, 100]);
+    }
+
+    #[test]
     fn a_fully_deduped_batch_keeps_the_poll_interval() {
         // given a source that re-serves the same one-event block on every poll
         let block = BlockRef {
@@ -1266,7 +1125,7 @@ mod tests {
             (Position::new(4, 0), 20),
             (Position::new(5, 0), 30),
         ];
-        assert_eq!(driver.engine().view(), expected);
+        assert_eq!(driver.engine().fold().applied, expected);
     }
 
     #[test]
@@ -1323,7 +1182,7 @@ mod tests {
         for value in 1..=12u64 {
             chain.push_block(&[value]);
         }
-        chain.set_batch_blocks(1);
+        chain.set_window(1);
         let config = DriverConfig {
             checkpoint_interval: Some(4),
             ..DriverConfig::default()
@@ -1346,7 +1205,7 @@ mod tests {
         for value in 1..=12u64 {
             chain.push_block(&[value]);
         }
-        chain.set_batch_blocks(1);
+        chain.set_window(1);
         let config = DriverConfig {
             checkpoint_interval: Some(4),
             ..DriverConfig::default()
@@ -1368,7 +1227,7 @@ mod tests {
         chain.push_block(&[3]);
         chain.push_block(&[4]);
         chain.push_block(&[5]);
-        chain.set_batch_blocks(1);
+        chain.set_window(1);
         let halt_pos = Position::new(3, 0);
         let fold = RecordingFold {
             applied: Vec::new(),
@@ -1435,8 +1294,8 @@ mod tests {
         for value in 1..=6u64 {
             chain.push_block(&[value]);
         }
-        chain.set_batch_blocks(1);
-        let mut driver = Probed::new(
+        chain.set_window(1);
+        let mut driver = Driver::new(
             RecordingFold::default(),
             chain,
             engine_config(4),
@@ -1469,7 +1328,7 @@ mod tests {
             (Position::new(5, 0), 50),
             (Position::new(6, 0), 60),
         ];
-        assert_eq!(driver.engine().view(), expected);
+        assert_eq!(driver.engine().fold().applied, expected);
     }
 
     #[test]
@@ -1483,8 +1342,8 @@ mod tests {
         chain.push_block(&[]);
         chain.push_block(&[]);
         chain.push_block(&[7]);
-        chain.set_batch_blocks(1);
-        let mut driver = Probed::new(
+        chain.set_window(1);
+        let mut driver = Driver::new(
             RecordingFold::default(),
             chain,
             engine_config(2),
@@ -1501,7 +1360,7 @@ mod tests {
         assert!(matches!(outcome, Tick::RolledBack { .. }));
         run_to_idle(&mut driver);
         let expected = vec![(Position::new(2, 0), 2), (Position::new(7, 0), 70)];
-        assert_eq!(driver.engine().view(), expected);
+        assert_eq!(driver.engine().fold().applied, expected);
     }
 
     #[test]
@@ -1511,8 +1370,8 @@ mod tests {
         for value in 1..=5u64 {
             chain.push_block(&[value]);
         }
-        chain.set_batch_blocks(1);
-        let mut driver = Probed::new(
+        chain.set_window(1);
+        let mut driver = Driver::new(
             RecordingFold::default(),
             chain,
             engine_config(2),
@@ -1532,7 +1391,7 @@ mod tests {
         assert!(matches!(outcome, Tick::RolledBack { .. }));
         run_to_idle(&mut driver);
         let expected = vec![(Position::new(1, 0), 1), (Position::new(2, 0), 99)];
-        assert_eq!(driver.engine().view(), expected);
+        assert_eq!(driver.engine().fold().applied, expected);
     }
 
     #[test]
@@ -1542,8 +1401,8 @@ mod tests {
         for value in 1..=8u64 {
             chain.push_block(&[value]);
         }
-        chain.set_batch_blocks(1);
-        let mut driver = Probed::new(
+        chain.set_window(1);
+        let mut driver = Driver::new(
             RecordingFold::default(),
             Probe::new(chain),
             engine_config(2),
@@ -1557,6 +1416,8 @@ mod tests {
         }
         // when the chain reorgs at the sixth block and the tick surfaces the fork
         driver.source_mut().inner.reorg(3, &[&[60], &[70], &[80]]);
+        // the scan spends one probe per poll on the boundary; count only the bisection
+        driver.source_mut().calls = 0;
         let outcome = driver.tick();
         // then rollback lands at or below the fifth and probe count is at most four
         match outcome {
@@ -1572,13 +1433,13 @@ mod tests {
     #[test]
     fn fork_deeper_than_ring_escalates() {
         // given ring capacity 4 and a reorg replacing every retained block
-        fn build(horizon: ReplayHorizon) -> Probed<RecordingFold, ScriptedChain> {
+        fn build(horizon: ReplayHorizon) -> Driver<RecordingFold, ScriptedChain> {
             let mut chain = ScriptedChain::new(1);
             for value in 1..=6u64 {
                 chain.push_block(&[value]);
             }
-            chain.set_batch_blocks(1);
-            let mut driver = Probed::new(
+            chain.set_window(1);
+            let mut driver = Driver::new(
                 RecordingFold::default(),
                 chain,
                 EngineConfig {
@@ -1616,13 +1477,13 @@ mod tests {
     #[test]
     fn no_checkpoint_below_ancestor_escalates() {
         // given checkpoints only above the fork ancestor
-        fn build(horizon: ReplayHorizon) -> Probed<RecordingFold, ScriptedChain> {
+        fn build(horizon: ReplayHorizon) -> Driver<RecordingFold, ScriptedChain> {
             let mut chain = ScriptedChain::new(1);
             for value in 1..=8u64 {
                 chain.push_block(&[value]);
             }
-            chain.set_batch_blocks(1);
-            let mut driver = Probed::new(
+            chain.set_window(1);
+            let mut driver = Driver::new(
                 RecordingFold::default(),
                 chain,
                 engine_config(1),
@@ -1663,8 +1524,8 @@ mod tests {
         for value in 1..=6u64 {
             chain.push_block(&[value]);
         }
-        chain.set_batch_blocks(1);
-        let mut driver = Probed::new(
+        chain.set_window(1);
+        let mut driver = Driver::new(
             RecordingFold::default(),
             Probe::new(chain),
             engine_config(2),
@@ -1693,71 +1554,6 @@ mod tests {
             (Position::new(5, 0), 50),
             (Position::new(6, 0), 60),
         ];
-        assert_eq!(driver.engine().view(), expected);
-    }
-
-    #[test]
-    fn anchor_match_resets_divergence_budget() {
-        // given an anchor agreeing with the fold
-        let mut chain = ScriptedChain::new(1);
-        for value in 1..=5u64 {
-            chain.push_block(&[value]);
-        }
-        let mut driver = Driver::with_anchor(
-            RecordingFold::default(),
-            chain,
-            ExactAnchor,
-            engine_config(2),
-            DriverConfig::default(),
-        )
-        .unwrap();
-        driver.tick();
-        let cursor_before = driver.engine().cursor();
-        // when checkpoints fire
-        driver.checkpoint();
-        driver.checkpoint();
-        // then no rollback runs and the cursor, status, and checkpoint count hold steady
-        assert_eq!(driver.engine().cursor(), cursor_before);
-        assert_eq!(driver.engine().status(), EngineStatus::Active);
-        assert_eq!(driver.engine().checkpoint_count(), 2);
-    }
-
-    #[test]
-    fn anchor_divergence_rolls_back_then_terminates() {
-        // given an anchor that always disagrees and max_divergence_retries 1
-        let mut chain = ScriptedChain::new(1);
-        for value in 1..=3u64 {
-            chain.push_block(&[value]);
-        }
-        let mut driver = Driver::with_anchor(
-            RecordingFold::default(),
-            chain,
-            DisagreeingAnchor,
-            EngineConfig {
-                ring_capacity: 8,
-                checkpoint_slots: 4,
-            },
-            DriverConfig {
-                max_divergence_retries: 1,
-                ..DriverConfig::default()
-            },
-        )
-        .unwrap();
-        // when two checkpoints fire a mismatch each, with a re-fold between them
-        driver.checkpoint();
-        driver.tick();
-        driver.checkpoint();
-        let after_first_mismatch = (driver.engine().status(), driver.engine().cursor());
-        driver.tick();
-        driver.checkpoint();
-        let after_second_mismatch = driver.engine().status();
-        // then the first mismatch rolls back to the pre-fold checkpoint, the second terminates
-        assert_eq!(after_first_mismatch, (EngineStatus::Active, None));
-        assert_eq!(
-            after_second_mismatch,
-            EngineStatus::Unrecoverable {
-                cause: DivergenceCause::AnchorDivergence { at: 3 },
-            }
-        );
+        assert_eq!(driver.engine().fold().applied, expected);
     }
 }

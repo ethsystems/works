@@ -27,7 +27,6 @@ use crc as _;
 #[cfg(all(feature = "std", not(feature = "wincode")))]
 use crc_fast as _;
 
-mod anchor;
 mod batch;
 mod checkpoint;
 mod driver;
@@ -54,10 +53,6 @@ pub mod storage;
 #[cfg_attr(docsrs, doc(cfg(feature = "test-helpers")))]
 pub mod test_util;
 
-pub use anchor::{
-    Anchor,
-    NoAnchor,
-};
 pub use batch::{
     Batch,
     BatchShapeError,
@@ -68,9 +63,7 @@ pub use driver::{
     Driver,
     DriverConfig,
     DriverStatus,
-    Probed,
     Tick,
-    Tickable,
 };
 pub use engine::{
     ApplySummary,
@@ -97,9 +90,9 @@ pub use sink::{
     SnapshotSink,
 };
 pub use source::{
-    EventSource,
-    ProbeSource,
+    DEFAULT_WINDOW,
     ReplayHorizon,
+    Source,
 };
 
 #[cfg(feature = "wincode")]

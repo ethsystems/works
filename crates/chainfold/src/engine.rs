@@ -40,6 +40,15 @@ pub struct EngineConfig {
     pub checkpoint_slots: usize,
 }
 
+impl Default for EngineConfig {
+    fn default() -> Self {
+        Self {
+            ring_capacity: 1024,
+            checkpoint_slots: 4,
+        }
+    }
+}
+
 impl EngineConfig {
     /// Accepts a power-of-two ring capacity within the allowed range.
     pub(crate) fn validate(&self) -> Result<(), ConfigError> {
@@ -132,6 +141,11 @@ impl<F: Fold> Engine<F> {
             .and_then(|slot| slot.cursor)
     }
 
+    /// The fold as of the durable point, if there is one.
+    pub fn durable_fold(&self) -> Option<&F> {
+        self.checkpoints.oldest(&self.ring).map(|slot| &slot.fold)
+    }
+
     /// Oldest live checkpoint slot, for the snapshot codec.
     #[cfg(feature = "wincode")]
     pub(crate) fn oldest_checkpoint(&self) -> Option<&Slot<F>> {
@@ -143,9 +157,9 @@ impl<F: Fold> Engine<F> {
         &self.fold
     }
 
-    /// Reads the fold's current view.
-    pub fn view(&self) -> F::View {
-        self.fold.view()
+    /// Mutable access to the live fold, for state the fold has externalized.
+    pub fn fold_mut(&mut self) -> &mut F {
+        &mut self.fold
     }
 
     /// Iterates observed blocks oldest first.
@@ -524,7 +538,7 @@ mod tests {
         let mut engine = new_engine();
         let first = batch_of(None, vec![(block(5, 0), vec![0])]);
         engine.apply_batch(&first).unwrap();
-        let view_before = engine.view();
+        let view_before = engine.fold().applied.clone();
         // when the boundary carries a different hash
         let next = batch_of(Some(block(5, 1)), vec![]);
         let result = engine.apply_batch(&next);
@@ -536,7 +550,7 @@ mod tests {
                 refetched: block(5, 1),
             })
         );
-        assert_eq!(engine.view(), view_before);
+        assert_eq!(engine.fold().applied, view_before);
     }
 
     #[test]
@@ -813,7 +827,7 @@ mod tests {
             })
         );
         assert_eq!(engine.status(), EngineStatus::Poisoned { at: poison_pos });
-        assert_eq!(engine.view(), vec![(poison_pos, 0)]);
+        assert_eq!(engine.fold().applied, vec![(poison_pos, 0)]);
     }
 
     #[test]
@@ -850,7 +864,7 @@ mod tests {
                 span: 1
             }))
         );
-        assert_eq!(engine.view(), Vec::<(Position, u64)>::new());
+        assert_eq!(engine.fold().applied, Vec::<(Position, u64)>::new());
     }
 
     #[test]
@@ -877,7 +891,7 @@ mod tests {
             .apply_batch(&batch_of(None, vec![(block(3, 0), vec![0])]))
             .unwrap();
         engine.checkpoint();
-        let checkpoint_view = engine.view();
+        let checkpoint_view = engine.fold().applied.clone();
         let checkpoint_cursor = engine.cursor();
         let rest = batch_of(
             Some(block(3, 0)),
@@ -891,7 +905,7 @@ mod tests {
         // when rolling back at or below 4
         let restored = engine.rollback_at_or_below(4).unwrap();
         // then the view equals the checkpoint view and cursor is the checkpoint cursor
-        assert_eq!(engine.view(), checkpoint_view);
+        assert_eq!(engine.fold().applied, checkpoint_view);
         assert_eq!(restored, checkpoint_cursor);
         assert_eq!(engine.cursor(), checkpoint_cursor);
     }
@@ -1036,15 +1050,15 @@ mod tests {
             .apply_batch(&batch_of(None, vec![(block(1, 0), vec![0])]))
             .unwrap();
         engine.checkpoint();
-        let checkpoint_view = engine.view();
+        let checkpoint_view = engine.fold().applied.clone();
         let poisoned = engine
             .apply_batch(&batch_of(Some(block(1, 0)), vec![(block(2, 0), vec![0])]));
         assert!(matches!(poisoned, Err(ApplyError::Poisoned { .. })));
-        assert_ne!(engine.view(), checkpoint_view);
+        assert_ne!(engine.fold().applied, checkpoint_view);
         // when rolled back
         engine.rollback_at_or_below(1).unwrap();
         // then the view has no trace of the partial mutation
-        assert_eq!(engine.view(), checkpoint_view);
+        assert_eq!(engine.fold().applied, checkpoint_view);
         assert_eq!(engine.status(), EngineStatus::Active);
     }
 
@@ -1091,6 +1105,45 @@ mod tests {
         let result = engine
             .apply_batch(&batch_of(Some(block(2, 0)), vec![(block(3, 0), vec![0])]));
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn durable_fold_reads_the_oldest_live_checkpoint() {
+        // given an engine checkpointed once, then advanced past it
+        let mut engine = engine_with_checkpoints(2);
+        engine
+            .apply_batch(&batch_of(None, vec![(block(1, 0), vec![0])]))
+            .unwrap();
+        engine.checkpoint();
+        let durable = engine.fold().applied.clone();
+        engine
+            .apply_batch(&batch_of(Some(block(1, 0)), vec![(block(2, 0), vec![1])]))
+            .unwrap();
+        // then the live fold has moved on but the durable one has not
+        assert_ne!(engine.fold().applied, durable);
+        assert_eq!(
+            engine.durable_fold().map(|f| f.applied.clone()),
+            Some(durable)
+        );
+        // and without checkpoints there is no durable fold at all
+        assert!(new_engine().durable_fold().is_none());
+    }
+
+    #[test]
+    fn fold_mut_edits_live_state_and_leaves_checkpoints_whole() {
+        // given a checkpointed engine
+        let mut engine = engine_with_checkpoints(2);
+        engine
+            .apply_batch(&batch_of(None, vec![(block(1, 0), vec![0, 1])]))
+            .unwrap();
+        engine.checkpoint();
+        let checkpointed = engine.fold().applied.clone();
+        // when the live fold drops state it has externalized
+        engine.fold_mut().applied.clear();
+        assert_eq!(engine.fold().applied, Vec::new());
+        // then the retained checkpoint still holds it, and rollback restores it
+        engine.rollback_at_or_below(1).unwrap();
+        assert_eq!(engine.fold().applied, checkpointed);
     }
 
     #[test]
@@ -1230,7 +1283,7 @@ mod tests {
             .apply_batch(&batch_of(None, vec![(block(1, 0), vec![0])]))
             .unwrap();
         engine.checkpoint();
-        let checkpoint_view = engine.view();
+        let checkpoint_view = engine.fold().applied.clone();
         let checkpoint_cursor = engine.cursor();
         engine
             .apply_batch(&batch_of(Some(block(1, 0)), vec![(block(2, 0), vec![0])]))
@@ -1244,7 +1297,7 @@ mod tests {
         // then both restores match
         assert_eq!(first_restore, checkpoint_cursor);
         assert_eq!(second_restore, checkpoint_cursor);
-        assert_eq!(engine.view(), checkpoint_view);
+        assert_eq!(engine.fold().applied, checkpoint_view);
     }
 
     #[test]

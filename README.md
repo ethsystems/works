@@ -11,6 +11,16 @@ Rust 1.95.0 (pinned via [`rust-toolchain.toml`](rust-toolchain.toml)).
 - [`binius-mayo`](crates/binius-mayo): A Binius64 zk-circuit library proving MAYO-2 post-quantum signature verification
 - [`chainfold`](crates/chainfold): A sans-io fold engine for ordered chain events, with fork recovery and durable snapshots.
 
+## Examples
+
+Each crate carries its own examples in its `examples/` directory. Examples that span
+more than one crate live in [`crates/examples`](crates/examples), so no published crate
+has to take a dev-dependency on a sibling.
+
+```sh
+cargo run --release -p examples --example merkle_log
+```
+
 ## Security
 
 See [SECURITY.md](SECURITY.md) for our vulnerability disclosure policy.

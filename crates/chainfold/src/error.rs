@@ -93,11 +93,6 @@ pub enum DivergenceCause {
         /// Oldest block the source still serves.
         horizon: u64,
     },
-    /// Fold view disagreed with the anchor after retries.
-    AnchorDivergence {
-        /// Block whose anchor comparison failed.
-        at: u64,
-    },
 }
 
 impl fmt::Display for DivergenceCause {
@@ -110,7 +105,6 @@ impl fmt::Display for DivergenceCause {
                     "replay needs block {needed}, source horizon is {horizon}"
                 )
             }
-            Self::AnchorDivergence { at } => write!(f, "anchor divergence at block {at}"),
         }
     }
 }

@@ -8,7 +8,6 @@ use std::vec::Vec;
 use core::fmt;
 
 use crate::{
-    batch::Batch,
     engine::Engine,
     error::{
         DurabilityLost,
@@ -21,9 +20,8 @@ use crate::{
     },
     sink::SnapshotSink,
     source::{
-        EventSource,
-        ProbeSource,
         ReplayHorizon,
+        Source,
     },
 };
 
@@ -49,7 +47,6 @@ pub enum FailKind {
 
 impl Fold for RecordingFold {
     type Event = u64;
-    type View = Vec<(Position, u64)>;
     type Error = FailKind;
 
     fn apply(
@@ -71,10 +68,6 @@ impl Fold for RecordingFold {
         }
         self.applied.push((pos, *event));
         Ok(())
-    }
-
-    fn view(&self) -> Self::View {
-        self.applied.clone()
     }
 }
 
@@ -121,7 +114,6 @@ pub struct NoopFold;
 
 impl Fold for NoopFold {
     type Event = u64;
-    type View = ();
     type Error = core::convert::Infallible;
 
     fn apply(
@@ -131,8 +123,6 @@ impl Fold for NoopFold {
     ) -> Result<(), FoldError<Self::Error>> {
         Ok(())
     }
-
-    fn view(&self) -> Self::View {}
 }
 
 /// Sink recording each accepted offer's durable point; fails scripted offers.
@@ -165,8 +155,8 @@ impl<F: Fold> SnapshotSink<F> for WatermarkSink {
 const HASH_LANES: usize = 4;
 /// Byte width of one hash lane.
 const LANE_BYTES: usize = 8;
-/// Sentinel batch_blocks value meaning no cap on event-bearing blocks per poll.
-const UNBOUNDED_BATCH_BLOCKS: usize = usize::MAX;
+/// Sentinel window meaning the whole chain is served in one query.
+const UNBOUNDED_WINDOW: u64 = u64::MAX;
 
 /// One splitmix64 mixing step, the building block of the ancestry-committing hash.
 fn splitmix64(mut x: u64) -> u64 {
@@ -208,7 +198,7 @@ pub struct ScriptedChain {
     blocks: Vec<ScriptedBlock>,
     next_salt: u64,
     horizon: ReplayHorizon,
-    batch_blocks: usize,
+    window: u64,
     pending_failures: u32,
 }
 
@@ -232,7 +222,7 @@ impl ScriptedChain {
             blocks: Vec::new(),
             next_salt: 0,
             horizon: ReplayHorizon::Genesis,
-            batch_blocks: UNBOUNDED_BATCH_BLOCKS,
+            window: UNBOUNDED_WINDOW,
             pending_failures: 0,
         }
     }
@@ -285,14 +275,14 @@ impl ScriptedChain {
         })
     }
 
-    /// Sets the horizon the chain reports through `EventSource::horizon`.
+    /// Sets the horizon the chain reports through `Source::horizon`.
     pub fn set_horizon(&mut self, horizon: ReplayHorizon) {
         self.horizon = horizon;
     }
 
-    /// Caps the event-bearing blocks served per poll.
-    pub fn set_batch_blocks(&mut self, blocks: usize) {
-        self.batch_blocks = blocks;
+    /// Caps the blocks the driver reads per query, which paces the poll loop.
+    pub fn set_window(&mut self, blocks: u64) {
+        self.window = blocks;
     }
 
     /// The next n polls return PollFailure.
@@ -301,45 +291,46 @@ impl ScriptedChain {
     }
 }
 
-impl EventSource for ScriptedChain {
+impl Source for ScriptedChain {
     type Event = u64;
     type Error = PollFailure;
 
-    fn next_batch(
-        &mut self,
-        cursor: Option<Position>,
-        out: &mut Batch<Self::Event>,
-    ) -> Result<(), Self::Error> {
+    fn head(&mut self) -> Result<u64, PollFailure> {
         if self.pending_failures > 0 {
             self.pending_failures -= 1;
             return Err(PollFailure);
         }
-        out.clear();
-        let start_number = match cursor {
-            Some(pos) => {
-                out.boundary = self.header(pos.block);
-                pos.block.checked_add(1).expect("cursor block at u64::MAX")
-            }
-            None => self.first_block,
-        };
-        let mut served = 0usize;
+        Ok(self
+            .blocks
+            .last()
+            .map_or(self.first_block.saturating_sub(1), |block| block.number))
+    }
+
+    fn header_at(&mut self, number: u64) -> Result<Option<BlockRef>, PollFailure> {
+        Ok(self.header(number))
+    }
+
+    fn events_in(
+        &mut self,
+        from: u64,
+        to: u64,
+        out: &mut Vec<(BlockRef, u32, u64)>,
+    ) -> Result<(), PollFailure> {
         for block in &self.blocks {
-            if block.number < start_number || block.events.is_empty() {
+            if block.number < from || block.number > to {
                 continue;
             }
-            if served >= self.batch_blocks {
-                break;
-            }
-            out.push_block(
-                BlockRef {
-                    number: block.number,
-                    hash: block.hash,
-                },
-                block.events.iter().enumerate().map(|(index, event)| {
-                    (u32::try_from(index).expect("log index fits in u32"), *event)
-                }),
-            );
-            served += 1;
+            let header = BlockRef {
+                number: block.number,
+                hash: block.hash,
+            };
+            out.extend(block.events.iter().enumerate().map(|(index, event)| {
+                (
+                    header,
+                    u32::try_from(index).expect("log index fits in u32"),
+                    *event,
+                )
+            }));
         }
         Ok(())
     }
@@ -347,15 +338,9 @@ impl EventSource for ScriptedChain {
     fn horizon(&self) -> ReplayHorizon {
         self.horizon
     }
-}
 
-impl ProbeSource for ScriptedChain {
-    fn header_at(&mut self, number: u64) -> Result<Option<BlockRef>, Self::Error> {
-        if self.pending_failures > 0 {
-            self.pending_failures -= 1;
-            return Err(PollFailure);
-        }
-        Ok(self.header(number))
+    fn window(&self) -> u64 {
+        self.window
     }
 }
 
@@ -600,16 +585,12 @@ impl Vfs for CrashVfs {
 mod tests {
     use super::*;
     use crate::{
-        batch::Batch,
         fold::Fold,
         position::{
             BlockRef,
             Position,
         },
-        source::{
-            EventSource,
-            ProbeSource,
-        },
+        source::Source,
     };
     #[cfg(not(feature = "std"))]
     use alloc::vec;
@@ -631,7 +612,7 @@ mod tests {
         }
         // then entries match in order
         assert_eq!(
-            fold.view(),
+            fold.applied,
             vec![(positions[0], 0), (positions[1], 1), (positions[2], 2)]
         );
     }
@@ -651,7 +632,7 @@ mod tests {
             result,
             Err(crate::error::FoldError::Poison(FailKind::Poison))
         ));
-        assert_eq!(fold.view(), vec![(pos, 42)]);
+        assert_eq!(fold.applied, vec![(pos, 42)]);
     }
 
     #[test]
@@ -660,9 +641,8 @@ mod tests {
         let mut fold = NoopFold;
         // when applied
         let result = fold.apply(Position::new(1, 0), &7);
-        // then Ok and view is unit
+        // then Ok
         assert_eq!(result, Ok(()));
-        assert_eq!(fold.view(), ());
     }
 
     #[test]
@@ -697,15 +677,13 @@ mod tests {
         chain.push_block(&[]);
         chain.push_block(&[]);
         chain.push_block(&[30, 31]);
-        let cursor = Position::new(5, 1);
-        let mut batch = Batch::new();
-        // when polled
-        chain.next_batch(Some(cursor), &mut batch).unwrap();
-        // then one span for block 9 with the complete event set
-        assert_eq!(batch.span_count(), 1);
-        let span = batch.spans().next().expect("one span");
-        assert_eq!(span.number, 9);
-        let events: Vec<u64> = span.events.to_vec();
+        let mut out = Vec::new();
+        // when read past the cursor block
+        chain.events_in(6, 9, &mut out).unwrap();
+        // then only block 9's complete event set
+        let blocks: Vec<u64> = out.iter().map(|(block, ..)| block.number).collect();
+        assert_eq!(blocks, vec![9, 9]);
+        let events: Vec<u64> = out.iter().map(|(.., event)| *event).collect();
         assert_eq!(events, vec![30, 31]);
     }
 
@@ -717,13 +695,11 @@ mod tests {
             chain.push_block(&[1]);
         }
         let cursor = Position::new(5, 0);
-        // when the chain reorgs at block 4 and is polled
+        // when the chain reorgs at block 4 and block 5 is probed again
         chain.reorg(3, &[&[1], &[1], &[1]]);
         let new_header = chain.header(5).unwrap();
-        let mut batch = Batch::new();
-        chain.next_batch(Some(cursor), &mut batch).unwrap();
-        // then boundary is block 5's new header
-        assert_eq!(batch.boundary, Some(new_header));
+        // then the probe reports block 5's new header
+        assert_eq!(chain.header_at(cursor.block), Ok(Some(new_header)));
     }
 
     #[test]
@@ -735,40 +711,36 @@ mod tests {
         }
         let cursor = Position::new(5, 0);
         chain.reorg(4, &[&[1]]);
-        let mut batch = Batch::new();
-        // when polled
-        chain.next_batch(Some(cursor), &mut batch).unwrap();
-        // then boundary None
-        assert_eq!(batch.boundary, None);
+        // when probed
+        // then the header is gone
+        assert_eq!(chain.header_at(cursor.block), Ok(None));
     }
 
     #[test]
-    fn batch_blocks_caps_spans_per_poll() {
-        // given five event-bearing blocks and batch_blocks 2
+    fn events_in_covers_only_the_requested_range() {
+        // given five event-bearing blocks numbered 1..=5
         let mut chain = ScriptedChain::new(1);
         for i in 0..5u64 {
             chain.push_block(&[i]);
         }
-        chain.set_batch_blocks(2);
-        let mut batch = Batch::new();
-        // when polled
-        chain.next_batch(None, &mut batch).unwrap();
-        // then two spans
-        assert_eq!(batch.span_count(), 2);
+        let mut out = Vec::new();
+        // when reading 2..=3
+        chain.events_in(2, 3, &mut out).unwrap();
+        // then only those two blocks' events
+        let numbers: Vec<u64> = out.iter().map(|(block, ..)| block.number).collect();
+        assert_eq!(numbers, vec![2, 3]);
     }
 
     #[test]
-    fn empty_batch_signals_caught_up() {
-        // given a cursor at the tip
+    fn head_reports_the_tip_and_underflows_to_before_first_on_empty() {
+        // given an empty chain starting at 1
         let mut chain = ScriptedChain::new(1);
+        // then head is below the first block, so nothing is in range
+        assert_eq!(chain.head(), Ok(0));
+        // and once blocks exist it is the tip
         chain.push_block(&[1]);
         chain.push_block(&[2]);
-        let tip = Position::new(2, 0);
-        let mut batch = Batch::new();
-        // when polled
-        chain.next_batch(Some(tip), &mut batch).unwrap();
-        // then no spans
-        assert!(batch.is_empty());
+        assert_eq!(chain.head(), Ok(2));
     }
 
     #[test]
@@ -790,14 +762,13 @@ mod tests {
         let mut chain = ScriptedChain::new(1);
         chain.push_block(&[1]);
         chain.fail_next_polls(2);
-        let mut batch = Batch::new();
         // when polling three times
-        let first = chain.next_batch(None, &mut batch);
-        let second = chain.next_batch(None, &mut batch);
-        let third = chain.next_batch(None, &mut batch);
+        let first = chain.head();
+        let second = chain.head();
+        let third = chain.head();
         // then two errors then success
         assert_eq!(first, Err(PollFailure));
         assert_eq!(second, Err(PollFailure));
-        assert_eq!(third, Ok(()));
+        assert_eq!(third, Ok(1));
     }
 }

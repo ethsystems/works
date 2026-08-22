@@ -1,4 +1,4 @@
-//! Tokio harness: runs a `Tickable` on its own thread and publishes status into a watch.
+//! Tokio harness: runs a `Driver` on its own thread and publishes status into a watch.
 
 use std::{
     sync::{
@@ -13,10 +13,13 @@ use tokio::sync::watch;
 
 use crate::{
     driver::{
+        Driver,
         DriverStatus,
-        Tickable,
     },
+    fold::Fold,
     position::Position,
+    sink::SnapshotSink,
+    source::Source,
 };
 
 /// Pending checkpoint requests and the stop signal shared with the loop thread.
@@ -25,8 +28,14 @@ struct HarnessState {
     stop: bool,
 }
 
-/// Runs a `Tickable` on a dedicated thread, bridging its status into a tokio watch channel.
-pub fn spawn<T: Tickable + Send + 'static>(mut driver: T) -> Handle<T> {
+/// Runs a `Driver` on a dedicated thread, bridging its status into a tokio watch channel.
+pub fn spawn<F, S, K>(mut driver: Driver<F, S, K>) -> Handle<Driver<F, S, K>>
+where
+    F: Fold + Clone + Send + 'static,
+    F::Event: Send,
+    S: Source<Event = F::Event> + Send + 'static,
+    K: SnapshotSink<F> + Send + 'static,
+{
     let initial = driver.status();
     let (status_tx, status_rx) = watch::channel(initial);
     let state = Arc::new((
@@ -83,7 +92,7 @@ pub fn spawn<T: Tickable + Send + 'static>(mut driver: T) -> Handle<T> {
     }
 }
 
-/// Handle to a `Tickable` running on its own thread.
+/// Handle to a `Driver` running on its own thread.
 pub struct Handle<T> {
     status: watch::Receiver<DriverStatus>,
     state: Arc<(Mutex<HarnessState>, Condvar)>,
@@ -286,7 +295,7 @@ mod tests {
         for value in 1..=12u64 {
             chain.push_block(&[value]);
         }
-        chain.set_batch_blocks(1);
+        chain.set_window(1);
         let driver = Driver::with_sink(
             RecordingFold::default(),
             chain,
@@ -377,6 +386,6 @@ mod tests {
         // then the returned driver's engine view matches the last published status
         assert_eq!(driver.engine().cursor(), status.cursor);
         let expected = vec![(Position::new(1, 0), 1), (Position::new(2, 0), 2)];
-        assert_eq!(driver.engine().view(), expected);
+        assert_eq!(driver.engine().fold().applied, expected);
     }
 }
