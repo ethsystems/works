@@ -20,7 +20,7 @@ durable, a reorg noticed only when a proof stops verifying.
 - **detect**: each batch carries the current header of the cursor block. A block hash
   commits to its whole ancestry, so a reorg touching anything at or below the cursor
   changes that one hash. One header per poll, one 40-byte compare.
-- **recover**: on a mismatch, `Probed` bisects the ring of observed blocks with
+- **recover**: on a mismatch, the driver bisects the ring of observed blocks with
   `header_at` for the deepest still-canonical block, rolls back to the newest checkpoint
   at or below it, and refolds forward. `O(log W)` probes, then deterministic replay.
 - **persist**: the driver offers the oldest retained checkpoint to a sink; a flusher
@@ -29,7 +29,7 @@ durable, a reorg noticed only when a proof stops verifying.
 
 ```mermaid
 flowchart LR
-  C[(chain)] -->|next_batch| D[Driver]
+  C[(chain)] -->|"head, header_at, events_in"| D[Driver]
   D -->|apply_batch| E[Engine]
   E --> K["K checkpoint slots"]
   K -->|offer| F[Flusher]
@@ -49,7 +49,7 @@ intended for production use.
 
 <!-- ANCHOR: design -->
 Three layers, each usable without the one above it: the `Engine` (`no_std` + `alloc`,
-sans-io, single writer), the `Driver` (a sans-runtime `Tickable` owning cadence, backoff,
+sans-io, single writer), the `Driver` (sans-runtime, owning cadence, backoff, scanning,
 and recovery), and the adapters (`std`: tokio harness, snapshot store, flusher).
 
 - `Position` is `(block, log_index)`. `log_index` is block-unique on EVM, so a tx index
@@ -59,21 +59,17 @@ and recovery), and the adapters (`std`: tokio harness, snapshot store, flusher).
 - `FoldError` is classified at the fold, not guessed by the engine: `Skip` (not mine,
   counted and stepped over), `Halt` (clean below this position, rollback or resync),
   `Poison` (partially mutated, untrusted until a restore).
-- fork detection is a separate capability trait. A source without `header_at` (blobs,
-  files) cannot be wired into a configuration that claims detection, and `Ok(None)` from
-  a probe means suspected fork, never a lagging node.
+- `Source` is three reads: `head`, `header_at`, `events_in`. The driver owns the window
+  walk, the scan mark, the boundary refetch, and the grouping into spans, so a source
+  cannot get the batch shape wrong and every source gets fork detection. `Ok(None)` from
+  a probe means suspected fork.
 - rollback is bounded to K retained checkpoints. Over-rollback past still-canonical but
   unobserved blocks is intended; the discarded events replay deterministically.
 - the recovery ladder is rollback, then resync from genesis, then a typed terminal state.
   `DivergenceCause` names which rung ran out: fork deeper than the window, no checkpoint
-  below the ancestor, source horizon short of the start block, anchor divergence.
+  below the ancestor, source horizon short of the start block.
 - `EngineStatus::Unrecoverable` is only left by a `reset`. Automated progress stops
   rather than folding on untrusted state.
-- source obligations are normative and tested: one consistent chain view per batch, the
-  cursor's current header on every batch that follows a cursor, whole-block spans in log
-  order, an honestly declared replay horizon.
-- `Anchor` is a non-blocking callback over caller-supplied data, compared at every
-  checkpoint. Fetching the expectation is the consumer's job.
 - the snapshot envelope is engine-owned: magic, format version, fold identity tag,
   cursor, observed ring, state bytes, CRC32C trailer. The ring travels inside it, so a
   restarted engine detects a reorg that happened while it was down.
@@ -110,23 +106,15 @@ struct Balances { total: u128 }
 
 impl Fold for Balances {
     type Event = u128;
-    type View = u128;
     type Error = &'static str;
 
     fn apply(&mut self, _pos: Position, event: &u128) -> Result<(), FoldError<&'static str>> {
         self.total = self.total.checked_add(*event).ok_or(FoldError::Halt("overflow"))?;
         Ok(())
     }
-
-    fn view(&self) -> u128 {
-        self.total
-    }
 }
 
-let mut engine = Engine::new(
-    Balances::default(),
-    EngineConfig { ring_capacity: 1024, checkpoint_slots: 4 },
-)?;
+let mut engine = Engine::new(Balances::default(), EngineConfig::default())?;
 
 // a batch per poll: ordering, dedup, boundary recheck, fork detection
 let summary = engine.apply_batch(&batch)?;
@@ -136,13 +124,13 @@ engine.checkpoint();
 ### driver and harness
 
 ```rust,ignore
-use chainfold::{DriverConfig, EngineConfig, Probed, Tick, Tickable, harness};
+use chainfold::{Driver, DriverConfig, EngineConfig, Tick, harness};
 
-let mut driver = Probed::new(
+let mut driver = Driver::new(
     Balances::default(),
-    source, // your EventSource + ProbeSource
-    EngineConfig { ring_capacity: 1024, checkpoint_slots: 8 },
-    DriverConfig { checkpoint_interval: Some(64), ..DriverConfig::default() },
+    source, // your Source
+    EngineConfig::default(),
+    DriverConfig::from_block(deployment_block),
 )?;
 
 // sans-runtime: the whole loop a consumer without tokio writes
@@ -158,9 +146,9 @@ let mut handle = harness::spawn(driver);
 let status = handle.wait_caught_up().await;
 ```
 
-`Driver` escalates a suspected fork straight to resync; `Probed` needs a `ProbeSource` and
-bisects to the ancestor first. Both take an `Anchor`, a `SnapshotSink`, or both, through
-the `with_anchor`, `with_sink`, and `resume*` constructors.
+A suspected fork bisects to the ancestor and rolls back; only a fork below every retained
+checkpoint escalates to a resync. `with_sink` and the `resume*` constructors add a
+`SnapshotSink`.
 
 ### durability (`storage` feature)
 
@@ -170,7 +158,7 @@ the `SnapshotSink` in between: the driver offers, the flusher thread fsyncs, and
 watermark moves onto the committed snapshot only when the fsync returns.
 
 `examples/replay.rs` runs the whole shape end to end: fold to the tip under a live flusher,
-survive a reorg, then restart from the durable cursor and converge on the same view.
+survive a reorg, then restart from the durable cursor and converge on the same state.
 
 ```sh
 cargo run -p chainfold --example replay --features tokio,storage,test-helpers
