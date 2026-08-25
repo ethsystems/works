@@ -18,7 +18,10 @@ more than one crate live in [`crates/examples`](crates/examples), so no publishe
 has to take a dev-dependency on a sibling.
 
 ```sh
+# chainfold + rotortree: chain events folded into a durable merkle accumulator
 cargo run --release -p examples --example merkle_log
+# chainfold + sealring: a shielded-pool wallet syncing off an unreliable rpc
+cargo run --release -p examples --example shielded_wallet
 ```
 
 ## Security

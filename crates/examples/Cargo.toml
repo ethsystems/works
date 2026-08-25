@@ -10,5 +10,8 @@ publish = false
 
 [dev-dependencies]
 chainfold = { path = "../chainfold", features = ["storage", "test-helpers"] }
+rand_chacha = "0.10"
 rotortree = { path = "../rotortree", features = ["storage", "blake3"] }
+sealring = { path = "../sealring", features = ["x25519", "std"] }
 tempfile = "3"
+x25519-dalek = { version = "3.0", default-features = false, features = ["static_secrets"] }
