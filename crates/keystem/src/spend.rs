@@ -24,7 +24,6 @@ use crate::{
 /// Holds the field's canonical big-endian encoding and is canonical by
 /// construction: rejection sampling or checked decode are the only ways in.
 /// Zeroized on drop, `Debug` prints `REDACTED`.
-/// ```
 #[derive(Zeroize, ZeroizeOnDrop)]
 pub struct SpendingKey<F: PrimeField> {
     bytes: [u8; KEY_LEN],
