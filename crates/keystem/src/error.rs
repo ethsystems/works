@@ -54,3 +54,21 @@ impl fmt::Display for InvalidKey {
 #[cfg(feature = "viewing")]
 #[cfg_attr(docsrs, doc(cfg(feature = "viewing")))]
 impl core::error::Error for InvalidKey {}
+
+/// Bytes that decode to no owner-and-viewing credential pair.
+#[cfg(all(feature = "spend", feature = "viewing"))]
+#[cfg_attr(docsrs, doc(cfg(all(feature = "spend", feature = "viewing"))))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InvalidAddress;
+
+#[cfg(all(feature = "spend", feature = "viewing"))]
+#[cfg_attr(docsrs, doc(cfg(all(feature = "spend", feature = "viewing"))))]
+impl fmt::Display for InvalidAddress {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "bytes are not an owner and viewing credential pair")
+    }
+}
+
+#[cfg(all(feature = "spend", feature = "viewing"))]
+#[cfg_attr(docsrs, doc(cfg(all(feature = "spend", feature = "viewing"))))]
+impl core::error::Error for InvalidAddress {}

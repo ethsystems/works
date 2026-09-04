@@ -19,6 +19,7 @@ That uniformity is what makes this packaging rather than design. The constructio
 - **spend**: a `SpendingKey` is canonical by construction, decoded or drawn only through checked paths, and never through a raw byte cast. `derive_owner_pubkey` runs the shared Poseidon1 permutation and returns the public credential.
 - **custody**: `SpendAuthority` distinguishes between the key and whatever holds it. The in-memory `SpendingKey` answers both `owner_pubkey` and `scalar`; a non-exporting custodian answers the pubkey and returns `NotExportable` from `scalar`.
 - **view**: a `ViewingKey<K, F>` wraps a KEM keypair from a curve family `K`, tagged with a disclosure channel `F`. `Incoming`, `Compliance`, and `Audit` are distinct ZSTs, so a value built for one channel cannot be handed to code expecting another.
+- **address**: an `Address` carries the owner pubkey and a viewing pubkey as one value, so a consumer authenticates one credential.
 
 <!-- ANCHOR_END: intro -->
 

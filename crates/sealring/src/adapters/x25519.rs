@@ -12,7 +12,16 @@ use crate::kem::Kem;
 /// Byte length of a Montgomery-form X25519 point.
 const X25519_EPK_LEN: usize = 32;
 
-/// X25519 KEM. Every 32-byte string is a valid input; low-order points
+/// Canonical little-endian encoding of `p = 2^255 - 19`.
+#[rustfmt::skip]
+const P: [u8; X25519_EPK_LEN] = [
+    0xed, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f,
+];
+
+/// X25519 KEM. Inputs are the 32-byte strings below `p`; low-order points
 /// produce an all-zero Diffie-Hellman output, rejected in constant time.
 pub struct X25519;
 
@@ -77,12 +86,13 @@ impl Kem for X25519 {
         pk.to_bytes()
     }
 
-    /// Every 32-byte string names a point. Low-order ones produce an all-zero
-    /// Diffie-Hellman output, which `decap` rejects, so the check that matters
-    /// happens where the secret is.
+    /// Rejects the non-canonical encodings dalek would otherwise accept
     fn decode_pk(bytes: &[u8]) -> Option<Self::PublicKey> {
-        Some(PublicKey::from(
-            <[u8; X25519_EPK_LEN]>::try_from(bytes).ok()?,
-        ))
+        let bytes = <[u8; X25519_EPK_LEN]>::try_from(bytes).ok()?;
+        bytes
+            .iter()
+            .rev()
+            .lt(P.iter().rev())
+            .then(|| PublicKey::from(bytes))
     }
 }

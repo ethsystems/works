@@ -3,6 +3,7 @@
 use rand_chacha::ChaCha20Rng;
 use rand_core::SeedableRng;
 use sealring::{
+    Kem,
     Recipient,
     X25519,
     open,
@@ -71,6 +72,16 @@ const LOW_ORDER_POINTS: &[[u8; 32]] = &[
     ],
 ];
 
+/// Canonical little-endian encoding of `p = 2^255 - 19`, the first byte string
+/// that is not a canonical point encoding.
+#[rustfmt::skip]
+const P: [u8; 32] = [
+    0xed, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f,
+];
+
 #[test]
 fn conformance_suite() {
     let mut rng = ChaCha20Rng::seed_from_u64(11);
@@ -114,4 +125,26 @@ fn seal_open_round_trips() {
     let opened = open::<X25519, TestDomain, _>(&me, &envelope, aad).unwrap();
 
     assert_eq!(opened, Some(note));
+}
+
+#[test]
+fn decode_pk_accepts_only_canonical_encodings() {
+    // The boundary, which a bit-255 mask alone would let through: `p` and
+    // `p + 1` are second encodings of points that already have one.
+    let mut neighbour = P;
+    neighbour[0] -= 1;
+    assert!(
+        X25519::decode_pk(&neighbour).is_some(),
+        "p - 1 is canonical"
+    );
+    assert!(X25519::decode_pk(&P).is_none(), "p is not");
+    neighbour[0] += 2;
+    assert!(X25519::decode_pk(&neighbour).is_none(), "p + 1 is not");
+
+    // Setting bit 255 of a real key is the same credential on the wire.
+    let mut rng = ChaCha20Rng::seed_from_u64(44);
+    let mut pk = PublicKey::from(&StaticSecret::random_from_rng(&mut rng)).to_bytes();
+    assert!(X25519::decode_pk(&pk).is_some());
+    pk[31] |= 0x80;
+    assert!(X25519::decode_pk(&pk).is_none(), "bit 255 must be rejected");
 }

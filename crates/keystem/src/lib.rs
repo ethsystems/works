@@ -7,7 +7,7 @@
 #![deny(warnings)]
 #![cfg_attr(not(feature = "std"), no_std)]
 
-#[cfg(all(not(feature = "std"), feature = "serde", feature = "viewing"))]
+#[cfg(all(not(feature = "std"), feature = "viewing"))]
 #[cfg_attr(docsrs, doc(cfg(not(feature = "std"))))]
 extern crate alloc;
 
@@ -33,6 +33,8 @@ mod error;
 #[cfg(any(feature = "spend", feature = "viewing"))]
 mod hex;
 
+#[cfg(all(feature = "spend", feature = "viewing"))]
+mod address;
 #[cfg(feature = "spend")]
 mod authority;
 #[cfg(feature = "spend")]
@@ -56,9 +58,15 @@ pub mod family;
 #[cfg_attr(docsrs, doc(cfg(feature = "test-helpers")))]
 pub mod test_util;
 
+#[cfg(all(feature = "spend", feature = "viewing"))]
+#[cfg_attr(docsrs, doc(cfg(all(feature = "spend", feature = "viewing"))))]
+pub use address::Address;
 #[cfg(feature = "spend")]
 #[cfg_attr(docsrs, doc(cfg(feature = "spend")))]
 pub use authority::SpendAuthority;
+#[cfg(all(feature = "spend", feature = "viewing"))]
+#[cfg_attr(docsrs, doc(cfg(all(feature = "spend", feature = "viewing"))))]
+pub use error::InvalidAddress;
 #[cfg(feature = "viewing")]
 #[cfg_attr(docsrs, doc(cfg(feature = "viewing")))]
 pub use error::InvalidKey;
