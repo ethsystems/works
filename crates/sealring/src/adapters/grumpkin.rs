@@ -172,14 +172,7 @@ impl Kem for Grumpkin {
     }
 
     fn decap(sk: &Self::SecretKey, epk: &[u8]) -> Option<Self::SharedSecret> {
-        if epk.len() != GRUMPKIN_EPK_LEN {
-            return None;
-        }
-        let point = Affine::deserialize_compressed(epk).ok()?;
-        if point.is_zero() {
-            return None;
-        }
-        let shared = (point * *sk).into_affine();
+        let shared = (Self::decode_pk(epk)? * *sk).into_affine();
         Some(GrumpkinSharedSecret(x_coordinate(&shared)?))
     }
 
@@ -189,6 +182,17 @@ impl Kem for Grumpkin {
 
     fn encode_pk(pk: &Self::PublicKey) -> Self::Epk {
         compress(pk)
+    }
+
+    /// Cofactor 1 means an on-curve decode needs no subgroup check, so only
+    /// the identity is rejected. The length check is what stops a longer
+    /// string from decoding through its first 32 bytes.
+    fn decode_pk(bytes: &[u8]) -> Option<Self::PublicKey> {
+        if bytes.len() != GRUMPKIN_EPK_LEN {
+            return None;
+        }
+        let point = Affine::deserialize_compressed(bytes).ok()?;
+        (!point.is_zero()).then_some(point)
     }
 
     /// Scalar-multiplies every epk in the chunk, then converts the whole
@@ -211,15 +215,9 @@ impl Kem for Grumpkin {
 
             for (i, (epk, slot)) in epks.iter().zip(out.iter_mut()).enumerate() {
                 *slot = None;
-                if epk.len() != GRUMPKIN_EPK_LEN {
-                    continue;
-                }
-                let Ok(point) = Affine::deserialize_compressed(*epk) else {
+                let Some(point) = Self::decode_pk(epk) else {
                     continue;
                 };
-                if point.is_zero() {
-                    continue;
-                }
                 let shared = point * *sk;
                 // An identity result has no x-coordinate to report, and
                 // Montgomery's trick needs every element it inverts non-zero.

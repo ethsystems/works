@@ -48,6 +48,15 @@ pub trait Kem {
     /// Encodes `pk` in the same format as `Epk`.
     fn encode_pk(pk: &Self::PublicKey) -> Self::Epk;
 
+    /// Decodes what [`encode_pk`](Self::encode_pk) produced, returning `None`
+    /// for byte strings that name no public key.
+    ///
+    /// The sender's import path for a counterparty key. It reads the same
+    /// encoding [`decap`](Self::decap) reads, so it rejects the same inputs.
+    /// An adapter proves both properties with `conformance_pk_codec_roundtrips`
+    /// and `conformance_garbage_fails` from the `test-helpers` suite.
+    fn decode_pk(bytes: &[u8]) -> Option<Self::PublicKey>;
+
     /// Decapsulates a batch of ephemeral keys, one output slot per input.
     ///
     /// The default is a scalar loop over [`decap`](Self::decap); adapters

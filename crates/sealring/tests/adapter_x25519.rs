@@ -12,6 +12,7 @@ use sealring::{
         conformance_derive_pk_agrees,
         conformance_garbage_fails,
         conformance_low_order_fails,
+        conformance_pk_codec_roundtrips,
         conformance_roundtrip,
     },
 };
@@ -83,6 +84,7 @@ fn conformance_suite() {
 
     conformance_roundtrip::<X25519>(&mut rng, &pk, &sk);
     conformance_derive_pk_agrees::<X25519>(&pk, &sk);
+    conformance_pk_codec_roundtrips::<X25519>(&pk);
 }
 
 #[test]

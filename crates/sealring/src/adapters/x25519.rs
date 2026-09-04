@@ -57,8 +57,7 @@ impl Kem for X25519 {
     }
 
     fn decap(sk: &Self::SecretKey, epk: &[u8]) -> Option<Self::SharedSecret> {
-        let epk_bytes: [u8; X25519_EPK_LEN] = epk.try_into().ok()?;
-        let shared = sk.diffie_hellman(&PublicKey::from(epk_bytes));
+        let shared = sk.diffie_hellman(&Self::decode_pk(epk)?);
         let shared_bytes = shared.to_bytes();
         let is_zero: bool = shared_bytes
             .as_slice()
@@ -76,5 +75,14 @@ impl Kem for X25519 {
 
     fn encode_pk(pk: &Self::PublicKey) -> Self::Epk {
         pk.to_bytes()
+    }
+
+    /// Every 32-byte string names a point. Low-order ones produce an all-zero
+    /// Diffie-Hellman output, which `decap` rejects, so the check that matters
+    /// happens where the secret is.
+    fn decode_pk(bytes: &[u8]) -> Option<Self::PublicKey> {
+        Some(PublicKey::from(
+            <[u8; X25519_EPK_LEN]>::try_from(bytes).ok()?,
+        ))
     }
 }

@@ -59,7 +59,7 @@ impl Kem for K256 {
     }
 
     fn decap(sk: &Self::SecretKey, epk: &[u8]) -> Option<Self::SharedSecret> {
-        let pk = k256::PublicKey::from_sec1_bytes(epk).ok()?;
+        let pk = Self::decode_pk(epk)?;
         let shared = k256::ecdh::diffie_hellman(sk.to_nonzero_scalar(), pk.as_affine());
         let bytes: &[u8; 32] = shared.raw_secret_bytes().as_ref();
         Some(K256SharedSecret(*bytes))
@@ -76,6 +76,11 @@ impl Kem for K256 {
         epk
     }
 
+    /// SEC1 decoding rejects the identity and off-curve points.
+    fn decode_pk(bytes: &[u8]) -> Option<Self::PublicKey> {
+        k256::PublicKey::from_sec1_bytes(bytes).ok()
+    }
+
     fn decap_batch(
         sk: &Self::SecretKey,
         epks: &[&[u8]],
@@ -89,7 +94,7 @@ impl Kem for K256 {
 
             for (i, (epk, slot)) in epks.iter().zip(out.iter_mut()).enumerate() {
                 *slot = None;
-                let Ok(pk) = k256::PublicKey::from_sec1_bytes(epk) else {
+                let Some(pk) = Self::decode_pk(epk) else {
                     continue;
                 };
                 indices[valid] = i;

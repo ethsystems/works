@@ -1,0 +1,83 @@
+[package]
+name = "keystem"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+description = "shielded key material for selective disclosure: spend authority and view authority as distinct key types"
+include = [
+    "src/**/*.rs",
+    "benches/**/*.rs",
+    "examples/**/*.rs",
+    "tests/**/*.rs",
+    "tests/golden/*.hex",
+    "README.md",
+    "LICENSE-MIT",
+    "LICENSE-APACHE",
+]
+
+[dependencies]
+rand_core = { version = "0.10", default-features = false, optional = true }
+zeroize = { version = "1.8", default-features = false, features = ["derive"], optional = true }
+ark-ff = { version = "0.5", default-features = false, optional = true }
+ark-bn254 = { version = "0.5", default-features = false, features = ["scalar_field"], optional = true }
+light-poseidon = { version = "0.4", optional = true }
+sealring = { version = "0.4", path = "../sealring", default-features = false, optional = true }
+k256 = { version = "0.14", default-features = false, features = ["ecdh", "arithmetic"], optional = true }
+x25519-dalek = { version = "3.0", default-features = false, features = ["static_secrets", "zeroize"], optional = true }
+serde = { workspace = true, features = ["alloc"], optional = true }
+include-utils = { workspace = true, optional = true }
+
+[dev-dependencies]
+ark-bls12-381 = { version = "0.5", default-features = false, features = ["curve"] }
+ark-serialize = { version = "0.5", default-features = false }
+criterion = { workspace = true, features = ["cargo_bench_support", "html_reports", "plotters"] }
+proptest = { workspace = true, features = ["std", "bit-set", "fork", "timeout"] }
+rand_chacha = "0.10"
+serde_json = "1"
+
+[features]
+default = ["std", "poseidon"]
+std = [
+    "ark-bn254?/std",
+    "ark-ff?/std",
+    "k256?/std",
+    "sealring?/std",
+    "serde?/std",
+    "zeroize?/std",
+]
+spend = ["dep:ark-ff", "dep:rand_core", "dep:zeroize"]
+bn254 = ["dep:ark-bn254", "spend"]
+poseidon = ["bn254", "dep:light-poseidon", "std"]
+viewing = ["dep:rand_core", "dep:sealring", "dep:zeroize"]
+k256 = ["dep:k256", "sealring/k256", "viewing"]
+x25519 = ["dep:x25519-dalek", "sealring/x25519", "viewing"]
+serde = ["dep:serde"]
+expose-secret-serde = ["serde"]
+test-helpers = []
+docs = ["dep:include-utils"]
+
+# the lib carries no #[bench] functions, and cargo would otherwise run it as a
+# bench target under the libtest harness, which rejects criterion's flags.
+[lib]
+bench = false
+
+[[bench]]
+name = "spend"
+harness = false
+required-features = ["poseidon"]
+
+[[bench]]
+name = "viewing"
+harness = false
+required-features = ["k256", "std", "x25519"]
+
+[[example]]
+name = "wallet_keys"
+required-features = ["poseidon", "serde", "test-helpers", "x25519"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]

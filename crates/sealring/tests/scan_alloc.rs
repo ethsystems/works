@@ -12,13 +12,8 @@ use std::{
         Mutex,
         MutexGuard,
         atomic::{
-            AtomicBool,
             AtomicUsize,
-            Ordering::{
-                Acquire,
-                Relaxed,
-                Release,
-            },
+            Ordering::Relaxed,
         },
     },
 };

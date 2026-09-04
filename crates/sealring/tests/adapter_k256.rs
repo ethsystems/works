@@ -16,6 +16,7 @@ use sealring::{
         conformance_derive_pk_agrees,
         conformance_garbage_fails,
         conformance_low_order_fails,
+        conformance_pk_codec_roundtrips,
         conformance_roundtrip,
     },
 };
@@ -33,6 +34,7 @@ fn conformance_suite() {
     conformance_low_order_fails::<K256>(&sk, &[IDENTITY_EPK]);
     conformance_roundtrip::<K256>(&mut rng, &pk, &sk);
     conformance_derive_pk_agrees::<K256>(&pk, &sk);
+    conformance_pk_codec_roundtrips::<K256>(&pk);
 }
 
 #[test]

@@ -88,6 +88,10 @@ impl Kem for MockKem {
     fn encode_pk(pk: &Self::PublicKey) -> Self::Epk {
         *pk
     }
+
+    fn decode_pk(bytes: &[u8]) -> Option<Self::PublicKey> {
+        bytes.try_into().ok()
+    }
 }
 
 /// Toy domain: notes are raw bytes, tag `"sealring-test"`.
@@ -109,20 +113,36 @@ impl Domain for TestDomain {
     }
 }
 
-/// Asserts that decapsulating structurally invalid epk byte strings under
-/// `sk` yields `None`: the empty string, and lengths shorter and longer
-/// than `K::EPK_LEN`.
+/// Asserts structurally invalid byte strings reach no key: the empty string,
+/// and lengths shorter and longer than `K::EPK_LEN`. `decap` and `decode_pk`
+/// read the same encoding, so both must reject all three.
 pub fn conformance_garbage_fails<K: Kem>(sk: &K::SecretKey) {
-    assert!(K::decap(sk, &[]).is_none(), "empty epk must fail decap");
     let too_short = vec![0xAAu8; K::EPK_LEN.saturating_sub(1)];
-    assert!(
-        K::decap(sk, &too_short).is_none(),
-        "short epk must fail decap"
-    );
     let too_long = vec![0xAAu8; K::EPK_LEN + 1];
-    assert!(
-        K::decap(sk, &too_long).is_none(),
-        "long epk must fail decap"
+
+    for case in [[].as_slice(), &too_short, &too_long] {
+        let len = case.len();
+        assert!(
+            K::decap(sk, case).is_none(),
+            "garbage epk of {len} bytes must fail decap"
+        );
+        assert!(
+            K::decode_pk(case).is_none(),
+            "garbage of {len} bytes must decode to no public key"
+        );
+    }
+}
+
+/// Asserts `decode_pk` inverts `encode_pk`, the property a sender rests on
+/// when it imports a counterparty's key from the wire. An adapter that gets
+/// this wrong seals to a key nobody holds.
+pub fn conformance_pk_codec_roundtrips<K: Kem>(pk: &K::PublicKey) {
+    let encoded = K::encode_pk(pk);
+    let decoded = K::decode_pk(encoded.as_ref()).expect("own pk encoding must decode");
+    assert_eq!(
+        K::encode_pk(&decoded).as_ref(),
+        encoded.as_ref(),
+        "decode_pk must invert encode_pk"
     );
 }
 

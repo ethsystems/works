@@ -1,0 +1,4 @@
+depth = 2
+skip = ["docs"]
+at-least-one-of = ["spend", "viewing"]
+exclude-no-default-features = true

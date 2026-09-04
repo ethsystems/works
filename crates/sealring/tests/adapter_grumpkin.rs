@@ -27,6 +27,7 @@ use sealring::{
         conformance_derive_pk_agrees,
         conformance_garbage_fails,
         conformance_low_order_fails,
+        conformance_pk_codec_roundtrips,
         conformance_roundtrip,
     },
 };
@@ -71,6 +72,7 @@ fn encap_decap_roundtrip_agrees() {
     let (sk, pk) = keypair(&mut rng);
     conformance_roundtrip::<Grumpkin>(&mut rng, &pk, &sk);
     conformance_derive_pk_agrees::<Grumpkin>(&pk, &sk);
+    conformance_pk_codec_roundtrips::<Grumpkin>(&pk);
 }
 
 #[test]
