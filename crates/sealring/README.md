@@ -121,7 +121,7 @@ cargo run -p sealring --example seal_open --features x25519
 | feature | pulls in | notes |
 |---|---|---|
 | (default) | nothing | traits and suite v1 only; bring your own `Kem` |
-| `k256` | k256 with `ecdh` | secp256k1, matches most iptf-pocs consumers |
+| `k256` | k256 with `ecdh` | secp256k1, matches most consumers |
 | `x25519` | x25519-dalek | |
 | `grumpkin` | ark-grumpkin | heaviest adapter; duplicates the rand/digest stack because arkworks still sits on rand_core 0.6 and digest 0.10. The adapter never routes the caller's rng into arkworks: it draws raw bytes from `CryptoRng` and builds the scalar with `from_le_bytes_mod_order` |
 | `parallel` | rayon | chunked scan across the rayon thread pool, `Scanner::scan_parallel` |
