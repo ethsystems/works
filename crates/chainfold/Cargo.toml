@@ -52,6 +52,11 @@ name = "snapshot"
 harness = false
 required-features = ["std", "wincode", "test-helpers"]
 
+[[bench]]
+name = "recover"
+harness = false
+required-features = ["std", "test-helpers"]
+
 [[example]]
 name = "replay"
 required-features = ["tokio", "storage", "test-helpers"]

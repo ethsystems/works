@@ -256,5 +256,8 @@ cargo bench -p chainfold -- --list
 
 `chainfold::apply` measures engine overhead through `NoopFold`, so the number is the
 bookkeeping alone; `chainfold::snapshot_encode` and `chainfold::snapshot_decode` measure
-the envelope codec in bytes per second. Both are feature-gated; see the
+the envelope codec in bytes per second. `chainfold::recover` times a reorg end to end,
+from the boundary mismatch through bisection, rollback, and the refold back to the tip,
+at the ring, slot, and interval settings one of our settlement PoCs runs; `chainfold::rollback`
+isolates the rollback tick as the fold grows. All are feature-gated; see the
 [Cargo.toml entry](Cargo.toml) for the exact flags.

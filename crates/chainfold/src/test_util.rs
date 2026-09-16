@@ -316,10 +316,12 @@ impl Source for ScriptedChain {
         to: u64,
         out: &mut Vec<(BlockRef, u32, u64)>,
     ) -> Result<(), PollFailure> {
-        for block in &self.blocks {
-            if block.number < from || block.number > to {
-                continue;
-            }
+        let index = |number: u64| {
+            usize::try_from(number.saturating_sub(self.first_block))
+                .map_or(self.blocks.len(), |i| i.min(self.blocks.len()))
+        };
+        let (start, end) = (index(from), index(to.saturating_add(1)));
+        for block in &self.blocks[start.min(end)..end] {
             let header = BlockRef {
                 number: block.number,
                 hash: block.hash,
