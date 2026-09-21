@@ -41,8 +41,7 @@ flowchart LR
 ```
 
 Fold state is fully generic; the crate pins no provider, no runtime, and no storage
-engine in its core. This approach makes tradeoffs specific to its callers and is not
-intended for production use.
+engine in its core.
 <!-- ANCHOR_END: intro -->
 
 ## design
