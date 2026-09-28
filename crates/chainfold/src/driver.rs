@@ -42,6 +42,7 @@ use {
         popped_tail,
         pushed_block,
     },
+    crate::verus::model::*,
     crate::verus::model::{
         BatchView,
         ChainView,
@@ -230,6 +231,7 @@ where
             r matches Ok(d) ==> d.wf() && d.synced() && engine.valid()
                 && d.engine_view() == Engine::<F>::fresh(fview::<F>(&fold), engine)
                 && d.durable_ok(),
+            r matches Ok(d) ==> d.dinv(Seq::empty(), Map::empty()),
             r matches Err(e) ==> !engine.valid() || horizon_refused(e, config.start_block),
     ))]
     pub fn new(
@@ -242,7 +244,15 @@ where
         proof! {
             crate::verus::tcb::axiom_no_sink_offers_nothing(NoSink);
         }
-        Self::build(fold, source, NoSink, engine, config)
+        let r = Self::build(fold, source, NoSink, engine, config);
+        #[cfg(verus_keep_ghost)]
+        proof! {
+            if let Ok(d) = &r {
+                d.engine.lemma_wf();
+                lemma_fresh_dinv::<F, S, F::Event, F::Error>(d.engine@, fview::<F>(&d.initial), d.config.start_block);
+            }
+        }
+        r
     }
 
     /// Resumes from a recovered engine, polling onward from its cursor.
@@ -283,6 +293,7 @@ where
             r matches Ok(d) ==> d.wf() && d.synced() && engine.valid()
                 && d.engine_view() == Engine::<F>::fresh(fview::<F>(&fold), engine)
                 && (floor_ok(sink_offered::<K>(&sink), d.engine_view()) ==> d.durable_ok()),
+            r matches Ok(d) ==> d.dinv(Seq::empty(), Map::empty()),
             r matches Err(e) ==> !engine.valid() || horizon_refused(e, config.start_block),
     ))]
     pub fn with_sink(
@@ -292,7 +303,15 @@ where
         engine: EngineConfig,
         config: DriverConfig,
     ) -> Result<Self, ConfigError> {
-        Self::build(fold, source, sink, engine, config)
+        let r = Self::build(fold, source, sink, engine, config);
+        #[cfg(verus_keep_ghost)]
+        proof! {
+            if let Ok(d) = &r {
+                d.engine.lemma_wf();
+                lemma_fresh_dinv::<F, S, F::Event, F::Error>(d.engine@, fview::<F>(&d.initial), d.config.start_block);
+            }
+        }
+        r
     }
 
     /// Resumes from a recovered engine, offering durable snapshots to the sink.
@@ -767,53 +786,258 @@ where
     }
 
     /// Runs one poll-apply step, then records whether the cursor moved forward.
+    #[cfg_attr(verus_keep_ghost, verus_spec(r =>
+        requires
+            old(self).wf(),
+        ensures
+            final(self).wf(),
+            final(self).synced(),
+            old(self).durable_ok() ==> final(self).durable_ok(),
+            final(self).init_view() == old(self).init_view(),
+            final(self).start_block() == old(self).start_block(),
+            forall|init: int, log: Seq<(Position, F::Event)>|
+                #[trigger] old(self).engine_view().inv::<F, F::Event, F::Error>(init, log)
+                    ==> tick_inv(*old(self), *final(self), r, init, log),
+            forall|log: Seq<(Position, F::Event)>, h: ChainView|
+                #[trigger] old(self).dinv(log, h) ==> t7_tick(*old(self), *final(self), r, log, h),
+    ))]
     fn step(&mut self) -> Tick {
         self.reconcile_reset();
+        #[cfg(verus_keep_ghost)]
+        proof_decl! {
+            let ghost mid = *self;
+        }
         let tick = self.poll_apply();
+        #[cfg(verus_keep_ghost)]
+        proof_decl! {
+            let ghost pa = *self;
+        }
         // Only forward cursor movement earns an immediate re-poll; a batch the
         // engine fully deduped leaves the loop on its poll interval.
         self.advanced = matches!(
             tick,
             Tick::Progressed(summary) if summary.applied > 0 || summary.skipped > 0
         );
+        #[cfg(verus_keep_ghost)]
+        proof! {
+            assert(mid.engine_view() == old(self).engine_view());
+            assert(mid.source_log() == old(self).source_log());
+            assert(pa.engine_view() == self.engine_view() && pa.source_log() == self.source_log()
+                && pa.batch_view() == self.batch_view() && pa.init_view() == self.init_view());
+            assert forall|log: Seq<(Position, F::Event)>, h: ChainView|
+                #[trigger] old(self).dinv(log, h) implies t7_tick(*old(self), *self, tick, log, h) by {
+                assert(mid.dinv(log, h));
+                assert(t7_tick(mid, pa, tick, log, h));
+                if exists|log2: Seq<(Position, F::Event)>, h2: ChainView| #[trigger] pa.dinv(log2, h2) {
+                    let (log2, h2) = choose|log2: Seq<(Position, F::Event)>, h2: ChainView| #[trigger] pa.dinv(log2, h2);
+                    assert(self.dinv(log2, h2));
+                }
+            }
+        }
         tick
     }
 
     /// Scans the source and applies the batch, recovering from a fork by bisection.
+    #[cfg_attr(verus_keep_ghost, verus_spec(r =>
+        requires
+            old(self).wf(),
+            old(self).synced(),
+        ensures
+            final(self).wf(),
+            final(self).synced(),
+            old(self).durable_ok() ==> final(self).durable_ok(),
+            final(self).init_view() == old(self).init_view(),
+            final(self).start_block() == old(self).start_block(),
+            forall|init: int, log: Seq<(Position, F::Event)>|
+                #[trigger] old(self).engine_view().inv::<F, F::Event, F::Error>(init, log)
+                    ==> tick_inv(*old(self), *final(self), r, init, log),
+            forall|log: Seq<(Position, F::Event)>, h: ChainView|
+                #[trigger] old(self).dinv(log, h) ==> t7_tick(*old(self), *final(self), r, log, h),
+    ))]
+    #[cfg_attr(verus_keep_ghost, verifier::spinoff_prover)]
+    #[cfg_attr(verus_keep_ghost, verifier::rlimit(20))]
     fn poll_apply(&mut self) -> Tick {
         self.generation = self.generation.wrapping_add(1);
         if !self.engine.status().is_active() {
-            return Tick::Terminal(self.engine.status());
+            let tick = Tick::Terminal(self.engine.status());
+            #[cfg(verus_keep_ghost)]
+            proof! {
+                assert(calls::<F, F::Event, F::Error>(self.engine@, self.batch@) =~= Seq::empty());
+                assert forall|init: int, log: Seq<(Position, F::Event)>|
+                    #[trigger] old(self).engine_view().inv::<F, F::Event, F::Error>(init, log)
+                        implies tick_inv(*old(self), *self, tick, init, log) by {
+                    assert(log + Seq::<(Position, F::Event)>::empty() =~= log);
+                }
+                assert forall|log: Seq<(Position, F::Event)>, h: ChainView|
+                    #[trigger] old(self).dinv(log, h) implies t7_tick(*old(self), *self, tick, log, h) by {
+                    assert(self.dinv(log, h));
+                }
+            }
+            return tick;
         }
         if self.scan().is_err() {
             self.consecutive_errors = self.consecutive_errors.saturating_add(1);
+            #[cfg(verus_keep_ghost)]
+            proof! {
+                assert forall|log: Seq<(Position, F::Event)>, h: ChainView|
+                    #[trigger] old(self).dinv(log, h) implies t7_tick(*old(self), *self, Tick::SourceError, log, h) by {
+                    assert(self.dinv(log, h));
+                }
+            }
             return Tick::SourceError;
         }
         self.consecutive_errors = 0;
-        match self.engine.apply_batch(&self.batch) {
+        #[cfg(verus_keep_ghost)]
+        proof_decl! {
+            let ghost v = self.engine@;
+            let ghost bv = self.batch@;
+            let ghost w = self.engine.window();
+            let ghost off = sink_offered::<K>(&self.sink);
+            let ghost (l0, hist) = (sview_log::<S>(&old(self).source).len() as int, sview_log::<S>(&self.source));
+            let ghost start = self.config.start_block;
+        }
+        #[cfg(verus_keep_ghost)]
+        proof! {
+            self.engine.lemma_wf();
+        }
+        let applied = self.engine.apply_batch(&self.batch);
+        #[cfg(verus_keep_ghost)]
+        proof! {
+            self.engine.lemma_wf();
+            if old(self).durable_ok() && self.synced() {
+                lemma_apply_floor::<F, F::Event, F::Error>(v, self.engine@, bv, w, off);
+            }
+        }
+        match applied {
             Ok(summary) => {
+                #[cfg(verus_keep_ghost)]
+                proof_decl! {
+                    let ghost post = self.engine@;
+                }
+                #[cfg(verus_keep_ghost)]
+                proof! {
+                    assert(accepted(v, bv) && !stopped::<F, F::Event, F::Error>(v, bv));
+                    let cl = calls::<F, F::Event, F::Error>(v, bv);
+                    assert forall|log: Seq<(Position, F::Event)>, h: ChainView|
+                        #[trigger] old(self).dinv(log, h) && a2_hyp::<S, F::Event>(hist, l0, v.cursor, start, bv, post.cursor)
+                            implies dinv::<F, S, F::Event, F::Error>(
+                        post,
+                        fview::<F>(&self.initial),
+                        start,
+                        log + cl,
+                        if bv.ends.len() > 0 { t7_view(hist, v.cursor, bv) } else { h },
+                    ) && t7_state::<F, S, F::Event, F::Error>(
+                        post,
+                        fview::<F>(&self.initial),
+                        start,
+                        t7_view(hist, v.cursor, bv),
+                    ) by {
+                        let (hw, ww, wins) = choose|hw: u64, ww: u64, wins: Seq<(int, int)>|
+                            #[trigger] scanned::<S, F::Event>(hist, l0, scan_first(v.cursor, start), hw, ww, wins, v.cursor, bv);
+                        lemma_apply_t7::<F, S, F::Event, F::Error>(
+                            v, post, bv, w, fview::<F>(&self.initial), start, log, h, hist, l0, hw, ww, wins,
+                        );
+                    }
+                }
                 self.caught_up = self.batch.is_empty();
                 // A snapshot refusal overrides progress; a checkpoint is silent.
                 self.auto_checkpoint();
+                #[cfg(verus_keep_ghost)]
+                proof! {
+                    let cl = calls::<F, F::Event, F::Error>(v, bv);
+                    if self.engine@ != post {
+                        assert forall|log: Seq<(Position, F::Event)>, h: ChainView|
+                            dinv::<F, S, F::Event, F::Error>(post, fview::<F>(&self.initial), start, log, h)
+                                implies #[trigger] dinv::<F, S, F::Event, F::Error>(
+                                self.engine@,
+                                fview::<F>(&self.initial),
+                                start,
+                                log,
+                                h,
+                            ) by {
+                            lemma_checkpoint_dinv::<F, S, F::Event, F::Error>(post, fview::<F>(&self.initial), start, log, h);
+                        }
+                    }
+                }
                 if let Some(tick) = self.offer_snapshot() {
+                    #[cfg(verus_keep_ghost)]
+                    proof! {
+                        let cl = calls::<F, F::Event, F::Error>(v, bv);
+                        assert(self.engine@.fold == post.fold && self.engine@.cursor == post.cursor && self.engine@.ring == post.ring);
+                        assert forall|init: int, log: Seq<(Position, F::Event)>|
+                            #[trigger] old(self).engine_view().inv::<F, F::Event, F::Error>(init, log)
+                                implies tick_inv(*old(self), *self, tick, init, log) by {}
+                        assert forall|log: Seq<(Position, F::Event)>, h: ChainView|
+                            #[trigger] old(self).dinv(log, h) implies t7_tick(*old(self), *self, tick, log, h) by {
+                            if a2_hyp::<S, F::Event>(hist, l0, v.cursor, start, bv, post.cursor) {
+                                let h2 = if bv.ends.len() > 0 { t7_view(hist, v.cursor, bv) } else { h };
+                                assert(dinv::<F, S, F::Event, F::Error>(post, fview::<F>(&self.initial), start, log + cl, h2));
+                                assert(self.dinv(log + cl, h2));
+                            }
+                        }
+                    }
                     return tick;
                 }
-                if self.batch.is_empty() {
+                let tick = if self.batch.is_empty() {
                     Tick::Idle
                 } else {
                     Tick::Progressed(summary)
+                };
+                #[cfg(verus_keep_ghost)]
+                proof! {
+                    let cl = calls::<F, F::Event, F::Error>(v, bv);
+                    assert(self.engine@.fold == post.fold && self.engine@.cursor == post.cursor && self.engine@.ring == post.ring);
+                    assert forall|init: int, log: Seq<(Position, F::Event)>|
+                        #[trigger] old(self).engine_view().inv::<F, F::Event, F::Error>(init, log)
+                            implies tick_inv(*old(self), *self, tick, init, log) by {}
+                    assert forall|log: Seq<(Position, F::Event)>, h: ChainView|
+                        #[trigger] old(self).dinv(log, h) implies t7_tick(*old(self), *self, tick, log, h) by {
+                        if a2_hyp::<S, F::Event>(hist, l0, v.cursor, start, bv, post.cursor) {
+                            let h2 = if bv.ends.len() > 0 { t7_view(hist, v.cursor, bv) } else { h };
+                            assert(dinv::<F, S, F::Event, F::Error>(post, fview::<F>(&self.initial), start, log + cl, h2));
+                            assert(self.dinv(log + cl, h2));
+                        }
+                    }
                 }
+                tick
             }
             Err(
                 ApplyError::ForkSuspected { .. }
                 | ApplyError::MissingBoundary
                 | ApplyError::CursorBlockUnobserved { .. },
-            ) => self.recover_via_bisection(),
+            ) => {
+                #[cfg(verus_keep_ghost)]
+                proof_decl! {
+                    let ghost pre = *self;
+                }
+                let tick = self.recover_via_bisection();
+                #[cfg(verus_keep_ghost)]
+                proof! {
+                    lemma_recover_t7(*old(self), pre, *self, tick);
+                }
+                tick
+            }
             Err(ApplyError::Halted { .. } | ApplyError::Poisoned { .. }) => {
-                Tick::Terminal(self.engine.status())
+                let tick = Tick::Terminal(self.engine.status());
+                #[cfg(verus_keep_ghost)]
+                proof! {
+                    assert(!(self.engine@.status is Active));
+                    assert forall|log: Seq<(Position, F::Event)>, h: ChainView|
+                        #[trigger] old(self).dinv(log, h) implies t7_tick(*old(self), *self, tick, log, h) by {
+                        assert(self.dinv(log + calls::<F, F::Event, F::Error>(v, bv), h));
+                    }
+                }
+                tick
             }
             Err(ApplyError::Shape(_) | ApplyError::BoundaryNumberMismatch { .. }) => {
                 self.consecutive_errors = self.consecutive_errors.saturating_add(1);
+                #[cfg(verus_keep_ghost)]
+                proof! {
+                    assert forall|log: Seq<(Position, F::Event)>, h: ChainView|
+                        #[trigger] old(self).dinv(log, h) implies t7_tick(*old(self), *self, Tick::SourceError, log, h) by {
+                        assert(self.dinv(log, h));
+                    }
+                }
                 Tick::SourceError
             }
             Err(ApplyError::NotActive { .. }) => {
@@ -1031,35 +1255,7 @@ where
             old(self).wf(),
             old(self).synced(),
         ensures
-            ({
-                let (from, hist) = (
-                    sview_log::<S>(&old(self).source).len() as int,
-                    sview_log::<S>(&final(self).source),
-                );
-                let mid = Driver { source: final(self).source, ..*old(self) };
-                let ring = old(self).engine@.ring;
-                &&& final(self).wf()
-                &&& final(self).synced()
-                &&& old(self).durable_ok() ==> final(self).durable_ok()
-                &&& from <= hist.len()
-                &&& hist.subrange(0, from) == sview_log::<S>(&old(self).source)
-                &&& forall|k: int| from <= k < hist.len() ==> a1::<S, S::Event>(#[trigger] hist[k])
-                &&& r matches Tick::RolledBack { to } ==> exists|lo: int, k: int|
-                    0 < lo <= ring.len() && from <= k < hist.len() && #[trigger] probe_held(ring, lo, hist[k])
-                        && rolled_back(mid, *final(self), ring[lo - 1].number, to)
-                &&& r is Resynced ==> resynced(mid, *final(self))
-                &&& r is Terminal ==> *final(self) == (Driver { engine: final(self).engine, ..mid })
-                    && final(self).engine@ == (EngineView { status: final(self).engine@.status, ..old(self).engine@ })
-                &&& r is SourceError ==> *final(self) == (Driver {
-                    consecutive_errors: if old(self).consecutive_errors < u32::MAX {
-                        (old(self).consecutive_errors + 1) as u32
-                    } else {
-                        u32::MAX
-                    },
-                    ..mid
-                })
-                &&& r is RolledBack || r is Resynced || r is Terminal || r is SourceError
-            }),
+            recovered(*old(self), *final(self), r),
     ))]
     #[cold]
     fn recover_via_bisection(&mut self) -> Tick {
@@ -1096,6 +1292,23 @@ where
     }
 
     /// Advances the loop by one poll, apply, and recovery step.
+    // T7: under A1-A3 (`t7_tick`'s hypotheses), `dinv` carries over and an Active
+    // Progressed/Idle tick leaves the fold at the canonical logs of the tick's view.
+    #[cfg_attr(verus_keep_ghost, verus_spec(r =>
+        requires
+            old(self).wf(),
+        ensures
+            final(self).wf(),
+            final(self).synced(),
+            old(self).durable_ok() ==> final(self).durable_ok(),
+            final(self).init_view() == old(self).init_view(),
+            final(self).start_block() == old(self).start_block(),
+            forall|init: int, log: Seq<(Position, F::Event)>|
+                #[trigger] old(self).engine_view().inv::<F, F::Event, F::Error>(init, log)
+                    ==> tick_inv(*old(self), *final(self), r, init, log),
+            forall|log: Seq<(Position, F::Event)>, h: ChainView|
+                #[trigger] old(self).dinv(log, h) ==> t7_tick(*old(self), *final(self), r, log, h),
+    ))]
     pub fn tick(&mut self) -> Tick {
         self.step()
     }
@@ -1112,9 +1325,25 @@ where
             forall|init: int, log: Seq<(Position, F::Event)>|
                 #[trigger] old(self).engine_view().inv::<F, F::Event, F::Error>(init, log)
                     ==> final(self).engine_view().inv::<F, F::Event, F::Error>(init, log),
+            forall|log: Seq<(Position, F::Event)>, h: ChainView|
+                #[trigger] old(self).dinv(log, h) ==> final(self).dinv(log, h),
     ))]
     pub fn checkpoint(&mut self) {
         self.run_checkpoint();
+        #[cfg(verus_keep_ghost)]
+        proof! {
+            old(self).engine.lemma_wf();
+            assert forall|log: Seq<(Position, F::Event)>, h: ChainView|
+                #[trigger] old(self).dinv(log, h) implies self.dinv(log, h) by {
+                lemma_checkpoint_dinv::<F, S, F::Event, F::Error>(
+                    old(self).engine@,
+                    fview::<F>(&self.initial),
+                    self.config.start_block,
+                    log,
+                    h,
+                );
+            }
+        }
     }
 
     /// Snapshots the current driver and engine state.
@@ -2572,6 +2801,41 @@ spec fn resynced<F: Fold, S: Source<Event = F::Event>, K: SnapshotSink<F>>(
     &&& sink_offered::<K>(&post.sink) == Set::<Position>::empty()
 }
 
+/// `recover_via_bisection`'s post-state: T4c for RolledBack, the ladder otherwise.
+spec fn recovered<F: Fold, S: Source<Event = F::Event>, K: SnapshotSink<F>>(
+    pre: Driver<F, S, K>,
+    post: Driver<F, S, K>,
+    r: Tick,
+) -> bool {
+    let (from, hist) = (
+        sview_log::<S>(&pre.source).len() as int,
+        sview_log::<S>(&post.source),
+    );
+    let mid = Driver { source: post.source, ..pre };
+    let ring = pre.engine@.ring;
+    &&& post.wf()
+    &&& post.synced()
+    &&& pre.durable_ok() ==> post.durable_ok()
+    &&& from <= hist.len()
+    &&& hist.subrange(0, from) == sview_log::<S>(&pre.source)
+    &&& forall|k: int| from <= k < hist.len() ==> a1::<S, S::Event>(#[trigger] hist[k])
+    &&& r matches Tick::RolledBack { to } ==> exists|lo: int, k: int|
+        0 < lo <= ring.len() && from <= k < hist.len() && #[trigger] probe_held(ring, lo, hist[k])
+            && rolled_back(mid, post, ring[lo - 1].number, to)
+    &&& r is Resynced ==> resynced(mid, post)
+    &&& r is Terminal ==> post == (Driver { engine: post.engine, ..mid })
+        && post.engine@ == (EngineView { status: post.engine@.status, ..pre.engine@ })
+    &&& r is SourceError ==> post == (Driver {
+        consecutive_errors: if pre.consecutive_errors < u32::MAX {
+            (pre.consecutive_errors + 1) as u32
+        } else {
+            u32::MAX
+        },
+        ..mid
+    })
+    &&& r is RolledBack || r is Resynced || r is Terminal || r is SourceError
+}
+
 /// `roll_back_to`'s Ok arm: T5b/T5c/T5d restated for the driver, plus the marks clamped
 /// to the restore point `to`.
 spec fn rolled_back<F: Fold, S: Source<Event = F::Event>, K: SnapshotSink<F>>(
@@ -2595,6 +2859,8 @@ spec fn rolled_back<F: Fold, S: Source<Event = F::Event>, K: SnapshotSink<F>>(
     &&& to matches Some(c) ==> prefix_at_or_below(e.ring, c.block, f.ring.len() as int)
     &&& f.status is Active
     &&& f.resets == e.resets
+    &&& f.slots.len() == e.slots.len()
+    &&& forall|j: int| 0 <= j < f.slots.len() && #[trigger] f.slots[j] is Some ==> f.slots[j] == e.slots[j]
     &&& forall|init: int, log: Seq<(Position, F::Event)>|
         #[trigger] e.inv::<F, F::Event, F::Error>(init, log) ==> f.inv::<F, F::Event, F::Error>(init, upto::<F::Event>(log, to))
 }
@@ -2819,6 +3085,903 @@ impl<F: Fold, S: Source<Event = F::Event>, K: SnapshotSink<F>> Driver<F, S, K> {
     /// the engine's cursor or any live slot.
     pub closed spec fn durable_ok(&self) -> bool {
         self.synced() ==> floor_ok(sink_offered::<K>(&self.sink), self.engine@)
+    }
+}
+
+impl<F: Fold, S: Source<Event = F::Event>, K: SnapshotSink<F>> Driver<F, S, K> {
+    /// View of the fold `resync` restarts from (T7 `init`).
+    pub closed spec fn init_view(&self) -> int {
+        fview::<F>(&self.initial)
+    }
+
+    pub closed spec fn start_block(&self) -> u64 {
+        self.config.start_block
+    }
+
+    /// The views that answered the source so far (A2).
+    pub closed spec fn source_log(&self) -> Seq<ChainView> {
+        sview_log::<S>(&self.source)
+    }
+
+    pub closed spec fn batch_view(&self) -> BatchView<F::Event> {
+        self.batch@
+    }
+
+    /// T7 ghost state over log `log` and chain view `h` (`dinv`).
+    pub closed spec fn dinv(&self, log: Seq<(Position, F::Event)>, h: ChainView) -> bool {
+        dinv::<F, S, F::Event, F::Error>(self.engine@, self.init_view(), self.start_block(), log, h)
+    }
+}
+
+/// `Inv` threading through one tick (T5): the log grows by the applied calls, is cut at a
+/// rollback target, restarts empty at a resync, and stays on a source error.
+pub open spec fn tick_inv<F: Fold, S: Source<Event = F::Event>, K: SnapshotSink<F>>(
+    pre: Driver<F, S, K>,
+    post: Driver<F, S, K>,
+    r: Tick,
+    init: int,
+    log: Seq<(Position, F::Event)>,
+) -> bool {
+    let f = post.engine_view();
+    match r {
+        Tick::RolledBack { to } => f.inv::<F, F::Event, F::Error>(init, upto(log, to)),
+        Tick::Resynced => f.inv::<F, F::Event, F::Error>(post.init_view(), Seq::empty()),
+        Tick::SourceError => f.inv::<F, F::Event, F::Error>(init, log),
+        _ => f.inv::<F, F::Event, F::Error>(
+            init,
+            log + calls::<F, F::Event, F::Error>(pre.engine_view(), post.batch_view()),
+        ),
+    }
+}
+
+/// T7's hypotheses for a tick that applied batch `b` built by a scan over `hist` from `l0`:
+/// A2 (ii)/(iii) for its windows, and its view holds `[start, c2.block]` for the new cursor.
+pub open spec fn a2_hyp<S, E>(
+    hist: Seq<ChainView>,
+    l0: int,
+    c: Option<Position>,
+    start: u64,
+    b: BatchView<E>,
+    c2: Option<Position>,
+) -> bool {
+    &&& forall|hw: u64, w: u64, wins: Seq<(int, int)>|
+        #[trigger] scanned::<S, E>(hist, l0, scan_first(c, start), hw, w, wins, c, b) ==> a2_scan(hist, l0, wins, c)
+    &&& c2 matches Some(p) ==> holds(t7_view(hist, c, b), start, p.block)
+}
+
+/// T7 across one tick from `pre` with `pre.dinv(log, h)`. The hypotheses, for a tick that
+/// applied a batch: A2 (ii)/(iii) for the scan's windows, and the tick's view holding
+/// every height from `start_block` to the new cursor. Then the invariant carries over,
+/// and after `Progressed`/`Idle` with the engine Active the fold is the fold of the
+/// canonical logs of the tick's view (its last `events_in` view, or the boundary view for
+/// `Idle`), with the ring a hash chain inside that view. After `RolledBack`, `Inv` holds
+/// over the canonical logs of a view that confirmed the probed ring entry, when that view
+/// holds `[start_block, entry]` (T4c).
+pub open spec fn t7_tick<F: Fold, S: Source<Event = F::Event>, K: SnapshotSink<F>>(
+    pre: Driver<F, S, K>,
+    post: Driver<F, S, K>,
+    r: Tick,
+    log: Seq<(Position, F::Event)>,
+    h: ChainView,
+) -> bool {
+    let (l0, hist) = (pre.source_log().len() as int, post.source_log());
+    let c = pre.engine_view().cursor;
+    let start = pre.start_block();
+    let v = t7_view(hist, c, post.batch_view());
+    let hyp = (r is Progressed || r is Idle || r is DurabilityLost) ==> a2_hyp::<S, F::Event>(
+        hist,
+        l0,
+        c,
+        start,
+        post.batch_view(),
+        post.engine_view().cursor,
+    );
+    let ring = pre.engine_view().ring;
+    &&& hyp ==> exists|log2: Seq<(Position, F::Event)>, h2: ChainView| #[trigger] post.dinv(log2, h2)
+    &&& hyp && (r is Progressed || r is Idle) && post.engine_view().status is Active ==> t7_state::<
+        F,
+        S,
+        F::Event,
+        F::Error,
+    >(post.engine_view(), pre.init_view(), start, v)
+    &&& r matches Tick::RolledBack { to } ==> exists|lo: int, k: int|
+        0 < lo <= ring.len() && l0 <= k < hist.len() && #[trigger] probe_held(ring, lo, hist[k]) && (holds(
+            hist[k],
+            start,
+            ring[lo - 1].number,
+        ) ==> post.engine_view().inv::<F, F::Event, F::Error>(
+            pre.init_view(),
+            canon::<S, F::Event>(hist[k], before(start), to),
+        ))
+}
+
+/// T7 invariant: `Inv` over `log`, and while Active `log` is the canonical history of the
+/// chain view `h` from `before(start)` to the cursor, which ends its block, with the ring
+/// in `h` at heights from `start`, and every stored slot cursor ending its block in `h`.
+pub open spec fn dinv<F: ?Sized, S: ?Sized, E, Er>(
+    e: EngineView,
+    init: int,
+    start: u64,
+    log: Seq<(Position, E)>,
+    h: ChainView,
+) -> bool {
+    &&& e.inv::<F, E, Er>(init, log)
+    &&& e.status is Active ==> {
+        &&& a1::<S, E>(h)
+        &&& log == canon::<S, E>(h, before(start), e.cursor)
+        &&& ring_in(e.ring, h)
+        &&& forall|i: int| 0 <= i < e.ring.len() ==> #[trigger] e.ring[i].number >= start
+        &&& e.cursor matches Some(c) ==> holds(h, start, c.block) && complete::<S, E>(h, c)
+        &&& forall|k: int|
+            0 <= k < e.slots.len() && #[trigger] e.slots[k] is Some && e.slots[k].unwrap().cursor is Some
+                ==> e.slots[k].unwrap().cursor.unwrap().block >= start && complete::<S, E>(
+                h,
+                e.slots[k].unwrap().cursor.unwrap(),
+            )
+    }
+}
+
+/// T7's conclusion for view `v`.
+pub open spec fn t7_state<F: ?Sized, S: ?Sized, E, Er>(e: EngineView, init: int, start: u64, v: ChainView) -> bool {
+    &&& e.fold == fold::<F, E, Er>(init, canon::<S, E>(v, before(start), e.cursor))
+    &&& ring_chain(e.ring)
+    &&& ring_in(e.ring, v)
+}
+
+/// A2 (ii) and (iii) for one scan over `hist` from `l0` with windows `wins`: blocks of the
+/// earlier (empty) windows are unchanged in the last `events_in` view, and the cursor
+/// block there is the one the boundary fetch saw.
+pub open spec fn a2_scan(hist: Seq<ChainView>, l0: int, wins: Seq<(int, int)>, cursor: Option<Position>) -> bool {
+    let vk = hist[l0 + wins.len()];
+    &&& forall|i: int, n: u64|
+        0 <= i < wins.len() - 1 && wins[i].0 <= n <= wins[i].1 ==> #[trigger] header(hist[l0 + 1 + i], n)
+            == header(vk, n)
+    &&& cursor matches Some(c) ==> header(vk, c.block) == header(hist[hist.len() - 1], c.block)
+}
+
+/// The view T7 names: the last `events_in` view for a non-empty batch, else the boundary
+/// view (the last view either way when there is no cursor).
+pub open spec fn t7_view<E>(hist: Seq<ChainView>, cursor: Option<Position>, b: BatchView<E>) -> ChainView {
+    if b.ends.len() > 0 && cursor is Some {
+        hist[hist.len() - 2]
+    } else {
+        hist[hist.len() - 1]
+    }
+}
+
+/// `flat` is `triples` with positions.
+proof fn lemma_flat_triples<E>(b: BatchView<E>, n: int)
+    requires
+        0 <= n <= b.ends.len(),
+    ensures
+        b.flat_upto(n).len() == b.triples_upto(n).len(),
+        forall|i: int| 0 <= i < b.flat_upto(n).len() ==> #[trigger] b.flat_upto(n)[i] == tpos(b.triples_upto(n)[i]),
+    decreases n,
+{
+    if n > 0 {
+        lemma_flat_triples(b, n - 1);
+        let (f0, t0, fs, ts) = (b.flat_upto(n - 1), b.triples_upto(n - 1), b.span_events(n - 1), b.span_triples(n - 1));
+        assert(fs.len() == ts.len());
+        assert forall|i: int| 0 <= i < b.flat_upto(n).len() implies #[trigger] b.flat_upto(n)[i] == tpos(b.triples_upto(n)[i]) by {
+            if i >= f0.len() {
+                assert(b.flat_upto(n)[i] == fs[i - f0.len()]);
+                assert(b.triples_upto(n)[i] == ts[i - t0.len()]);
+            } else {
+                assert(b.flat_upto(n)[i] == f0[i]);
+                assert(b.triples_upto(n)[i] == t0[i]);
+            }
+        }
+    }
+}
+
+/// Span `j`'s first entry is at `start(j)` in `triples_upto(n)`.
+proof fn lemma_triples_at<E>(b: BatchView<E>, n: int, j: int)
+    requires
+        b.wf(),
+        0 <= j < n <= b.ends.len(),
+        b.start(j) < b.ends[j],
+    ensures
+        b.start(j) < b.triples_upto(n).len(),
+        b.triples_upto(n)[b.start(j)].0 == b.block(j),
+    decreases n,
+{
+    lemma_triples_len(b, n - 1);
+    lemma_triples_len(b, n);
+    if j == n - 1 {
+        assert(b.triples_upto(n)[b.start(j)] == b.span_triples(j)[0]);
+    } else {
+        lemma_triples_at(b, n - 1, j);
+        assert(b.ends[j] <= b.ends[n - 2]);
+        assert(b.triples_upto(n)[b.start(j)] == b.triples_upto(n - 1)[b.start(j)]);
+    }
+}
+
+/// The windows before window `i` hold no entry in the last `events_in` view (A2 (ii)).
+proof fn lemma_windows_empty<S, E>(
+    hist: Seq<ChainView>,
+    l0: int,
+    first: u64,
+    hw: u64,
+    w: u64,
+    wins: Seq<(int, int)>,
+    t: Seq<(BlockRef, u32, E)>,
+    i: int,
+)
+    requires
+        0 <= l0,
+        windows_ok::<S, E>(hist, l0, Some(first), hw, w, wins, t),
+        a2_scan(hist, l0, wins, None),
+        0 <= i < wins.len(),
+    ensures
+        first <= wins[i].0 <= wins[i].1 + 1,
+        wins[i].1 <= hw,
+        range_entries::<S, E>(hist[l0 + wins.len()], first as int, wins[i].0 - 1).len() == 0,
+    decreases i,
+{
+    assert(wins[i].0 <= hw);
+    if i > 0 {
+        let j = i - 1;
+        lemma_windows_empty::<S, E>(hist, l0, first, hw, w, wins, t, j);
+        let vk = hist[l0 + wins.len()];
+        assert(wins[i].0 == wins[j].1 + 1);
+        lemma_re_split::<S, E>(vk, first as int, wins[j].0 - 1, wins[j].1);
+        assert forall|n: u64| wins[j].0 <= n <= wins[j].1 implies #[trigger] header(hist[l0 + 1 + j], n) == header(vk, n) by {}
+        lemma_re_agree::<S, E>(hist[l0 + 1 + j], vk, wins[j].0, wins[j].1);
+        assert(range_entries::<S, E>(hist[l0 + 1 + j], wins[j].0, wins[j].1).len() == 0);
+    }
+}
+
+/// A scanned, shaped, non-empty batch is exactly the last window's entries in the last
+/// `events_in` view, and the windows before it are empty there.
+proof fn lemma_batch_window<S, E>(
+    b: BatchView<E>,
+    hist: Seq<ChainView>,
+    l0: int,
+    first: Option<u64>,
+    hw: u64,
+    ww: u64,
+    wins: Seq<(int, int)>,
+    cursor: Option<Position>,
+)
+    requires
+        b.wf(),
+        b.shaped(),
+        b.ends.len() > 0,
+        0 <= l0,
+        scanned::<S, E>(hist, l0, first, hw, ww, wins, cursor, b),
+        forall|k: int| l0 <= k < hist.len() ==> a1::<S, E>(#[trigger] hist[k]),
+        a2_scan(hist, l0, wins, cursor),
+    ensures
+        ({
+            let m = wins.len() as int;
+            let vk = hist[l0 + m];
+            let (wlo, whi) = (wins[m - 1].0, wins[m - 1].1);
+            &&& m > 0
+            &&& first is Some
+            &&& first.unwrap() <= wlo <= whi + 1
+            &&& whi <= hw
+            &&& vk == t7_view(hist, cursor, b)
+            &&& a1::<S, E>(vk)
+            &&& b.triples() == range_entries::<S, E>(vk, wlo, whi)
+            &&& b.flat() == pentries::<S, E>(vk, wlo, whi)
+            &&& range_entries::<S, E>(vk, first.unwrap() as int, wlo - 1).len() == 0
+        }),
+{
+    let m = wins.len() as int;
+    let n = b.ends.len() as int;
+    let vk = hist[l0 + m];
+    let t = b.triples();
+    let flat = b.flat();
+    lemma_triples_len(b, n);
+    assert(b.start(n - 1) < b.ends[n - 1]);
+    if n >= 2 {
+        assert(b.ends[0] <= b.ends[n - 1]);
+    }
+    assert(t.len() > 0);
+    assert(m > 0);
+    let first = first.unwrap();
+    let (wlo, whi) = (wins[m - 1].0, wins[m - 1].1);
+    assert(a1::<S, E>(vk));
+    let r = range_entries::<S, E>(vk, wlo, whi);
+    assert(t.to_multiset() == r.to_multiset());
+    lemma_re_sorted::<S, E>(vk, wlo, whi);
+    crate::batch::lemma_shaped_sorted(b);
+    lemma_flat_triples(b, n);
+    assert forall|i: int, j: int| 0 <= i < j < t.len() implies lt(tpos(#[trigger] t[i]).0, tpos(#[trigger] t[j]).0) by {
+        assert(flat[i] == tpos(t[i]) && flat[j] == tpos(t[j]));
+        assert(lt(flat[i].0, flat[j].0));
+    }
+    lemma_sorted_unique(t, r);
+    assert(flat =~= pentries::<S, E>(vk, wlo, whi)) by {
+        assert forall|i: int| 0 <= i < flat.len() implies flat[i] == pentries::<S, E>(vk, wlo, whi)[i] by {
+            assert(flat[i] == tpos(t[i]));
+        }
+    }
+    lemma_windows_empty::<S, E>(hist, l0, first, hw, ww, wins, t, m - 1);
+}
+
+/// Every entry of the ring after an accepted non-empty apply is in `vk`, at a height from
+/// `start`: an old entry through the agreement with `h`, a gained one through the batch.
+proof fn lemma_ring_after_in<E>(
+    v: EngineView,
+    post: EngineView,
+    b: BatchView<E>,
+    w: int,
+    h: ChainView,
+    vk: ChainView,
+    start: u64,
+    lo: int,
+    hi: int,
+)
+    requires
+        v.wf(),
+        b.wf(),
+        b.shaped(),
+        0 < w,
+        ring_after(v, post, b, w),
+        ring_in(v.ring, h),
+        forall|i: int| 0 <= i < v.ring.len() ==> #[trigger] v.ring[i].number >= start,
+        v.cursor matches Some(p) ==> forall|n: u64| start <= n <= p.block ==> #[trigger] header(h, n) == header(vk, n),
+        forall|j: int|
+            0 <= j < b.blocks.len() ==> vk.contains_key(#[trigger] b.blocks[j]) && vk[b.blocks[j]] == b.block(j)
+                && b.blocks[j] >= start,
+    ensures
+        ring_in(post.ring, vk),
+        forall|i: int| 0 <= i < post.ring.len() ==> #[trigger] post.ring[i].number >= start,
+{
+    let (i0, i1) = choose|i0: int, i1: int|
+        #![trigger split_at_tip(b, v.cursor, i0), split_at_tip(b, post.cursor, i1)]
+        {
+            &&& i0 <= i1
+            &&& split_at_tip(b, v.cursor, i0)
+            &&& split_at_tip(b, post.cursor, i1)
+            &&& post.ring == ring_ext(v.ring, w, span_refs(b).subrange(i0, i1))
+        };
+    let g = span_refs(b).subrange(i0, i1);
+    assert(0 <= i0 && i1 <= span_refs(b).len());
+    lemma_ring_ext_from(v.ring, w, g);
+    assert forall|i: int| 0 <= i < post.ring.len() implies vk.contains_key(#[trigger] post.ring[i].number)
+        && vk[post.ring[i].number] == post.ring[i] && post.ring[i].number >= start by {
+        let x = post.ring[i];
+        if v.ring.contains(x) {
+            let j = choose|j: int| 0 <= j < v.ring.len() && v.ring[j] == x;
+            let p = v.cursor.unwrap();
+            if j < v.ring.len() - 1 {
+                assert(v.ring[j].number < v.ring[v.ring.len() - 1].number);
+            }
+            assert(header(h, x.number) == header(vk, x.number));
+        } else {
+            let q = choose|q: int| 0 <= q < g.len() && g[q] == x;
+            assert(g[q] == b.block(i0 + q));
+            assert(b.blocks[i0 + q] == x.number);
+        }
+    }
+}
+
+/// T7 for an accepted apply that did not stop, over the scan that built the batch.
+proof fn lemma_apply_t7<F: ?Sized, S, E, Er>(
+    v: EngineView,
+    post: EngineView,
+    b: BatchView<E>,
+    w: int,
+    init: int,
+    start: u64,
+    log: Seq<(Position, E)>,
+    h: ChainView,
+    hist: Seq<ChainView>,
+    l0: int,
+    hw: u64,
+    ww: u64,
+    wins: Seq<(int, int)>,
+)
+    requires
+        v.wf(),
+        post.wf(),
+        b.wf(),
+        0 < w,
+        v.status is Active,
+        dinv::<F, S, E, Er>(v, init, start, log, h),
+        accepted(v, b),
+        !stopped::<F, E, Er>(v, b),
+        post.cursor == cursor_after(v.cursor, ok_calls::<F, E, Er>(v, b)),
+        ring_after(v, post, b, w),
+        post.slots == v.slots,
+        post.status == v.status,
+        post.inv::<F, E, Er>(init, log + calls::<F, E, Er>(v, b)),
+        0 <= l0,
+        scanned::<S, E>(hist, l0, scan_first(v.cursor, start), hw, ww, wins, v.cursor, b),
+        forall|k: int| l0 <= k < hist.len() ==> a1::<S, E>(#[trigger] hist[k]),
+        a2_scan(hist, l0, wins, v.cursor),
+        post.cursor matches Some(c2) ==> holds(t7_view(hist, v.cursor, b), start, c2.block),
+    ensures
+        dinv::<F, S, E, Er>(
+            post,
+            init,
+            start,
+            log + calls::<F, E, Er>(v, b),
+            if b.ends.len() > 0 {
+                t7_view(hist, v.cursor, b)
+            } else {
+                h
+            },
+        ),
+        t7_state::<F, S, E, Er>(post, init, start, t7_view(hist, v.cursor, b)),
+{
+    if b.ends.len() == 0 {
+        lemma_apply_empty::<F, S, E, Er>(v, post, b, w, init, start, log, h, hist, l0, hw, ww, wins);
+    } else {
+        lemma_apply_step::<F, S, E, Er>(v, post, b, w, init, start, log, h, hist, l0, hw, ww, wins);
+    }
+}
+
+/// `lemma_apply_t7` for an empty batch: nothing moves, and the boundary view agrees with
+/// `h` up to the cursor.
+proof fn lemma_apply_empty<F: ?Sized, S, E, Er>(
+    v: EngineView,
+    post: EngineView,
+    b: BatchView<E>,
+    w: int,
+    init: int,
+    start: u64,
+    log: Seq<(Position, E)>,
+    h: ChainView,
+    hist: Seq<ChainView>,
+    l0: int,
+    hw: u64,
+    ww: u64,
+    wins: Seq<(int, int)>,
+)
+    requires
+        v.wf(),
+        post.wf(),
+        b.wf(),
+        0 < w,
+        v.status is Active,
+        dinv::<F, S, E, Er>(v, init, start, log, h),
+        accepted(v, b),
+        !stopped::<F, E, Er>(v, b),
+        post.cursor == cursor_after(v.cursor, ok_calls::<F, E, Er>(v, b)),
+        ring_after(v, post, b, w),
+        post.slots == v.slots,
+        post.status == v.status,
+        post.inv::<F, E, Er>(init, log + calls::<F, E, Er>(v, b)),
+        0 <= l0,
+        scanned::<S, E>(hist, l0, scan_first(v.cursor, start), hw, ww, wins, v.cursor, b),
+        forall|k: int| l0 <= k < hist.len() ==> a1::<S, E>(#[trigger] hist[k]),
+        a2_scan(hist, l0, wins, v.cursor),
+        post.cursor matches Some(c2) ==> holds(t7_view(hist, v.cursor, b), start, c2.block),
+        b.ends.len() == 0,
+    ensures
+        dinv::<F, S, E, Er>(post, init, start, log + calls::<F, E, Er>(v, b), h),
+        t7_state::<F, S, E, Er>(post, init, start, t7_view(hist, v.cursor, b)),
+{
+    let c = v.cursor;
+    let a0 = before(start);
+    let flat = b.flat();
+    let cl = calls::<F, E, Er>(v, b);
+    assert(flat.len() == 0);
+    lemma_newer_all(c, flat);
+    assert(cl.len() == 0);
+    assert(log + cl =~= log);
+    let (i0, i1) = choose|i0: int, i1: int|
+        #![trigger split_at_tip(b, v.cursor, i0), split_at_tip(b, post.cursor, i1)]
+        {
+            &&& i0 <= i1
+            &&& split_at_tip(b, v.cursor, i0)
+            &&& split_at_tip(b, post.cursor, i1)
+            &&& post.ring == ring_ext(v.ring, w, span_refs(b).subrange(i0, i1))
+        };
+    assert(span_refs(b).subrange(i0, i1) =~= Seq::<BlockRef>::empty());
+    assert(post.ring == v.ring);
+    assert(post.cursor == c);
+    let vb = hist[hist.len() - 1];
+    assert(vb == t7_view(hist, c, b));
+    if let Some(p) = c {
+        let r = v.ring;
+        assert(r[r.len() - 1].number == p.block);
+        assert(h[p.block] == r.last());
+        assert(a1::<S, E>(vb));
+        lemma_view_agree(h, vb, start, p.block);
+        lemma_canon_agree::<S, E>(h, vb, start, c);
+        assert forall|i: int| 0 <= i < r.len() implies start <= #[trigger] r[i].number <= p.block by {
+            if i < r.len() - 1 {
+                assert(r[i].number < r[r.len() - 1].number);
+            }
+        }
+        lemma_ring_move(r, h, vb, start, p.block);
+        lemma_ring_chain_in(r, h);
+    }
+}
+
+/// `lemma_apply_t7` for a non-empty batch: the ghost view moves to the last `events_in`
+/// view, and the log grows by the batch.
+proof fn lemma_apply_step<F: ?Sized, S, E, Er>(
+    v: EngineView,
+    post: EngineView,
+    b: BatchView<E>,
+    w: int,
+    init: int,
+    start: u64,
+    log: Seq<(Position, E)>,
+    h: ChainView,
+    hist: Seq<ChainView>,
+    l0: int,
+    hw: u64,
+    ww: u64,
+    wins: Seq<(int, int)>,
+)
+    requires
+        v.wf(),
+        post.wf(),
+        b.wf(),
+        0 < w,
+        v.status is Active,
+        dinv::<F, S, E, Er>(v, init, start, log, h),
+        accepted(v, b),
+        !stopped::<F, E, Er>(v, b),
+        post.cursor == cursor_after(v.cursor, ok_calls::<F, E, Er>(v, b)),
+        ring_after(v, post, b, w),
+        post.slots == v.slots,
+        post.status == v.status,
+        post.inv::<F, E, Er>(init, log + calls::<F, E, Er>(v, b)),
+        0 <= l0,
+        scanned::<S, E>(hist, l0, scan_first(v.cursor, start), hw, ww, wins, v.cursor, b),
+        forall|k: int| l0 <= k < hist.len() ==> a1::<S, E>(#[trigger] hist[k]),
+        a2_scan(hist, l0, wins, v.cursor),
+        post.cursor matches Some(c2) ==> holds(t7_view(hist, v.cursor, b), start, c2.block),
+        b.ends.len() > 0,
+    ensures
+        dinv::<F, S, E, Er>(post, init, start, log + calls::<F, E, Er>(v, b), t7_view(hist, v.cursor, b)),
+        t7_state::<F, S, E, Er>(post, init, start, t7_view(hist, v.cursor, b)),
+{
+    let c = v.cursor;
+    let flat = b.flat();
+    let cl = calls::<F, E, Er>(v, b);
+    let m = wins.len() as int;
+    let vk = hist[l0 + m];
+    lemma_batch_window::<S, E>(b, hist, l0, scan_first(c, start), hw, ww, wins, c);
+    let first = scan_first(c, start).unwrap();
+    let (wlo, whi) = (wins[m - 1].0, wins[m - 1].1);
+    assert(cl == flat && flat.len() > 0) by {
+        lemma_re_facts::<S, E>(vk, wlo, whi);
+        assert forall|i: int| 0 <= i < flat.len() implies opt_lt(c, Some((#[trigger] flat[i]).0)) by {
+            assert(flat[i] == tpos(range_entries::<S, E>(vk, wlo, whi)[i]));
+        }
+        lemma_newer_all(c, flat);
+        lemma_applied_prefix::<F, E, Er>(v.fold, flat);
+        lemma_triples_len(b, b.ends.len() as int);
+        assert(b.start(b.ends.len() - 1) < b.ends[b.ends.len() - 1]);
+        lemma_flat_triples(b, b.ends.len() as int);
+    }
+    let c2 = flat.last().0;
+    assert(post.cursor == Some(c2));
+    if let Some(p) = c {
+        let r = v.ring;
+        assert(r[r.len() - 1].number == p.block);
+        assert(h[p.block] == r.last());
+        assert(header(vk, p.block) == Some(r.last()));
+    }
+    lemma_step_canon::<S, E>(vk, h, start, c, log, first, wlo, whi, flat);
+    assert forall|k: int|
+        0 <= k < post.slots.len() && #[trigger] post.slots[k] is Some && post.slots[k].unwrap().cursor is Some
+            implies complete::<S, E>(vk, post.slots[k].unwrap().cursor.unwrap()) by {
+        let sc = post.slots[k].unwrap().cursor.unwrap();
+        assert(opt_le(Some(sc), c));
+        assert(header(h, sc.block) == header(vk, sc.block));
+        assert(block_entries::<S, E>(h, sc.block) == block_entries::<S, E>(vk, sc.block));
+    }
+    assert forall|j: int|
+        0 <= j < b.blocks.len() implies vk.contains_key(#[trigger] b.blocks[j]) && vk[b.blocks[j]] == b.block(j)
+            && b.blocks[j] >= start by {
+        lemma_re_facts::<S, E>(vk, wlo, whi);
+        assert(b.start(j) < b.ends[j]);
+        lemma_triples_at(b, b.ends.len() as int, j);
+        assert(range_entries::<S, E>(vk, wlo, whi)[b.start(j)].0 == b.block(j));
+    }
+    lemma_ring_after_in(v, post, b, w, h, vk, start, wlo, whi);
+    lemma_ring_chain_in(post.ring, vk);
+}
+
+/// The canon half of `lemma_apply_step`: the old log in `vk`, extended by the batch, is
+/// `canon` of `vk` up to the batch's last position, which ends its block.
+proof fn lemma_step_canon<S, E>(
+    vk: ChainView,
+    h: ChainView,
+    start: u64,
+    c: Option<Position>,
+    log: Seq<(Position, E)>,
+    first: u64,
+    wlo: int,
+    whi: int,
+    flat: Seq<(Position, E)>,
+)
+    requires
+        a1::<S, E>(vk),
+        a1::<S, E>(h),
+        log == canon::<S, E>(h, before(start), c),
+        c matches Some(p) ==> {
+            &&& holds(h, start, p.block)
+            &&& complete::<S, E>(h, p)
+            &&& h.contains_key(p.block) && vk.contains_key(p.block) && h[p.block] == vk[p.block]
+            &&& p.block >= start
+            &&& first == p.block + 1
+        },
+        c is None ==> first == start,
+        flat == pentries::<S, E>(vk, wlo, whi),
+        flat.len() > 0,
+        first <= wlo <= whi + 1,
+        whi <= u64::MAX,
+        range_entries::<S, E>(vk, first as int, wlo - 1).len() == 0,
+        holds(vk, start, flat.last().0.block),
+    ensures
+        complete::<S, E>(vk, flat.last().0),
+        wlo <= flat.last().0.block <= whi,
+        log + flat == canon::<S, E>(vk, before(start), Some(flat.last().0)),
+        c matches Some(p) ==> forall|n: u64| start <= n <= p.block ==> #[trigger] header(h, n) == header(vk, n),
+{
+    let a0 = before(start);
+    lemma_last_complete::<S, E>(vk, wlo, whi);
+    let c2 = flat.last().0;
+    assert(c2 == tpos(range_entries::<S, E>(vk, wlo, whi).last()).0);
+    let lb: int = match c {
+        Some(p) => p.block as int,
+        None => start - 1,
+    };
+    if let Some(p) = c {
+        lemma_view_agree(h, vk, start, p.block);
+        lemma_canon_agree::<S, E>(h, vk, start, c);
+        assert(header(h, p.block) == header(vk, p.block));
+        assert(block_entries::<S, E>(h, p.block) == block_entries::<S, E>(vk, p.block));
+    }
+    lemma_canon_extend::<S, E>(vk, a0, lb, c, c2);
+    lemma_pe_split::<S, E>(vk, first as int, wlo - 1, c2.block as int);
+    assert(pentries::<S, E>(vk, first as int, wlo - 1).len() == 0);
+    assert(pentries::<S, E>(vk, wlo, c2.block as int) == flat);
+    assert(pentries::<S, E>(vk, first as int, c2.block as int) =~= flat);
+}
+
+/// T7 and `Inv` across `poll_apply`'s recovery arm: the rejected apply changed nothing
+/// the invariants read, then `recovered` gives the rollback, resync or unchanged state.
+proof fn lemma_recover_t7<F: Fold, S: Source<Event = F::Event>, K: SnapshotSink<F>>(
+    old: Driver<F, S, K>,
+    pre: Driver<F, S, K>,
+    post: Driver<F, S, K>,
+    tick: Tick,
+)
+    requires
+        old.engine@.wf(),
+        old.engine@.status is Active,
+        recovered(pre, post, tick),
+        pre.engine@ == (EngineView { last_verified: pre.engine@.last_verified, ..old.engine@ }),
+        !accepted(old.engine@, pre.batch@),
+        old.initial == pre.initial,
+        old.config == pre.config,
+        sview_log::<S>(&old.source).len() <= sview_log::<S>(&pre.source).len(),
+    ensures
+        forall|init: int, log: Seq<(Position, F::Event)>|
+            #[trigger] old.engine_view().inv::<F, F::Event, F::Error>(init, log) ==> tick_inv(old, post, tick, init, log),
+        forall|log: Seq<(Position, F::Event)>, h: ChainView|
+            #[trigger] old.dinv(log, h) ==> t7_tick(old, post, tick, log, h),
+{
+    let v = old.engine@;
+    let bv = pre.batch@;
+    assert(post.batch == pre.batch);
+    assert(calls::<F, F::Event, F::Error>(v, bv) =~= Seq::empty());
+    let (from, rh) = (sview_log::<S>(&pre.source).len() as int, sview_log::<S>(&post.source));
+    let mid = Driver { source: post.source, ..pre };
+    let init = fview::<F>(&old.initial);
+    let start = old.config.start_block;
+    post.engine.lemma_wf();
+    assert forall|i: int, log: Seq<(Position, F::Event)>|
+        #[trigger] old.engine_view().inv::<F, F::Event, F::Error>(i, log) implies tick_inv(old, post, tick, i, log) by {
+        assert(log + calls::<F, F::Event, F::Error>(v, bv) =~= log);
+        assert(pre.engine@.inv::<F, F::Event, F::Error>(i, log));
+    }
+    assert forall|log: Seq<(Position, F::Event)>, h: ChainView|
+        #[trigger] old.dinv(log, h) implies t7_tick(old, post, tick, log, h) by {
+        assert(dinv::<F, S, F::Event, F::Error>(pre.engine@, init, start, log, h));
+        match tick {
+            Tick::RolledBack { to } => {
+                let ring = v.ring;
+                let (lo, k) = choose|lo: int, k: int|
+                    0 < lo <= ring.len() && from <= k < rh.len() && #[trigger] probe_held(ring, lo, rh[k])
+                        && rolled_back(mid, post, ring[lo - 1].number, to);
+                let e = pre.engine@;
+                let kk = choose|kk: int| #[trigger] e.rollback_target(ring[lo - 1].number, kk) && to == e.slots[kk].unwrap().cursor;
+                lemma_rollback_t7::<F, S, F::Event, F::Error>(
+                    e, post.engine@, init, start, log, h, ring[lo - 1].number, kk, to, rh[k], lo,
+                );
+                assert(post.dinv(upto(log, to), h));
+            },
+            Tick::Resynced => {
+                lemma_fresh_dinv::<F, S, F::Event, F::Error>(post.engine@, init, start);
+                assert(post.dinv(Seq::empty(), Map::empty()));
+            },
+            Tick::Terminal(_) => {
+                assert(log + calls::<F, F::Event, F::Error>(v, bv) =~= log);
+                assert(post.engine@.inv::<F, F::Event, F::Error>(init, log));
+                assert(post.dinv(log, h));
+            },
+            _ => {
+                assert(post.dinv(log, h));
+            },
+        }
+    }
+}
+
+/// A fresh engine (no cursor, empty ring) satisfies the T7 invariant with the empty log
+/// and the empty view.
+proof fn lemma_fresh_dinv<F: ?Sized, S, E, Er>(e: EngineView, init: int, start: u64)
+    requires
+        e.wf(),
+        e.cursor is None,
+        e.ring.len() == 0,
+        e.inv::<F, E, Er>(init, Seq::empty()),
+    ensures
+        dinv::<F, S, E, Er>(e, init, start, Seq::empty(), Map::empty()),
+{
+    assert(canon::<S, E>(Map::empty(), before(start), None) =~= Seq::<(Position, E)>::empty());
+    assert forall|k: int|
+        0 <= k < e.slots.len() && #[trigger] e.slots[k] is Some && e.slots[k].unwrap().cursor is Some implies false by {
+        assert(opt_le(e.slots[k].unwrap().cursor, e.cursor));
+    }
+}
+
+/// T7 through a rollback to slot `k`'s cursor `to`: the ghost view stays, the log is cut
+/// at `to`; and a probe view that confirmed `ring[lo - 1]` and holds `[start, ring[lo -
+/// 1]]` agrees with the ghost view up to `to`.
+proof fn lemma_rollback_t7<F: ?Sized, S, E, Er>(
+    e: EngineView,
+    f: EngineView,
+    init: int,
+    start: u64,
+    log: Seq<(Position, E)>,
+    h: ChainView,
+    ancestor: u64,
+    k: int,
+    to: Option<Position>,
+    pv: ChainView,
+    lo: int,
+)
+    requires
+        e.wf(),
+        e.status is Active,
+        dinv::<F, S, E, Er>(e, init, start, log, h),
+        e.rollback_target(ancestor, k),
+        to == e.slots[k].unwrap().cursor,
+        f.cursor == to,
+        f.ring == e.ring.subrange(0, f.ring.len() as int),
+        to is None ==> f.ring.len() == 0,
+        to matches Some(c) ==> prefix_at_or_below(e.ring, c.block, f.ring.len() as int),
+        f.status is Active,
+        f.slots.len() == e.slots.len(),
+        forall|j: int| 0 <= j < f.slots.len() && #[trigger] f.slots[j] is Some ==> f.slots[j] == e.slots[j],
+        f.inv::<F, E, Er>(init, upto(log, to)),
+    ensures
+        dinv::<F, S, E, Er>(f, init, start, upto(log, to), h),
+        0 < lo <= e.ring.len() && ancestor == e.ring[lo - 1].number && a1::<S, E>(pv) && confirms(pv, e.ring[lo - 1])
+            && holds(pv, start, ancestor) ==> f.inv::<F, E, Er>(init, canon::<S, E>(pv, before(start), to)),
+{
+    let a0 = before(start);
+    let sl = e.slots[k].unwrap();
+    assert(opt_le(sl.cursor, e.cursor));
+    match e.cursor {
+        None => {
+            assert(to is None);
+            assert(log.len() == 0);
+            assert(upto(log, to) == log);
+        },
+        Some(cc) => {
+            if let Some(q) = to {
+                assert(q.block >= start);
+            }
+            lemma_canon_upto::<S, E>(h, a0, cc, to);
+            if 0 < lo <= e.ring.len() && ancestor == e.ring[lo - 1].number && a1::<S, E>(pv) && confirms(pv, e.ring[lo - 1])
+                && holds(pv, start, ancestor) {
+                let r = e.ring;
+                assert(r[r.len() - 1].number == cc.block);
+                if lo - 1 < r.len() - 1 {
+                    assert(r[lo - 1].number < r[r.len() - 1].number);
+                }
+                assert(h[ancestor] == r[lo - 1]);
+                assert(ancestor >= start);
+                lemma_view_agree(h, pv, start, ancestor);
+                lemma_canon_agree::<S, E>(h, pv, start, to);
+            }
+        },
+    }
+    assert forall|i: int| 0 <= i < f.ring.len() implies h.contains_key(#[trigger] f.ring[i].number) && h[f.ring[i].number]
+        == f.ring[i] && f.ring[i].number >= start by {
+        assert(f.ring[i] == e.ring[i]);
+    }
+    assert forall|j: int|
+        0 <= j < f.slots.len() && #[trigger] f.slots[j] is Some && f.slots[j].unwrap().cursor is Some
+            implies f.slots[j].unwrap().cursor.unwrap().block >= start && complete::<S, E>(
+            h,
+            f.slots[j].unwrap().cursor.unwrap(),
+        ) by {
+        assert(f.slots[j] == e.slots[j]);
+    }
+}
+
+/// A checkpoint keeps the T7 invariant: the new slot's cursor is the cursor.
+proof fn lemma_checkpoint_dinv<F: ?Sized, S, E, Er>(
+    pre: EngineView,
+    init: int,
+    start: u64,
+    log: Seq<(Position, E)>,
+    h: ChainView,
+)
+    requires
+        pre.wf(),
+        dinv::<F, S, E, Er>(pre, init, start, log, h),
+        checkpointed(pre).inv::<F, E, Er>(init, log),
+    ensures
+        dinv::<F, S, E, Er>(checkpointed(pre), init, start, log, h),
+{
+    let post = checkpointed(pre);
+    if pre.status is Active && pre.slots.len() > 0 {
+        let n = pre.slots.len() as int;
+        if let Some(c) = pre.cursor {
+            assert(pre.ring[pre.ring.len() - 1].number == c.block);
+        }
+        assert forall|k: int|
+            0 <= k < post.slots.len() && #[trigger] post.slots[k] is Some && post.slots[k].unwrap().cursor is Some
+                implies post.slots[k].unwrap().cursor.unwrap().block >= start && complete::<S, E>(
+                h,
+                post.slots[k].unwrap().cursor.unwrap(),
+            ) by {
+            if k < n - 1 {
+                assert(post.slots[k] == pre.slots[k + 1]);
+            }
+        }
+    }
+}
+
+/// T6b through apply: the cursor does not move back and a dead slot stays dead.
+proof fn lemma_apply_floor<F: ?Sized, E, Er>(v: EngineView, post: EngineView, b: BatchView<E>, w: int, off: Set<Position>)
+    requires
+        v.wf(),
+        0 < w,
+        floor_ok(off, v),
+        post.slots == v.slots,
+        post.cursor == cursor_after(v.cursor, ok_calls::<F, E, Er>(v, b)),
+        accepted(v, b) ==> ring_after(v, post, b, w),
+        !accepted(v, b) ==> post.ring == v.ring,
+    ensures
+        floor_ok(off, post),
+{
+    lemma_cursor_advances::<F, E, Er>(v, b);
+    assert forall|k: int| #[trigger] post.live_at(k) implies v.live_at(k) by {
+        if let Some(q) = post.slots[k].unwrap().cursor {
+            assert(opt_le(v.slots[k].unwrap().cursor, v.cursor));
+            let i = choose|i: int| 0 <= i < post.ring.len() && #[trigger] post.ring[i].number == q.block;
+            if accepted(v, b) {
+                let (i0, i1) = choose|i0: int, i1: int|
+                    #![trigger split_at_tip(b, v.cursor, i0), split_at_tip(b, post.cursor, i1)]
+                    {
+                        &&& i0 <= i1
+                        &&& split_at_tip(b, v.cursor, i0)
+                        &&& split_at_tip(b, post.cursor, i1)
+                        &&& post.ring == ring_ext(v.ring, w, span_refs(b).subrange(i0, i1))
+                    };
+                let g = span_refs(b).subrange(i0, i1);
+                lemma_ring_ext_from(v.ring, w, g);
+                if !v.ring.contains(post.ring[i]) {
+                    let j = choose|j: int| 0 <= j < g.len() && g[j] == post.ring[i];
+                    assert(g[j] == span_refs(b)[i0 + j]);
+                    assert(false);
+                } else {
+                    let j = choose|j: int| 0 <= j < v.ring.len() && v.ring[j] == post.ring[i];
+                    assert(v.ring[j].number == q.block);
+                }
+            } else {
+                assert(v.ring[i].number == q.block);
+            }
+        }
+    }
+    assert forall|p: Position| #[trigger] off.contains(p) implies opt_le(Some(p), post.cursor) by {
+        lemma_opt_lt_order(Some(p), v.cursor, post.cursor);
     }
 }
 

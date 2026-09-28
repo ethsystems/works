@@ -362,6 +362,7 @@ impl<F: Fold> Engine<F> {
             }),
             // T3e: unreachable under wf.
             !(r matches Err(ApplyError::CursorBlockUnobserved { .. })),
+            r matches Err(ApplyError::NotActive { .. }) ==> !(old(self)@.status is Active),
             r is Ok ==> accepted(old(self)@, batch@) && final(self)@.status == old(self)@.status,
             accepted(old(self)@, batch@) ==> (r is Ok <==> !stopped::<F, F::Event, F::Error>(
                 old(self)@,
@@ -2300,6 +2301,7 @@ impl<F> Engine<F> {
         ensures
             self@.wf(),
             self@.ring.len() <= 0x10_0000,
+            0 < self.window(),
     {
         self.ring.lemma_wf();
     }

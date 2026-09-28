@@ -1320,4 +1320,661 @@ pub proof fn lemma_idempotent<F: ?Sized, E, Er>(v: EngineView, b: BatchView<E>)
     lemma_applied_prefix::<F, E, Er>(v.fold, newer(v.cursor, b.flat()));
 }
 
+
+// P8c: driver end-to-end (T7).
+
+/// View `v` holds every height in `[lo, hi]` (T7; weaker than `down_closed`).
+pub open spec fn holds(v: ChainView, lo: u64, hi: u64) -> bool {
+    forall|n: u64| lo <= n <= hi ==> #[trigger] v.contains_key(n)
+}
+
+/// No entry of `v`'s block `p.block` lies after `p`: the cursor ends its block.
+pub open spec fn complete<S: ?Sized, E>(v: ChainView, p: Position) -> bool {
+    forall|i: int|
+        0 <= i < block_entries::<S, E>(v, p.block).len() ==> (#[trigger] block_entries::<S, E>(
+            v,
+            p.block,
+        )[i]).1 as u64 <= p.log_index
+}
+
+/// A source entry with its position.
+pub open spec fn tpos<E>(x: (BlockRef, u32, E)) -> (Position, E) {
+    (Position { block: x.0.number, log_index: x.1 as u64 }, x.2)
+}
+
+/// Source entries strictly ascending by position.
+pub open spec fn ksorted<E>(s: Seq<(BlockRef, u32, E)>) -> bool {
+    forall|i: int, j: int| #![trigger s[i], s[j]] 0 <= i < j < s.len() ==> lt(tpos(s[i]).0, tpos(s[j]).0)
+}
+
+/// `range_entries` with positions.
+pub open spec fn pentries<S: ?Sized, E>(v: ChainView, lo: int, hi: int) -> Seq<(Position, E)> {
+    range_entries::<S, E>(v, lo, hi).map_values(|x: (BlockRef, u32, E)| tpos(x))
+}
+
+/// `canon`'s lowest height and filter.
+pub open spec fn alo(a: Option<Position>) -> int {
+    match a {
+        None => 0,
+        Some(a) => a.block as int,
+    }
+}
+
+pub open spec fn within<E>(a: Option<Position>, c: Position) -> spec_fn((Position, E)) -> bool {
+    |x: (Position, E)| opt_lt(a, Some(x.0)) && le(x.0, c)
+}
+
+pub proof fn lemma_canon_def<S: ?Sized, E>(v: ChainView, a: Option<Position>, c: Position)
+    ensures
+        canon::<S, E>(v, a, Some(c)) == pentries::<S, E>(v, alo(a), c.block as int).filter(within::<E>(a, c)),
+{
+    let m = range_entries::<S, E>(v, alo(a), c.block as int).map_values(
+        |x: (BlockRef, u32, E)| (Position { block: x.0.number, log_index: x.1 as u64 }, x.2),
+    );
+    assert(m =~= pentries::<S, E>(v, alo(a), c.block as int));
+    assert(within::<E>(a, c) =~= (|x: (Position, E)| opt_lt(a, Some(x.0)) && le(x.0, c)));
+}
+
+pub proof fn lemma_filter_ext<A>(s: Seq<A>, p: spec_fn(A) -> bool, q: spec_fn(A) -> bool)
+    requires
+        forall|i: int| 0 <= i < s.len() ==> p(#[trigger] s[i]) == q(s[i]),
+    ensures
+        s.filter(p) == s.filter(q),
+    decreases s.len(),
+{
+    reveal(Seq::filter);
+    if s.len() > 0 {
+        assert forall|i: int| 0 <= i < s.drop_last().len() implies p(#[trigger] s.drop_last()[i]) == q(
+            s.drop_last()[i],
+        ) by {
+            assert(s.drop_last()[i] == s[i]);
+        }
+        lemma_filter_ext(s.drop_last(), p, q);
+        assert(p(s[s.len() - 1]) == q(s[s.len() - 1]));
+    }
+}
+
+pub proof fn lemma_filter_all<A>(s: Seq<A>, p: spec_fn(A) -> bool)
+    requires
+        forall|i: int| 0 <= i < s.len() ==> p(#[trigger] s[i]),
+    ensures
+        s.filter(p) == s,
+    decreases s.len(),
+{
+    reveal(Seq::filter);
+    if s.len() > 0 {
+        assert forall|i: int| 0 <= i < s.drop_last().len() implies p(#[trigger] s.drop_last()[i]) by {
+            assert(s.drop_last()[i] == s[i]);
+        }
+        lemma_filter_all(s.drop_last(), p);
+        assert(p(s[s.len() - 1]));
+        assert(s.drop_last().push(s.last()) =~= s);
+    }
+}
+
+pub proof fn lemma_filter_none<A>(s: Seq<A>, p: spec_fn(A) -> bool)
+    requires
+        forall|i: int| 0 <= i < s.len() ==> !p(#[trigger] s[i]),
+    ensures
+        s.filter(p) == Seq::<A>::empty(),
+    decreases s.len(),
+{
+    reveal(Seq::filter);
+    if s.len() > 0 {
+        assert forall|i: int| 0 <= i < s.drop_last().len() implies !p(#[trigger] s.drop_last()[i]) by {
+            assert(s.drop_last()[i] == s[i]);
+        }
+        lemma_filter_none(s.drop_last(), p);
+        assert(!p(s[s.len() - 1]));
+    } else {
+        assert(s =~= Seq::<A>::empty());
+    }
+}
+
+/// `range_entries` splits at any height in range.
+pub proof fn lemma_re_split<S: ?Sized, E>(v: ChainView, lo: int, mid: int, hi: int)
+    requires
+        0 <= lo,
+        lo - 1 <= mid <= hi <= u64::MAX,
+    ensures
+        range_entries::<S, E>(v, lo, hi) == range_entries::<S, E>(v, lo, mid) + range_entries::<S, E>(
+            v,
+            mid + 1,
+            hi,
+        ),
+    decreases hi - mid,
+{
+    if hi == mid {
+        assert(range_entries::<S, E>(v, lo, hi) + range_entries::<S, E>(v, mid + 1, hi) =~= range_entries::<
+            S,
+            E,
+        >(v, lo, hi));
+    } else {
+        lemma_re_split::<S, E>(v, lo, mid, hi - 1);
+        assert(range_entries::<S, E>(v, lo, hi) =~= range_entries::<S, E>(v, lo, mid) + range_entries::<
+            S,
+            E,
+        >(v, mid + 1, hi));
+    }
+}
+
+pub proof fn lemma_pe_split<S: ?Sized, E>(v: ChainView, lo: int, mid: int, hi: int)
+    requires
+        0 <= lo,
+        lo - 1 <= mid <= hi <= u64::MAX,
+    ensures
+        pentries::<S, E>(v, lo, hi) == pentries::<S, E>(v, lo, mid) + pentries::<S, E>(v, mid + 1, hi),
+{
+    lemma_re_split::<S, E>(v, lo, mid, hi);
+    assert(pentries::<S, E>(v, lo, hi) =~= pentries::<S, E>(v, lo, mid) + pentries::<S, E>(v, mid + 1, hi));
+}
+
+/// Every entry of `range_entries(v, lo, hi)` is `v`'s block at a height in `[lo, hi]`.
+pub proof fn lemma_re_facts<S: ?Sized, E>(v: ChainView, lo: int, hi: int)
+    requires
+        chain(v),
+    ensures
+        forall|i: int|
+            0 <= i < range_entries::<S, E>(v, lo, hi).len() ==> {
+                let x = #[trigger] range_entries::<S, E>(v, lo, hi)[i];
+                &&& lo <= x.0.number <= hi
+                &&& v.contains_key(x.0.number)
+                &&& v[x.0.number] == x.0
+            },
+    decreases hi - lo + 1,
+{
+    if !(hi < lo || hi < 0 || hi > u64::MAX) {
+        lemma_re_facts::<S, E>(v, lo, hi - 1);
+        let (r0, b) = (range_entries::<S, E>(v, lo, hi - 1), block_entries::<S, E>(v, hi as u64));
+        assert forall|i: int| 0 <= i < range_entries::<S, E>(v, lo, hi).len() implies {
+            let x = #[trigger] range_entries::<S, E>(v, lo, hi)[i];
+            &&& lo <= x.0.number <= hi
+            &&& v.contains_key(x.0.number)
+            &&& v[x.0.number] == x.0
+        } by {
+            if i >= r0.len() {
+                assert(range_entries::<S, E>(v, lo, hi)[i] == b[i - r0.len()]);
+                assert(v.contains_key(hi as u64));
+            } else {
+                assert(range_entries::<S, E>(v, lo, hi)[i] == r0[i]);
+            }
+        }
+    }
+}
+
+/// Entries of block `p.block` in a range sit at or below a `complete` point `p`.
+pub proof fn lemma_re_complete<S: ?Sized, E>(v: ChainView, lo: int, hi: int, p: Position)
+    requires
+        chain(v),
+        complete::<S, E>(v, p),
+    ensures
+        forall|i: int|
+            0 <= i < range_entries::<S, E>(v, lo, hi).len() && (#[trigger] range_entries::<S, E>(
+                v,
+                lo,
+                hi,
+            )[i]).0.number == p.block ==> range_entries::<S, E>(v, lo, hi)[i].1 as u64 <= p.log_index,
+    decreases hi - lo + 1,
+{
+    if !(hi < lo || hi < 0 || hi > u64::MAX) {
+        lemma_re_complete::<S, E>(v, lo, hi - 1, p);
+        let (r0, b) = (range_entries::<S, E>(v, lo, hi - 1), block_entries::<S, E>(v, hi as u64));
+        assert forall|i: int|
+            0 <= i < range_entries::<S, E>(v, lo, hi).len() && (#[trigger] range_entries::<S, E>(
+                v,
+                lo,
+                hi,
+            )[i]).0.number == p.block implies range_entries::<S, E>(v, lo, hi)[i].1 as u64
+            <= p.log_index by {
+            if i >= r0.len() {
+                assert(range_entries::<S, E>(v, lo, hi)[i] == b[i - r0.len()]);
+                assert(v.contains_key(hi as u64));
+                assert(b[i - r0.len()] == block_entries::<S, E>(v, p.block)[i - r0.len()]);
+            } else {
+                assert(range_entries::<S, E>(v, lo, hi)[i] == r0[i]);
+            }
+        }
+    }
+}
+
+
+/// Views that agree on `[lo, hi]` give the same entries there.
+pub proof fn lemma_re_agree<S: ?Sized, E>(v: ChainView, u: ChainView, lo: int, hi: int)
+    requires
+        forall|n: u64| lo <= n <= hi ==> #[trigger] header(v, n) == header(u, n),
+    ensures
+        range_entries::<S, E>(v, lo, hi) == range_entries::<S, E>(u, lo, hi),
+    decreases hi - lo + 1,
+{
+    if !(hi < lo || hi < 0 || hi > u64::MAX) {
+        lemma_re_agree::<S, E>(v, u, lo, hi - 1);
+        assert(header(v, hi as u64) == header(u, hi as u64));
+        assert(block_entries::<S, E>(v, hi as u64) == block_entries::<S, E>(u, hi as u64));
+    }
+}
+
+/// Under A1 the entries of a range are strictly ascending by position.
+pub proof fn lemma_re_sorted<S: ?Sized, E>(v: ChainView, lo: int, hi: int)
+    requires
+        a1::<S, E>(v),
+    ensures
+        ksorted(range_entries::<S, E>(v, lo, hi)),
+    decreases hi - lo + 1,
+{
+    if !(hi < lo || hi < 0 || hi > u64::MAX) {
+        lemma_re_sorted::<S, E>(v, lo, hi - 1);
+        lemma_re_facts::<S, E>(v, lo, hi - 1);
+        let (r0, b) = (range_entries::<S, E>(v, lo, hi - 1), block_entries::<S, E>(v, hi as u64));
+        let r = range_entries::<S, E>(v, lo, hi);
+        assert(r == r0 + b);
+        if v.contains_key(hi as u64) {
+            let l = logs::<S, E>(v[hi as u64].hash);
+            assert(logs_ascending(l));
+            assert(v[hi as u64].number == hi);
+        }
+        assert forall|i: int, j: int| 0 <= i < j < r.len() implies lt(tpos(#[trigger] r[i]).0, tpos(#[trigger] r[j]).0) by {
+            if j < r0.len() {
+                assert(r[i] == r0[i] && r[j] == r0[j]);
+            } else if i < r0.len() {
+                assert(r[i] == r0[i] && r[j] == b[j - r0.len()]);
+            } else {
+                let l = logs::<S, E>(v[hi as u64].hash);
+                assert(r[i] == b[i - r0.len()] && r[j] == b[j - r0.len()]);
+                assert(l[i - r0.len()].0 < l[j - r0.len()].0);
+            }
+        }
+    }
+}
+
+/// Two strictly sorted sequences with the same elements are equal.
+pub proof fn lemma_sorted_unique<E>(s: Seq<(BlockRef, u32, E)>, t: Seq<(BlockRef, u32, E)>)
+    requires
+        ksorted(s),
+        ksorted(t),
+        s.to_multiset() == t.to_multiset(),
+    ensures
+        s == t,
+    decreases s.len(),
+{
+    broadcast use {vstd::seq_lib::to_multiset_len, vstd::seq_lib::to_multiset_contains, vstd::seq_lib::to_multiset_remove};
+    vstd::seq_lib::to_multiset_len(s);
+    vstd::seq_lib::to_multiset_len(t);
+    assert(s.len() == t.len());
+    if s.len() > 0 {
+        vstd::seq_lib::to_multiset_contains(s, s[0]);
+        vstd::seq_lib::to_multiset_contains(t, s[0]);
+        vstd::seq_lib::to_multiset_contains(s, t[0]);
+        vstd::seq_lib::to_multiset_contains(t, t[0]);
+        assert(s.contains(s[0]));
+        assert(t.contains(t[0]));
+        assert(t.contains(s[0]));
+        assert(s.contains(t[0]));
+        vstd::seq_lib::to_multiset_remove(s, 0);
+        vstd::seq_lib::to_multiset_remove(t, 0);
+        let j = choose|j: int| 0 <= j < t.len() && t[j] == s[0];
+        let i = choose|i: int| 0 <= i < s.len() && s[i] == t[0];
+        if i > 0 {
+            assert(lt(tpos(s[0]).0, tpos(s[i]).0));
+            if j > 0 {
+                assert(lt(tpos(t[0]).0, tpos(t[j]).0));
+            }
+            assert(false);
+        }
+        assert(s[0] == t[0]);
+        assert(s.remove(0) =~= s.drop_first());
+        assert(t.remove(0) =~= t.drop_first());
+        assert(s.drop_first().to_multiset() == t.drop_first().to_multiset());
+        assert(ksorted(s.drop_first())) by {
+            assert forall|a: int, b: int| 0 <= a < b < s.drop_first().len() implies lt(
+                tpos(#[trigger] s.drop_first()[a]).0,
+                tpos(#[trigger] s.drop_first()[b]).0,
+            ) by {
+                assert(s.drop_first()[a] == s[a + 1] && s.drop_first()[b] == s[b + 1]);
+            }
+        }
+        assert(ksorted(t.drop_first())) by {
+            assert forall|a: int, b: int| 0 <= a < b < t.drop_first().len() implies lt(
+                tpos(#[trigger] t.drop_first()[a]).0,
+                tpos(#[trigger] t.drop_first()[b]).0,
+            ) by {
+                assert(t.drop_first()[a] == t[a + 1] && t.drop_first()[b] == t[b + 1]);
+            }
+        }
+        lemma_sorted_unique(s.drop_first(), t.drop_first());
+        assert(s =~= t) by {
+            assert forall|k: int| 0 <= k < s.len() implies s[k] == t[k] by {
+                if k > 0 {
+                    assert(s[k] == s.drop_first()[k - 1] && t[k] == t.drop_first()[k - 1]);
+                }
+            }
+        }
+    } else {
+        assert(s =~= t);
+    }
+}
+
+/// Positioned entries of a range are `lt_sorted` under A1.
+pub proof fn lemma_pe_sorted<S: ?Sized, E>(v: ChainView, lo: int, hi: int)
+    requires
+        a1::<S, E>(v),
+    ensures
+        lt_sorted(pentries::<S, E>(v, lo, hi)),
+{
+    lemma_re_sorted::<S, E>(v, lo, hi);
+    let (r, p) = (range_entries::<S, E>(v, lo, hi), pentries::<S, E>(v, lo, hi));
+    assert forall|i: int, j: int| 0 <= i < j < p.len() implies lt((#[trigger] p[i]).0, (#[trigger] p[j]).0) by {
+        assert(p[i] == tpos(r[i]) && p[j] == tpos(r[j]));
+        assert(lt(tpos(r[i]).0, tpos(r[j]).0));
+    }
+}
+
+/// Chains that agree at `c` and both hold `[start, c]` agree on all of it.
+pub proof fn lemma_view_agree(h: ChainView, v: ChainView, start: u64, c: u64)
+    requires
+        chain(h),
+        chain(v),
+        holds(h, start, c),
+        holds(v, start, c),
+        h[c] == v[c],
+    ensures
+        forall|n: u64| start <= n <= c ==> #[trigger] header(h, n) == header(v, n),
+{
+    assert forall|n: u64| start <= n <= c implies #[trigger] header(h, n) == header(v, n) by {
+        assert(h.contains_key(n) && h.contains_key(c) && v.contains_key(n) && v.contains_key(c));
+        assert(h[n] == anc(h[c].hash, n));
+        assert(v[n] == anc(v[c].hash, n));
+    }
+}
+
+/// `canon` from `before(start)` reads only heights `start..`.
+pub proof fn lemma_canon_agree<S: ?Sized, E>(v: ChainView, u: ChainView, start: u64, c: Option<Position>)
+    requires
+        chain(v),
+        chain(u),
+        c matches Some(p) ==> forall|n: u64| start <= n <= p.block ==> #[trigger] header(v, n) == header(u, n),
+    ensures
+        canon::<S, E>(v, before(start), c) == canon::<S, E>(u, before(start), c),
+{
+    if let Some(p) = c {
+        let a = before(start);
+        lemma_canon_def::<S, E>(v, a, p);
+        lemma_canon_def::<S, E>(u, a, p);
+        let hi = p.block as int;
+        if start == 0 {
+            lemma_re_agree::<S, E>(v, u, 0, hi);
+        } else if hi >= start - 1 {
+            let lo = start - 1;
+            lemma_pe_split::<S, E>(v, lo, lo, hi);
+            lemma_pe_split::<S, E>(u, lo, lo, hi);
+            lemma_re_agree::<S, E>(v, u, lo + 1, hi);
+            let w = within::<E>(a, p);
+            Seq::filter_distributes_over_add(pentries::<S, E>(v, lo, lo), pentries::<S, E>(v, lo + 1, hi), w);
+            Seq::filter_distributes_over_add(pentries::<S, E>(u, lo, lo), pentries::<S, E>(u, lo + 1, hi), w);
+            lemma_re_facts::<S, E>(v, lo, lo);
+            lemma_re_facts::<S, E>(u, lo, lo);
+            assert forall|i: int| 0 <= i < pentries::<S, E>(v, lo, lo).len() implies !w(#[trigger] pentries::<S, E>(v, lo, lo)[i]) by {
+                assert(pentries::<S, E>(v, lo, lo)[i] == tpos(range_entries::<S, E>(v, lo, lo)[i]));
+            }
+            assert forall|i: int| 0 <= i < pentries::<S, E>(u, lo, lo).len() implies !w(#[trigger] pentries::<S, E>(u, lo, lo)[i]) by {
+                assert(pentries::<S, E>(u, lo, lo)[i] == tpos(range_entries::<S, E>(u, lo, lo)[i]));
+            }
+            lemma_filter_none(pentries::<S, E>(v, lo, lo), w);
+            lemma_filter_none(pentries::<S, E>(u, lo, lo), w);
+        }
+    }
+}
+
+pub open spec fn and_le<E>(p: spec_fn((Position, E)) -> bool, t: Option<Position>) -> spec_fn((Position, E)) -> bool {
+    |x: (Position, E)| p(x) && opt_le(Some(x.0), t)
+}
+
+/// On a sorted log `upto` is a filter.
+pub proof fn lemma_upto_filter<E>(s: Seq<(Position, E)>, p: spec_fn((Position, E)) -> bool, t: Option<Position>)
+    requires
+        lt_sorted(s),
+    ensures
+        upto(s.filter(p), t) == s.filter(and_le(p, t)),
+    decreases s.len(),
+{
+    reveal(Seq::filter);
+    if s.len() > 0 {
+        let (s0, x) = (s.drop_last(), s.last());
+        assert(lt_sorted(s0)) by {
+            assert forall|i: int, j: int| 0 <= i < j < s0.len() implies lt((#[trigger] s0[i]).0, (#[trigger] s0[j]).0) by {
+                assert(s0[i] == s[i] && s0[j] == s[j]);
+            }
+        }
+        lemma_upto_filter(s0, p, t);
+        let q = and_le(p, t);
+        if p(x) {
+            assert(s.filter(p) == s0.filter(p).push(x));
+            assert(s.filter(p).drop_last() =~= s0.filter(p));
+            if opt_le(Some(x.0), t) {
+                assert forall|i: int| 0 <= i < s0.len() implies p(#[trigger] s0[i]) == q(s0[i]) by {
+                    assert(s0[i] == s[i]);
+                    assert(lt(s[i].0, s[s.len() - 1].0));
+                    assert(opt_lt(Some(s0[i].0), Some(x.0)));
+                    lemma_opt_lt_order(Some(s0[i].0), Some(x.0), t);
+                }
+                lemma_filter_ext(s0, p, q);
+            }
+        }
+    }
+}
+
+/// `upto` of `canon` at a lower point is `canon` there.
+pub proof fn lemma_canon_upto<S: ?Sized, E>(v: ChainView, a: Option<Position>, c: Position, t: Option<Position>)
+    requires
+        a1::<S, E>(v),
+        opt_le(t, Some(c)),
+        t matches Some(q) ==> alo(a) <= q.block + 1,
+    ensures
+        upto(canon::<S, E>(v, a, Some(c)), t) == canon::<S, E>(v, a, t),
+{
+    lemma_canon_def::<S, E>(v, a, c);
+    let (lo, hi) = (alo(a), c.block as int);
+    let s = pentries::<S, E>(v, lo, hi);
+    let w = within::<E>(a, c);
+    lemma_pe_sorted::<S, E>(v, lo, hi);
+    lemma_upto_filter(s, w, t);
+    lemma_re_facts::<S, E>(v, lo, hi);
+    match t {
+        None => {
+            lemma_filter_none(s, and_le(w, t));
+        },
+        Some(q) => {
+            lemma_canon_def::<S, E>(v, a, q);
+            let m = q.block as int;
+            assert(m <= hi);
+            lemma_pe_split::<S, E>(v, lo, m, hi);
+            let (s1, s2) = (pentries::<S, E>(v, lo, m), pentries::<S, E>(v, m + 1, hi));
+            Seq::filter_distributes_over_add(s1, s2, and_le(w, t));
+            lemma_re_facts::<S, E>(v, lo, m);
+            lemma_re_facts::<S, E>(v, m + 1, hi);
+            assert forall|i: int| 0 <= i < s2.len() implies !and_le(w, t)(#[trigger] s2[i]) by {
+                assert(s2[i] == tpos(range_entries::<S, E>(v, m + 1, hi)[i]));
+            }
+            lemma_filter_none(s2, and_le(w, t));
+            assert forall|i: int| 0 <= i < s1.len() implies and_le(w, t)(#[trigger] s1[i]) == within::<E>(a, q)(s1[i]) by {
+                assert(s1[i] == tpos(range_entries::<S, E>(v, lo, m)[i]));
+                if le(s1[i].0, q) {
+                    lemma_opt_lt_order(Some(s1[i].0), t, Some(c));
+                }
+            }
+            lemma_filter_ext(s1, and_le(w, t), within::<E>(a, q));
+            assert(s1.filter(and_le(w, t)) + Seq::empty() =~= s1.filter(and_le(w, t)));
+        },
+    }
+}
+
+
+/// T7 apply step: extending a complete cursor `co` (or the anchor) to a complete `cn`
+/// appends the positioned entries of the heights between.
+pub proof fn lemma_canon_extend<S: ?Sized, E>(
+    v: ChainView,
+    a: Option<Position>,
+    lb: int,
+    co: Option<Position>,
+    cn: Position,
+)
+    requires
+        a1::<S, E>(v),
+        alo(a) - 1 <= lb < cn.block,
+        a matches Some(q) ==> q.block <= lb,
+        co matches Some(p) ==> p.block == lb && complete::<S, E>(v, p),
+        co is None ==> (a is None && lb == -1) || (a matches Some(q) && q.log_index == u64::MAX && lb
+            == q.block),
+        complete::<S, E>(v, cn),
+    ensures
+        canon::<S, E>(v, a, Some(cn)) == canon::<S, E>(v, a, co) + pentries::<S, E>(v, lb + 1, cn.block as int),
+{
+    lemma_canon_def::<S, E>(v, a, cn);
+    let (lo, hi) = (alo(a), cn.block as int);
+    let wn = within::<E>(a, cn);
+    lemma_pe_split::<S, E>(v, lo, lb, hi);
+    let (s1, s2) = (pentries::<S, E>(v, lo, lb), pentries::<S, E>(v, lb + 1, hi));
+    Seq::filter_distributes_over_add(s1, s2, wn);
+    assert(s2.filter(wn) == s2) by {
+        lemma_re_facts::<S, E>(v, lb + 1, hi);
+        lemma_re_complete::<S, E>(v, lb + 1, hi, cn);
+        assert forall|i: int| 0 <= i < s2.len() implies wn(#[trigger] s2[i]) by {
+            assert(s2[i] == tpos(range_entries::<S, E>(v, lb + 1, hi)[i]));
+        }
+        lemma_filter_all(s2, wn);
+    }
+    assert(s1.filter(wn) == canon::<S, E>(v, a, co)) by {
+        lemma_re_facts::<S, E>(v, lo, lb);
+        match co {
+            None => {
+                if a is None {
+                    assert(s1.len() == 0);
+                }
+                assert forall|i: int| 0 <= i < s1.len() implies !wn(#[trigger] s1[i]) by {
+                    assert(s1[i] == tpos(range_entries::<S, E>(v, lo, lb)[i]));
+                }
+                lemma_filter_none(s1, wn);
+            },
+            Some(p) => {
+                lemma_canon_def::<S, E>(v, a, p);
+                lemma_re_complete::<S, E>(v, lo, lb, p);
+                assert forall|i: int| 0 <= i < s1.len() implies wn(#[trigger] s1[i]) == within::<E>(a, p)(s1[i]) by {
+                    assert(s1[i] == tpos(range_entries::<S, E>(v, lo, lb)[i]));
+                }
+                lemma_filter_ext(s1, wn, within::<E>(a, p));
+            },
+        }
+    }
+    if co is None {
+        assert(Seq::<(Position, E)>::empty() + s2 =~= s2);
+    }
+}
+
+
+/// The last entry of a non-empty range ends its block, and nothing lies above its block.
+pub proof fn lemma_last_complete<S: ?Sized, E>(v: ChainView, lo: int, hi: int)
+    requires
+        a1::<S, E>(v),
+        0 <= lo,
+        range_entries::<S, E>(v, lo, hi).len() > 0,
+    ensures
+        ({
+            let r = range_entries::<S, E>(v, lo, hi);
+            let x = tpos(r.last()).0;
+            &&& complete::<S, E>(v, x)
+            &&& lo <= x.block <= hi
+            &&& r == range_entries::<S, E>(v, lo, x.block as int)
+        }),
+    decreases hi - lo,
+{
+    let (r0, b) = (range_entries::<S, E>(v, lo, hi - 1), block_entries::<S, E>(v, hi as u64));
+    let r = range_entries::<S, E>(v, lo, hi);
+    assert(r == r0 + b);
+    if b.len() > 0 {
+        assert(v.contains_key(hi as u64));
+        assert(v[hi as u64].number == hi);
+        let l = logs::<S, E>(v[hi as u64].hash);
+        assert(logs_ascending(l));
+        assert(r.last() == b.last());
+        assert forall|i: int| 0 <= i < b.len() implies (#[trigger] b[i]).1 as u64 <= b.last().1 as u64 by {
+            if i < b.len() - 1 {
+                assert(l[i].0 < l[b.len() - 1].0);
+            }
+        }
+    } else {
+        assert(r =~= r0);
+        lemma_last_complete::<S, E>(v, lo, hi - 1);
+    }
+}
+
+/// A ring inside a chain view, ascending, is a hash chain.
+pub proof fn lemma_ring_chain_in(r: Seq<BlockRef>, v: ChainView)
+    requires
+        ring_in(r, v),
+        chain(v),
+        ring_ascending(r),
+    ensures
+        ring_chain(r),
+{
+    assert forall|i: int, j: int| 0 <= i < j < r.len() implies r[i] == anc(#[trigger] r[j].hash, (#[trigger] r[i]).number) by {
+        assert(v.contains_key(r[i].number) && v.contains_key(r[j].number));
+        assert(r[i].number < r[j].number);
+        assert(v[r[i].number] == anc(v[r[j].number].hash, r[i].number));
+    }
+}
+
+/// A ring inside `h`, at heights where `h` and `v` agree, is inside `v`.
+pub proof fn lemma_ring_move(r: Seq<BlockRef>, h: ChainView, v: ChainView, lo: u64, hi: u64)
+    requires
+        ring_in(r, h),
+        forall|i: int| 0 <= i < r.len() ==> lo <= #[trigger] r[i].number <= hi,
+        forall|n: u64| lo <= n <= hi ==> #[trigger] header(h, n) == header(v, n),
+    ensures
+        ring_in(r, v),
+{
+    assert forall|i: int| 0 <= i < r.len() implies v.contains_key(#[trigger] r[i].number) && v[r[i].number] == r[i] by {
+        assert(header(h, r[i].number) == header(v, r[i].number));
+    }
+}
+
+
+/// Every entry after `c` is newer.
+pub proof fn lemma_newer_all<E>(c: Option<Position>, s: Seq<(Position, E)>)
+    requires
+        forall|i: int| 0 <= i < s.len() ==> opt_lt(c, Some((#[trigger] s[i]).0)),
+    ensures
+        newer(c, s) == s,
+{
+    let p = |x: (Position, E)| opt_lt(c, Some(x.0));
+    lemma_filter_all(s, p);
+}
+
+
+/// Every newer entry is after `c`.
+pub proof fn lemma_newer_after<E>(c: Option<Position>, s: Seq<(Position, E)>)
+    ensures
+        forall|i: int| 0 <= i < newer(c, s).len() ==> opt_lt(c, Some((#[trigger] newer(c, s)[i]).0)),
+{
+    let p = |x: (Position, E)| opt_lt(c, Some(x.0));
+    assert forall|i: int| 0 <= i < newer(c, s).len() implies opt_lt(c, Some((#[trigger] newer(c, s)[i]).0)) by {
+        s.lemma_filter_pred(p, i);
+    }
+}
+
+/// Apply never moves the cursor back (T6b floor through apply).
+pub proof fn lemma_cursor_advances<F: ?Sized, E, Er>(v: EngineView, b: BatchView<E>)
+    ensures
+        opt_le(v.cursor, cursor_after(v.cursor, ok_calls::<F, E, Er>(v, b))),
+{
+    let nw = newer(v.cursor, b.flat());
+    let cl = calls::<F, E, Er>(v, b);
+    let ok = ok_calls::<F, E, Er>(v, b);
+    if ok.len() > 0 {
+        lemma_newer_after(v.cursor, b.flat());
+        lemma_applied_prefix::<F, E, Er>(v.fold, nw);
+        assert(accepted(v, b));
+        assert(ok.last() == cl[ok.len() - 1]);
+        assert(cl[ok.len() - 1] == nw[ok.len() - 1]);
+    }
+}
+
 } // verus!
