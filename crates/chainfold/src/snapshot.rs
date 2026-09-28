@@ -247,7 +247,7 @@ impl<E: fmt::Display> fmt::Display for SnapshotError<E> {
             Self::RingCursorMismatch => {
                 write!(
                     f,
-                    "snapshot ring's newest block does not match the cursor block"
+                    "snapshot ring does not end at the cursor block, or has entries without a cursor"
                 )
             }
             Self::Config(error) => write!(f, "snapshot config invalid: {error}"),
