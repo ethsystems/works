@@ -501,20 +501,26 @@ where
         };
 
         let head = self.source.head()?;
-        let mut from = match cursor {
-            Some(cursor) => cursor.block + 1,
-            None => self.config.start_block,
+        // None only for a cursor at u64::MAX, which has no block above it to read.
+        let first = match cursor {
+            Some(cursor) => cursor.block.checked_add(1),
+            None => Some(self.config.start_block),
         };
 
         let window = self.source.window().max(1);
-        while from <= head {
-            let to = head.min(from.saturating_add(window - 1));
-            self.scratch.clear();
-            self.source.events_in(from, to, &mut self.scratch)?;
-            from = to.saturating_add(1);
-            if !self.scratch.is_empty() {
-                group_into(&mut self.batch, &mut self.scratch);
-                break;
+        if let Some(mut from) = first {
+            while from <= head {
+                let to = head.min(from.saturating_add(window - 1));
+                self.scratch.clear();
+                self.source.events_in(from, to, &mut self.scratch)?;
+                if !self.scratch.is_empty() {
+                    group_into(&mut self.batch, &mut self.scratch);
+                    break;
+                }
+                let Some(next) = to.checked_add(1) else {
+                    break;
+                };
+                from = next;
             }
         }
         Ok(())
@@ -719,6 +725,52 @@ mod tests {
             out: &mut Vec<(BlockRef, u32, u64)>,
         ) -> Result<(), PollFailure> {
             out.push((self.block, 0, 1));
+            Ok(())
+        }
+    }
+
+    /// Chain whose only block is number `u64::MAX`; errors on a second `events_in` in
+    /// one tick, so a scan that spins fails the tick instead of hanging the test.
+    struct Summit {
+        event: Option<u64>,
+        queries: u32,
+    }
+
+    impl Summit {
+        const BLOCK: BlockRef = BlockRef {
+            number: u64::MAX,
+            hash: [9u8; 32],
+        };
+    }
+
+    impl Source for Summit {
+        type Event = u64;
+        type Error = PollFailure;
+
+        fn head(&mut self) -> Result<u64, PollFailure> {
+            self.queries = 0;
+            Ok(u64::MAX)
+        }
+
+        fn header_at(&mut self, number: u64) -> Result<Option<BlockRef>, PollFailure> {
+            Ok((number == u64::MAX).then_some(Self::BLOCK))
+        }
+
+        fn events_in(
+            &mut self,
+            _from: u64,
+            to: u64,
+            out: &mut Vec<(BlockRef, u32, u64)>,
+        ) -> Result<(), PollFailure> {
+            self.queries += 1;
+            if self.queries > 1 {
+                return Err(PollFailure);
+            }
+            if let Some(event) = self.event
+                && to == u64::MAX
+            {
+                out.push((Self::BLOCK, 0, event));
+            }
             Ok(())
         }
     }
@@ -1625,5 +1677,46 @@ mod tests {
             (Position::new(6, 0), 60),
         ];
         assert_eq!(driver.engine().fold().applied, expected);
+    }
+
+    #[test]
+    fn scan_returns_when_head_is_u64_max() {
+        // given a chain whose only block, number u64::MAX, carries no events
+        let mut driver = Driver::new(
+            RecordingFold::default(),
+            Summit {
+                event: None,
+                queries: 0,
+            },
+            engine_config(2),
+            DriverConfig::from_block(u64::MAX),
+        )
+        .unwrap();
+        // when polled
+        let outcome = driver.tick();
+        // then the scan reads the one window and stops
+        assert_eq!(outcome, Tick::Idle);
+        assert_eq!(driver.source_mut().queries, 1);
+    }
+
+    #[test]
+    fn scan_past_a_cursor_at_u64_max_is_idle() {
+        // given a driver that has folded the one event of block u64::MAX
+        let mut driver = Driver::new(
+            RecordingFold::default(),
+            Summit {
+                event: Some(1),
+                queries: 0,
+            },
+            engine_config(2),
+            DriverConfig::from_block(u64::MAX),
+        )
+        .unwrap();
+        assert!(matches!(driver.tick(), Tick::Progressed(_)));
+        // when polled again
+        let outcome = driver.tick();
+        // then nothing lies above the cursor, and the boundary still verifies
+        assert_eq!(outcome, Tick::Idle);
+        assert_eq!(driver.engine().cursor(), Some(Position::new(u64::MAX, 0)));
     }
 }
