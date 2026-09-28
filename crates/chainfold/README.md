@@ -223,8 +223,6 @@ trusted items are in `src/verus/tcb.rs`.
 
 #### what Verus proves
 
-Parts marked TODO are in progress (P5 for apply, P8 for the driver).
-
 - **T1, position.** `lt` is a strict total order: irreflexive, transitive, and
   trichotomous. `pos_gt` and `Position::new` match their specs.
 - **T2, batch.** `validate` returns `Ok` if and only if the batch is well shaped.
@@ -232,9 +230,10 @@ Parts marked TODO are in progress (P5 for apply, P8 for the driver).
   strictly ascending in each span. `Ok` implies that the flattened positions are strictly ascending. Each `Err`
   names the first violation (`first_descent` gives the least `i >= 1` with
   `v[i] <= v[i-1]`).
-- **T3, apply.** TODO (P5). The parts are: rejection keeps the state, dedup against
-  the cursor, total order across calls, idempotence, the post-state, and the fold
-  equality.
+- **T3, apply.** `apply_batch` runs the fold on the entries after the cursor, in
+  order, up to the first stop. A rejection changes only the checked freshness. The
+  fold, cursor, and ring follow those calls, and a second apply of the batch changes
+  nothing.
 - **T4, ring and bisection.** Every `BlockRing` fn matches its `Seq` model.
   `index_at_or_below` finds the last entry at or below `n` in at most
   `floor(log2 len) + 1` steps. `canonical_prefix` makes at most `log2 len + 1` source
@@ -244,18 +243,21 @@ Parts marked TODO are in progress (P5 for apply, P8 for the driver).
   `rollback_at_or_below` picks the newest live slot at or below the target. It
   restores the fold, cursor, and ring prefix of that slot. An `Err` leaves the engine
   unchanged. The refold invariant `inv(init, log)` holds across `checkpoint`,
-  `rollback_at_or_below`, `reset`, and `mark_unrecoverable`. TODO (P5): the same
-  invariant across `apply_batch`.
+  `rollback_at_or_below`, `reset`, and `mark_unrecoverable`. `apply_batch` extends
+  the log by the entries it ran the fold on.
 - **T6, durable cursor and restart.** `durable_point() <= cursor()` in every `wf`
   state. `decode_snapshot` returns only `wf` engines, for any input bytes, with no
   trust in the codec or the checksum. `encode_durable_snapshot` returns the durable
   point, and its envelope encodes the durable snapshot. A decoded envelope gives back
   the durable snapshot view, except for the fold (A5). `Driver::status` reports
-  `durable_cursor <= cursor` while the driver state is `durable_ok` (T6b). TODO (P8):
-  the same invariant across every driver method.
-- **T7, driver end to end.** TODO (P8). Take a tick that returns `Progressed` or
-  `Idle` with the engine `Active`. After it, the fold equals the fold of the canonical
-  log of the view of that tick.
+  `durable_cursor <= cursor` while the driver state is `durable_ok` (T6b). Every
+  driver method keeps `durable_ok`.
+- **T7, driver end to end.** Under A1, A2, and A3, `Driver::tick` keeps the ghost
+  invariant `dinv`, and a new driver starts in it. After a tick that returns
+  `Progressed` or `Idle` with the engine `Active`, the fold equals the fold of the
+  canonical logs of that tick's view up to the cursor, and the ring is a hash chain in
+  that view. After `RolledBack`, `inv` holds over the canonical logs of a view that
+  confirmed the probed ring entry.
 
 Verus checks every exec fn in the in-scope files for panics and overflow. The only
 exceptions are the fns listed as out of scope or pending in `Cargo.toml`.
@@ -274,7 +276,7 @@ exceptions are the fns listed as out of scope or pending in `Cargo.toml`.
 - **A2′, one bisection view.** All probes of one bisection see one view. Only T4c
   optimality needs it. Optimality also takes `down_closed(V)` as a hypothesis: `V`
   holds every height below each height it holds. `a1` does not include this, because
-  a pruned source answers `None` below its horizon. TODO (P8): T7 takes the weaker
+  a pruned source answers `None` below its horizon. T7 takes the weaker
   `holds(V, start_block, n)` for each view a tick uses.
 - **A3, fold determinism.** `Fold::apply` is a function of the state view, the
   position, and the event. The state view is `fview(&f)`, an uninterpreted `int`
