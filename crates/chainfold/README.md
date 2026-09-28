@@ -250,8 +250,9 @@ Parts marked TODO are in progress (P5 for apply, P8 for the driver).
   state. `decode_snapshot` returns only `wf` engines, for any input bytes, with no
   trust in the codec or the checksum. `encode_durable_snapshot` returns the durable
   point, and its envelope encodes the durable snapshot. A decoded envelope gives back
-  the durable snapshot view, except for the fold (A5). TODO (P8): the driver bound
-  `status().durable_cursor <= status().cursor`.
+  the durable snapshot view, except for the fold (A5). `Driver::status` reports
+  `durable_cursor <= cursor` while the driver state is `durable_ok` (T6b). TODO (P8):
+  the same invariant across every driver method.
 - **T7, driver end to end.** TODO (P8). Take a tick that returns `Progressed` or
   `Idle` with the engine `Active`. After it, the fold equals the fold of the canonical
   log of the view of that tick.
@@ -297,9 +298,8 @@ exceptions are the fns listed as out of scope or pending in `Cargo.toml`.
    log index. The test `position_order_is_block_then_log_index` checks it.
 3. `OrdSpecImpl for Position`: the same for the derived `Ord`.
 4. `Vec::into_boxed_slice` keeps the elements in order (std docs).
-5. `<[T]>::sort_by_key` permutes the slice and claims no order, because
-   `Batch::validate` checks the order. TODO (P8): `group_into` calls
-   `sort_unstable_by_key`, so this entry changes to that fn.
+5. `<[T]>::sort_unstable_by_key` permutes the slice (std docs). It claims no order,
+   because `Batch::validate` checks the order. `group_into` uses it.
 6. `<[T]>::split_last_chunk`: empty contract, it asserts nothing.
 7. `snapshot::crc32c`: empty contract. Decode never trusts the checksum value.
 8. `wincode::ReadError`: an opaque type, it asserts nothing.
