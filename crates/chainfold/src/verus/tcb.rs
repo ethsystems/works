@@ -15,6 +15,7 @@ use std::{
 use vstd::prelude::*;
 
 use crate::{
+    fold::Fold,
     position::Position,
     sink::NoSink,
     verus::model::{
@@ -26,10 +27,11 @@ use crate::{
 
 verus! {
 
-// A6: Clone preserves the fold view (A3 clone fidelity). Verus knows only that a clone of
-// a generic `F` satisfies `F::clone`'s unknown ensures; the `Fold` contract adds this.
+// A6: Clone preserves the fold view (A3 clone fidelity, stated on `Fold`). Verus knows
+// only that a clone of a generic `F` satisfies `F::clone`'s unknown ensures; the `Fold`
+// contract adds this, so the bound is `Fold`, not every `Clone` type.
 #[verifier::external_body]
-pub proof fn axiom_clone_preserves_fview<F: Clone>(a: F, b: F)
+pub proof fn axiom_clone_preserves_fview<F: Fold + Clone>(a: F, b: F)
     requires
         cloned(a, b),
     ensures
