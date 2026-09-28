@@ -404,13 +404,18 @@ pub(crate) fn first_descent<T: Ord>(values: &[T]) -> Option<usize> {
             ascending <==> ascending_upto(values@, i as int),
     ))]
     for i in 1..values.len() {
-        // A select, not `&=`: Verus rejects `&` on bool. It still vectorizes, see
-        // tasks/chainfold-perf-p3.md.
-        ascending = if values[i - 1] < values[i] {
-            ascending
-        } else {
-            false
-        };
+        #[cfg(verus_keep_ghost)]
+        proof_decl! {
+            let ghost before = ascending;
+        }
+        // Verus rejects `&` on bool; this u8 spelling compiles to the same code as `&=`
+        // (tasks/chainfold-perf-p3.md).
+        let rises = values[i - 1] < values[i];
+        ascending = (ascending as u8 & rises as u8) != 0;
+        #[cfg(verus_keep_ghost)]
+        proof! {
+            lemma_and_bits(before as u8, rises as u8);
+        }
         #[cfg(verus_keep_ghost)]
         proof! {
             assert(ascending_upto(values@, i + 1) <==> (ascending_upto(values@, i as int)
@@ -839,6 +844,16 @@ pub(crate) proof fn lemma_ascending_pairwise<T: Ord>(v: Seq<T>)
     assert forall|i: int, j: int| #![trigger v[i], v[j]] 0 <= i < j < v.len() implies v[i].is_lt(&v[j]) by {
         lemma_ascending_from(v, i, j);
     }
+}
+
+proof fn lemma_and_bits(x: u8, y: u8)
+    by (bit_vector)
+    requires
+        x <= 1,
+        y <= 1,
+    ensures
+        (x & y != 0) <==> (x != 0 && y != 0),
+{
 }
 
 proof fn lemma_int_laws()
