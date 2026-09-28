@@ -4,6 +4,9 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
+    # vstd is pinned to the Verus release in ci.yml; bump both together.
+    ignore:
+      - dependency-name: "vstd"
 
   - package-ecosystem: "github-actions"
     directory: "/"

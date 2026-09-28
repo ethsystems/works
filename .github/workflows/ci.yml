@@ -104,11 +104,47 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
 
+  # chainfold proofs (pm#423). CI uses the x86 release; see verus-gates.py for
+  # what the static gates catch that Verus itself does not. Never cache target/:
+  # stale Verus artifacts can skip verification.
+  verus:
+    name: Verus (chainfold)
+    runs-on: ubuntu-latest
+    env:
+      VERUS_VERSION: 0.2026.09.20.aef82ed
+      VERUS_SHA256: 7b870fa12bc589015c2fab60a8b3d9f07c7b1adb3444eb0fadffcbf7f0447b33
+    steps:
+      - uses: actions/checkout@v7
+      - name: Static gates
+        run: |
+          python3 .github/scripts/verus-gates.py --self-test
+          python3 .github/scripts/verus-gates.py crates/chainfold
+      - name: Install Verus
+        shell: bash
+        run: |
+          set -euo pipefail
+          zip="verus-$VERUS_VERSION-x86-linux.zip"
+          curl -sSfLO "https://github.com/verus-lang/verus/releases/download/release/$VERUS_VERSION/$zip"
+          echo "$VERUS_SHA256  $zip" | sha256sum -c -
+          unzip -q "$zip" -d "$RUNNER_TEMP"
+          dir="$RUNNER_TEMP/verus-x86-linux"
+          # e.g. "1.98.1-x86_64-unknown-linux-gnu (overridden by environment variable RUSTUP_TOOLCHAIN)"
+          toolchain=$(jq -r '.verus.toolchain | split(" ")[0]' "$dir/version.json")
+          rustup toolchain install "$toolchain" --profile minimal \
+            --component rustc-dev --component llvm-tools
+          # beats the repo's rust-toolchain.toml
+          echo "RUSTUP_TOOLCHAIN=$toolchain" >> "$GITHUB_ENV"
+          echo "$dir" >> "$GITHUB_PATH"
+      - name: Verify
+        run: >-
+          cargo verus verify -p chainfold --features verus,wincode
+          --check-toolchain --fwd-verus-args-to roots
+
   gate:
     name: CI Gate
     runs-on: ubuntu-latest
     if: always()
-    needs: [fmt, discover, clippy, test, docs]
+    needs: [fmt, discover, clippy, test, docs, verus]
     steps:
       - if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
         run: exit 1
