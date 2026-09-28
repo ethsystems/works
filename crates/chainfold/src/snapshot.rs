@@ -199,7 +199,8 @@ pub enum SnapshotError<E> {
     RingNotAscending,
     /// Stored hash bytes do not match the ring entry count.
     RingHashLenMismatch,
-    /// Stored ring's newest block differs from the stored cursor block.
+    /// Stored ring's newest block differs from the stored cursor block, or a
+    /// cursorless snapshot carries ring entries.
     RingCursorMismatch,
     /// Caller configuration is invalid.
     Config(ConfigError),
@@ -343,9 +344,8 @@ impl<F: Persist> Engine<F> {
         }
         let cursor = (envelope.cursor_set != 0)
             .then(|| Position::new(envelope.cursor_block, envelope.cursor_log_index));
-        if let Some(pos) = cursor
-            && envelope.ring_numbers.last() != Some(&pos.block)
-        {
+        // A cursorless engine has an empty ring, so None must pair with no entries.
+        if envelope.ring_numbers.last().copied() != cursor.map(|pos| pos.block) {
             return Err(SnapshotError::RingCursorMismatch);
         }
 
@@ -753,6 +753,23 @@ mod tests {
         // when decoded
         let result = Engine::<RecordingFold>::decode_snapshot(&bytes, test_config());
         // then RingCursorMismatch
+        assert_eq!(result.unwrap_err(), SnapshotError::RingCursorMismatch);
+    }
+
+    #[test]
+    fn cursorless_envelope_with_a_ring_is_refused() {
+        // given a hand-built envelope with no cursor but one observed block
+        let mut state = Vec::new();
+        RecordingFold::default().encode_state(&mut state);
+        let bytes = encode_custom(
+            RecordingFold::STATE_TAG.as_bytes(),
+            None,
+            &[block(5, 0)],
+            state,
+        );
+        // when decoded
+        let result = Engine::<RecordingFold>::decode_snapshot(&bytes, test_config());
+        // then RingCursorMismatch; no engine reaches a cursorless state with a ring
         assert_eq!(result.unwrap_err(), SnapshotError::RingCursorMismatch);
     }
 }
