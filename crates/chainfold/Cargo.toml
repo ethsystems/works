@@ -71,7 +71,7 @@ verify = true
 # Read by .github/scripts/verus-gates.py: every fn in an in-scope file must be
 # verified or listed here with the phase that verifies it.
 [package.metadata.verus-gates]
-in-scope = ["src/ring.rs", "src/position.rs", "src/batch.rs", "src/checkpoint.rs", "src/engine.rs", "src/snapshot.rs"]
+in-scope = ["src/ring.rs", "src/position.rs", "src/batch.rs", "src/checkpoint.rs", "src/engine.rs", "src/snapshot.rs", "src/driver.rs"]
 
 [package.metadata.verus-gates.out-of-scope]
 "src/batch.rs::BatchShapeError::fmt" = "Display (plan section 5)"
@@ -90,6 +90,41 @@ in-scope = ["src/ring.rs", "src/position.rs", "src/batch.rs", "src/checkpoint.rs
 "src/snapshot.rs::SnapshotError::fmt" = "Display (plan section 5)"
 "src/snapshot.rs::write_payload" = "A6"
 "src/snapshot.rs::trailer_bytes" = "A6"
+"src/driver.rs::DriverConfig::default" = "config constants, no claim"
+"src/driver.rs::DriverConfig::from_block" = "config constants, no claim"
+"src/driver.rs::Driver::next_delay" = "timing, no claim (plan section 5)"
+"src/driver.rs::due" = "P8"
+"src/driver.rs::clamp" = "P8"
+"src/driver.rs::DriverStatus::is_terminal" = "P8"
+"src/driver.rs::Driver::new" = "P8"
+"src/driver.rs::Driver::resume" = "P8"
+"src/driver.rs::Driver::with_sink" = "P8"
+"src/driver.rs::Driver::resume_with_sink" = "P8"
+"src/driver.rs::Driver::build" = "P8"
+"src/driver.rs::Driver::around" = "P8"
+"src/driver.rs::Driver::sink" = "P8"
+"src/driver.rs::Driver::into_sink" = "P8"
+"src/driver.rs::Driver::engine" = "P8"
+"src/driver.rs::Driver::engine_mut" = "P8"
+"src/driver.rs::Driver::source_mut" = "P8"
+"src/driver.rs::Driver::is_caught_up" = "P8"
+"src/driver.rs::Driver::auto_checkpoint" = "P8"
+"src/driver.rs::Driver::run_checkpoint" = "P8"
+"src/driver.rs::Driver::offer_snapshot" = "P8"
+"src/driver.rs::Driver::lose_durability" = "P8"
+"src/driver.rs::Driver::clamp_marks" = "P8"
+"src/driver.rs::Driver::roll_back_to" = "P8"
+"src/driver.rs::Driver::resync_or_terminal" = "P8"
+"src/driver.rs::Driver::resync" = "P8"
+"src/driver.rs::Driver::reconcile_reset" = "P8"
+"src/driver.rs::Driver::reconcile_reset_slow" = "P8"
+"src/driver.rs::Driver::scan" = "P8"
+"src/driver.rs::Driver::recover_via_bisection" = "P8"
+"src/driver.rs::Driver::checkpoint" = "P8"
+"src/driver.rs::Driver::status" = "P8"
+"src/driver.rs::Driver::step" = "P8 T7 (after P5)"
+"src/driver.rs::Driver::poll_apply" = "P8 T7 (after P5)"
+"src/driver.rs::Driver::tick" = "P8 T7 (after P5)"
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = [

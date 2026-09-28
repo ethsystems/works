@@ -68,9 +68,9 @@ pub assume_specification<T, A: core::alloc::Allocator>[ Vec::<T, A>::into_boxed_
         b@ == v@,
 ;
 
-// A6: `sort_by_key` permutes the slice (std docs; vstd has no spec). Claims nothing about
-// order, because `Batch::validate` checks it. Used by `group_into` (P8).
-pub assume_specification<T, K: Ord, F: FnMut(&T) -> K>[ <[T]>::sort_by_key::<K, F> ](
+// A6: `sort_unstable_by_key` permutes the slice (std docs; vstd has no spec). Claims
+// nothing about order, because `Batch::validate` checks it. Used by `group_into` (P8).
+pub assume_specification<T, K: Ord, F: FnMut(&T) -> K>[ <[T]>::sort_unstable_by_key::<K, F> ](
     v: &mut [T],
     f: F,
 )

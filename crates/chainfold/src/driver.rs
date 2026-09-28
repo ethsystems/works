@@ -3,10 +3,7 @@ use alloc::vec::Vec;
 #[cfg(feature = "std")]
 use std::vec::Vec;
 
-use core::{
-    cmp::Reverse,
-    time::Duration,
-};
+use core::time::Duration;
 
 use crate::{
     batch::Batch,
@@ -37,6 +34,16 @@ use crate::{
         ReplayHorizon,
         Source,
     },
+};
+#[cfg(verus_keep_ghost)]
+use {
+    crate::batch::{
+        appended_at,
+        popped_tail,
+        pushed_block,
+    },
+    crate::verus::model::BatchView,
+    vstd::prelude::*,
 };
 
 /// Default poll cadence when the source has no error backlog.
@@ -613,12 +620,77 @@ where
 ///
 /// Sorted by descending position and popped from the tail, the entries leave in
 /// ascending order with no intermediate buffer; the sort is in place.
+#[cfg_attr(verus_keep_ghost, verus_verify)]
+#[cfg_attr(verus_keep_ghost, verus_spec(
+    requires
+        old(batch)@.wf(),
+        old(batch)@.ends.len() == 0,
+    ensures
+        final(batch)@.wf(),
+        final(batch)@.boundary == old(batch)@.boundary,
+        final(entries)@.len() == 0,
+        final(batch)@.triples().to_multiset() == old(entries)@.to_multiset(),
+))]
 fn group_into<E>(batch: &mut Batch<E>, entries: &mut Vec<(BlockRef, u32, E)>) {
-    entries.sort_unstable_by_key(|(block, log_index, _)| {
-        Reverse((block.number, *log_index))
-    });
-    while let Some(&(block, _, _)) = entries.last() {
-        batch.push_block_from_tail(block, entries);
+    // `MAX - x` reverses each key lane, so the sort is descending without `Reverse`.
+    entries.sort_unstable_by_key(|e| (u64::MAX - e.0.number, u32::MAX - e.1));
+    #[cfg(verus_keep_ghost)]
+    proof_decl! {
+        let ghost s = entries@;
+        assert(batch@.triples() =~= Seq::empty());
+    }
+    #[cfg_attr(verus_keep_ghost, verus_spec(
+        invariant
+            batch@.wf(),
+            batch@.boundary == old(batch)@.boundary,
+            entries@.len() <= s.len(),
+            entries@ == s.subrange(0, entries@.len() as int),
+            batch@.triples().len() == s.len() - entries@.len(),
+            forall|j: int|
+                0 <= j < s.len() - entries@.len() ==> #[trigger] batch@.triples()[j] == s[s.len() - 1 - j],
+        ensures
+            batch@.wf(),
+            batch@.boundary == old(batch)@.boundary,
+            entries@.len() == 0,
+            batch@.triples() =~= s.reverse(),
+        decreases entries@.len(),
+    ))]
+    loop {
+        match entries.last() {
+            Some(&(block, _, _)) => {
+                #[cfg(verus_keep_ghost)]
+                proof_decl! {
+                    let ghost pre = batch@;
+                    let ghost before = entries@;
+                }
+                batch.push_block_from_tail(block, entries);
+                #[cfg(verus_keep_ghost)]
+                proof! {
+                    lemma_push_triples(pre, batch@, before, entries@, block);
+                    if entries@.len() == before.len() {
+                        assert(entries@[entries@.len() - 1] == before[before.len() - 1]);
+                    }
+                    assert(entries@ =~= s.subrange(0, entries@.len() as int));
+                    let n = pre.triples().len();
+                    assert forall|j: int|
+                        0 <= j < s.len() - entries@.len() implies #[trigger] batch@.triples()[j]
+                            == s[s.len() - 1 - j] by {
+                        if j >= n {
+                            let k = j - n;
+                            assert(batch@.triples()[n + k] == before[before.len() - 1 - k]);
+                            assert(before[before.len() - 1 - k] == s[s.len() - 1 - j]);
+                        } else {
+                            assert(pre.triples()[j] == s[s.len() - 1 - j]);
+                        }
+                    }
+                }
+            }
+            None => break,
+        }
+    }
+    #[cfg(verus_keep_ghost)]
+    proof! {
+        s.lemma_reverse_to_multiset();
     }
 }
 
@@ -1909,3 +1981,94 @@ mod tests {
         assert_eq!(restored, Some(Position::new(17, 0)));
     }
 }
+
+#[cfg(verus_keep_ghost)]
+verus! {
+
+/// Spans below the pushed one keep their entries.
+proof fn lemma_triples_upto_kept<E>(pre: BatchView<E>, post: BatchView<E>, block: BlockRef, m: int)
+    requires
+        pre.wf(),
+        pushed_block(pre, post, block),
+        0 <= m <= pre.ends.len(),
+    ensures
+        post.triples_upto(m) == pre.triples_upto(m),
+    decreases m,
+{
+    if m > 0 {
+        lemma_triples_upto_kept(pre, post, block, m - 1);
+        let i = m - 1;
+        let len = pre.events.len() as int;
+        assert(pre.ends[i] <= len) by {
+            if i < pre.ends.len() - 1 {
+                assert(pre.ends[i] <= pre.ends[pre.ends.len() - 1]);
+            }
+        }
+        assert(post.ends[i] == pre.ends[i]);
+        if i > 0 {
+            assert(post.ends[i - 1] == pre.ends[i - 1]);
+        }
+        assert forall|x: int| 0 <= x < len implies post.log_indices[x] == pre.log_indices[x]
+            && post.events[x] == pre.events[x] by {
+            assert(post.log_indices.subrange(0, len)[x] == post.log_indices[x]);
+            assert(post.events.subrange(0, len)[x] == post.events[x]);
+        }
+        assert(post.span_triples(i) =~= pre.span_triples(i));
+    }
+}
+
+/// One `push_block_from_tail` appends the popped entries, last first, to `triples()`.
+proof fn lemma_push_triples<E>(
+    pre: BatchView<E>,
+    post: BatchView<E>,
+    before: Seq<(BlockRef, u32, E)>,
+    after: Seq<(BlockRef, u32, E)>,
+    block: BlockRef,
+)
+    requires
+        pre.wf(),
+        pushed_block(pre, post, block),
+        popped_tail(pre, post, before, after, block),
+    ensures
+        post.triples().len() == pre.triples().len() + (before.len() - after.len()),
+        forall|j: int| 0 <= j < pre.triples().len() ==> #[trigger] post.triples()[j] == pre.triples()[j],
+        forall|j: int|
+            0 <= j < before.len() - after.len() ==> #[trigger] post.triples()[pre.triples().len() + j]
+                == before[before.len() - 1 - j],
+{
+    let n = pre.ends.len() as int;
+    lemma_triples_upto_kept(pre, post, block, n);
+    assert(post.triples() == post.triples_upto(n) + post.span_triples(n));
+    let start = post.start(n);
+    assert(start == pre.events.len()) by {
+        if n > 0 {
+            assert(post.ends[n - 1] == pre.ends[n - 1]);
+        }
+    }
+    assert(pre.triples().len() == pre.events.len()) by {
+        lemma_triples_len(pre, n);
+    }
+    let m = before.len() - after.len();
+    assert forall|j: int| 0 <= j < m implies #[trigger] post.span_triples(n)[j] == before[before.len() - 1 - j] by {
+        assert(appended_at(pre, post, before, j, block));
+    }
+}
+
+/// `triples_upto(m)` has `start(m)` entries.
+proof fn lemma_triples_len<E>(b: BatchView<E>, m: int)
+    requires
+        b.wf(),
+        0 <= m <= b.ends.len(),
+    ensures
+        b.triples_upto(m).len() == b.start(m),
+    decreases m,
+{
+    if m > 0 {
+        lemma_triples_len(b, m - 1);
+        if m >= 2 {
+            assert(b.ends[m - 2] <= b.ends[m - 1]);
+        }
+    }
+}
+
+} // verus!

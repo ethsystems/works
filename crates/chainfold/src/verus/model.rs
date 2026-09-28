@@ -819,4 +819,35 @@ pub proof fn lemma_durable_snapshot_inv<F: ?Sized, E, Er>(
     }
 }
 
+impl<E> BatchView<E> {
+    /// Span `i` as source entries `(block, log_index, event)`, in lane order (P8).
+    pub open spec fn span_triples(self, i: int) -> Seq<(BlockRef, u32, E)> {
+        let start = self.start(i);
+        if self.ends[i] < start {
+            seq![]
+        } else {
+            Seq::new(
+                (self.ends[i] - start) as nat,
+                |k: int| (self.block(i), self.log_indices[start + k], self.events[start + k]),
+            )
+        }
+    }
+
+    /// Entries of spans `0..n`, flattened.
+    pub open spec fn triples_upto(self, n: int) -> Seq<(BlockRef, u32, E)>
+        decreases n,
+    {
+        if n <= 0 {
+            seq![]
+        } else {
+            self.triples_upto(n - 1) + self.span_triples(n - 1)
+        }
+    }
+
+    /// Every entry of the batch in lane order, as the source delivered it.
+    pub open spec fn triples(self) -> Seq<(BlockRef, u32, E)> {
+        self.triples_upto(self.ends.len() as int)
+    }
+}
+
 } // verus!
