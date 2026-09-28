@@ -44,10 +44,20 @@ use {
     },
     crate::verus::model::{
         BatchView,
+        ChainView,
         EngineView,
+        SlotView,
+        a1,
+        confirms,
+        down_closed,
         fview,
         opt_le,
+        prefix_at_or_below,
+        qualifies,
+        ring_chain,
         sink_offered,
+        sview_log,
+        upto,
     },
     crate::verus::tcb::axiom_clone_preserves_fview,
     vstd::prelude::*,
@@ -65,10 +75,7 @@ const DEFAULT_CHECKPOINT_INTERVAL: u64 = 64;
 /// True when `block` has reached the next interval step past the last marked block.
 #[cfg_attr(verus_keep_ghost, verus_spec(r =>
     ensures
-        r == match last {
-            Some(l) => block >= l.saturating_add(interval),
-            None => true,
-        },
+        r == due_spec(last, block, interval),
 ))]
 fn due(last: Option<u64>, block: u64, interval: u64) -> bool {
     match last {
@@ -209,18 +216,30 @@ where
     seen_resets: u64,
 }
 
+#[cfg_attr(verus_keep_ghost, cfg_eval, verus_verify)]
 impl<F, S> Driver<F, S>
 where
     F: Fold + Clone,
     S: Source<Event = F::Event>,
 {
     /// Builds a driver that persists nothing.
+    #[cfg_attr(verus_keep_ghost, verus_spec(r =>
+        ensures
+            r matches Ok(d) ==> d.wf() && d.synced() && engine.valid()
+                && d.engine_view() == Engine::<F>::fresh(fview::<F>(&fold), engine)
+                && d.durable_ok(),
+            r matches Err(e) ==> !engine.valid() || horizon_refused(e, config.start_block),
+    ))]
     pub fn new(
         fold: F,
         source: S,
         engine: EngineConfig,
         config: DriverConfig,
     ) -> Result<Self, ConfigError> {
+        #[cfg(verus_keep_ghost)]
+        proof! {
+            crate::verus::tcb::axiom_no_sink_offers_nothing(NoSink);
+        }
         Self::build(fold, source, NoSink, engine, config)
     }
 
@@ -228,16 +247,28 @@ where
     ///
     /// `genesis` is the fold a resync restarts from, so it is empty state rather than
     /// the recovered state.
+    #[cfg_attr(verus_keep_ghost, verus_spec(r =>
+        requires
+            engine.wf(),
+        ensures
+            r matches Ok(d) ==> d.wf() && d.synced() && d.engine_view() == engine@ && d.durable_ok(),
+            r matches Err(e) ==> horizon_refused(e, config.start_block),
+    ))]
     pub fn resume(
         engine: Engine<F>,
         source: S,
         genesis: F,
         config: DriverConfig,
     ) -> Result<Self, ConfigError> {
+        #[cfg(verus_keep_ghost)]
+        proof! {
+            crate::verus::tcb::axiom_no_sink_offers_nothing(NoSink);
+        }
         Self::around(engine, source, NoSink, genesis, config)
     }
 }
 
+#[cfg_attr(verus_keep_ghost, cfg_eval, verus_verify)]
 impl<F, S, K> Driver<F, S, K>
 where
     F: Fold + Clone,
@@ -245,6 +276,13 @@ where
     K: SnapshotSink<F>,
 {
     /// Builds a driver that offers durable snapshots to the sink.
+    #[cfg_attr(verus_keep_ghost, verus_spec(r =>
+        ensures
+            r matches Ok(d) ==> d.wf() && d.synced() && engine.valid()
+                && d.engine_view() == Engine::<F>::fresh(fview::<F>(&fold), engine)
+                && (floor_ok(sink_offered::<K>(&sink), d.engine_view()) ==> d.durable_ok()),
+            r matches Err(e) ==> !engine.valid() || horizon_refused(e, config.start_block),
+    ))]
     pub fn with_sink(
         fold: F,
         source: S,
@@ -256,6 +294,14 @@ where
     }
 
     /// Resumes from a recovered engine, offering durable snapshots to the sink.
+    #[cfg_attr(verus_keep_ghost, verus_spec(r =>
+        requires
+            engine.wf(),
+        ensures
+            r matches Ok(d) ==> d.wf() && d.synced() && d.engine_view() == engine@
+                && (floor_ok(sink_offered::<K>(&sink), engine@) ==> d.durable_ok()),
+            r matches Err(e) ==> horizon_refused(e, config.start_block),
+    ))]
     pub fn resume_with_sink(
         engine: Engine<F>,
         source: S,
@@ -265,14 +311,15 @@ where
     ) -> Result<Self, ConfigError> {
         Self::around(engine, source, sink, genesis, config)
     }
-}
 
-impl<F, S, K> Driver<F, S, K>
-where
-    F: Fold + Clone,
-    S: Source<Event = F::Event>,
-    K: SnapshotSink<F>,
-{
+    #[cfg_attr(verus_keep_ghost, verus_spec(r =>
+        ensures
+            r matches Ok(d) ==> d.wf() && d.synced() && engine_config.valid()
+                && d.engine@ == Engine::<F>::fresh(fview::<F>(&fold), engine_config)
+                && fview::<F>(&d.initial) == fview::<F>(&fold)
+                && (floor_ok(sink_offered::<K>(&sink), d.engine@) ==> d.durable_ok()),
+            r matches Err(e) ==> !engine_config.valid() || horizon_refused(e, driver_config.start_block),
+    ))]
     fn build(
         fold: F,
         source: S,
@@ -280,6 +327,13 @@ where
         engine_config: EngineConfig,
         driver_config: DriverConfig,
     ) -> Result<Self, ConfigError> {
+        #[cfg(verus_keep_ghost)]
+        proof! {
+            assert forall|b: F| #[trigger] call_ensures(F::clone, (&fold,), b) implies fview::<F>(&b)
+                == fview::<F>(&fold) by {
+                axiom_clone_preserves_fview::<F>(fold, b);
+            }
+        }
         let initial = fold.clone();
         let engine = Engine::new(fold, engine_config)?;
         Self::around(engine, source, sink, initial, driver_config)
@@ -289,6 +343,27 @@ where
     ///
     /// A sink whose durable cursor leads the engine, such as a store holding a snapshot
     /// under a fresh engine, is reset so it never reports that stale point.
+    #[cfg_attr(verus_keep_ghost, verus_spec(r =>
+        requires
+            engine.wf(),
+        ensures
+            r matches Ok(d) ==> {
+                &&& d.wf()
+                &&& d.synced()
+                &&& d.engine == engine
+                &&& d.source == source
+                &&& d.initial == initial
+                &&& d.config == driver_config
+                &&& d.batch@.ends.len() == 0 && d.batch@.boundary is None
+                &&& d.last_checkpoint_block is None && d.last_snapshot_block is None
+                &&& !d.durability_lost && !d.caught_up && d.consecutive_errors == 0
+                // A4 reading: T6b holds when the sink was reset, else when it offered
+                // nothing past the engine's state.
+                &&& d.sink == sink || sink_offered::<K>(&d.sink) == Set::<Position>::empty()
+                &&& floor_ok(sink_offered::<K>(&sink), engine@) ==> d.durable_ok()
+            },
+            r matches Err(e) ==> horizon_refused(e, driver_config.start_block),
+    ))]
     fn around(
         engine: Engine<F>,
         source: S,
@@ -327,7 +402,14 @@ where
             seen_resets,
         })
     }
+}
 
+impl<F, S, K> Driver<F, S, K>
+where
+    F: Fold + Clone,
+    S: Source<Event = F::Event>,
+    K: SnapshotSink<F>,
+{
     /// Borrows the durability sink.
     #[cfg_attr(verus_keep_ghost, verus_verify)]
     pub fn sink(&self) -> &K {
@@ -351,11 +433,29 @@ where
     }
 
     /// Manual recovery access: rollback out of Halted or Poisoned, then keep ticking.
+    #[cfg_attr(verus_keep_ghost, verus_spec(r =>
+        ensures
+            r@ == old(self).engine_view(),
+            old(self).wf() ==> r.wf(),
+            // The driver keeps only its own half of `wf`: the engine's, synced and
+            // durable_ok are the caller's to restore; `step` reconciles an unseen reset.
+            final(self).engine_view() == final(r)@,
+            old(self).wf() && final(r).wf() ==> final(self).wf(),
+            old(self).synced() ==> (final(self).synced() <==> final(r)@.resets == r@.resets),
+            old(self).durable_ok() && final(r)@ == r@ ==> final(self).durable_ok(),
+    ))]
     pub fn engine_mut(&mut self) -> &mut Engine<F> {
         &mut self.engine
     }
 
     /// Mutable access to the underlying event source.
+    #[cfg_attr(verus_keep_ghost, verus_spec(
+        ensures
+            final(self).engine_view() == old(self).engine_view(),
+            old(self).wf() ==> final(self).wf(),
+            old(self).synced() ==> final(self).synced(),
+            old(self).durable_ok() ==> final(self).durable_ok(),
+    ))]
     pub fn source_mut(&mut self) -> &mut S {
         &mut self.source
     }
@@ -367,6 +467,18 @@ where
     }
 
     /// Runs the interval-based checkpoint rule.
+    #[cfg_attr(verus_keep_ghost, verus_spec(
+        requires
+            old(self).wf(),
+        ensures
+            final(self).wf(),
+            old(self).durable_ok() ==> final(self).durable_ok(),
+            if checkpoint_due(*old(self)) {
+                checkpoint_ran(*old(self), *final(self))
+            } else {
+                *final(self) == *old(self)
+            },
+    ))]
     fn auto_checkpoint(&mut self) {
         let Some(interval) = self.config.checkpoint_interval else {
             return;
@@ -380,14 +492,59 @@ where
     }
 
     /// Stores a checkpoint and records the block it was taken at.
+    #[cfg_attr(verus_keep_ghost, verus_spec(
+        requires
+            old(self).wf(),
+        ensures
+            final(self).wf(),
+            old(self).durable_ok() ==> final(self).durable_ok(),
+            checkpoint_ran(*old(self), *final(self)),
+    ))]
     fn run_checkpoint(&mut self) {
         self.engine.checkpoint();
+        #[cfg(verus_keep_ghost)]
+        proof! {
+            let (pre, post) = (old(self).engine@, self.engine@);
+            if pre.status is Active && pre.slots.len() > 0 {
+                // A live slot below the new one was live one index up before.
+                assert forall|k: int| #[trigger] post.live_at(k) && k + 1 < post.slots.len() implies pre.live_at(k + 1) by {
+                    assert(post.slots[k] == pre.slots[k + 1]);
+                }
+            }
+        }
         if let Some(cursor) = self.engine.cursor() {
             self.last_checkpoint_block = Some(cursor.block);
         }
     }
 
     /// Runs the interval-based snapshot rule; returns the overriding tick, if any.
+    #[cfg_attr(verus_keep_ghost, verus_spec(r =>
+        requires
+            old(self).wf(),
+        ensures
+            final(self).wf(),
+            old(self).durable_ok() ==> final(self).durable_ok(),
+            if snapshot_due(*old(self)) {
+                let p = old(self).engine@.durable_point().unwrap();
+                &&& forall|q: Position|
+                    #[trigger] sink_offered::<K>(&final(self).sink).contains(q)
+                        ==> sink_offered::<K>(&old(self).sink).contains(q) || q == p
+                &&& match r {
+                    None => *final(self) == (Driver {
+                        sink: final(self).sink,
+                        last_snapshot_block: Some(p.block),
+                        ..*old(self)
+                    }),
+                    Some(t) => t == Tick::DurabilityLost && *final(self) == (Driver {
+                        sink: final(self).sink,
+                        durability_lost: true,
+                        ..*old(self)
+                    }),
+                }
+            } else {
+                r is None && *final(self) == *old(self)
+            },
+    ))]
     fn offer_snapshot(&mut self) -> Option<Tick> {
         if self.durability_lost {
             return None;
@@ -396,6 +553,15 @@ where
         let point = self.engine.durable_point()?;
         if !due(self.last_snapshot_block, point.block, interval) {
             return None;
+        }
+        #[cfg(verus_keep_ghost)]
+        proof! {
+            // The offered point is the oldest live slot's cursor: at or below the cursor
+            // and, by slot monotonicity, every live slot.
+            let v = self.engine@;
+            self.engine.lemma_wf();
+            self.engine.lemma_durable_point_le_cursor();
+            crate::verus::model::lemma_oldest_live_from(v, 0);
         }
         match self.sink.offer(&self.engine) {
             Ok(()) => {
@@ -435,12 +601,56 @@ where
     }
 
     /// Rolls back to the newest checkpoint at or below the ancestor, else escalates.
+    #[cfg_attr(verus_keep_ghost, verus_spec(r =>
+        requires
+            old(self).wf(),
+            old(self).synced(),
+        ensures
+            final(self).wf(),
+            final(self).synced(),
+            old(self).durable_ok() ==> final(self).durable_ok(),
+            r matches Tick::RolledBack { to } ==> rolled_back(*old(self), *final(self), ancestor, to),
+            r is Resynced ==> resynced(*old(self), *final(self)),
+            r is Terminal ==> *final(self) == (Driver { engine: final(self).engine, ..*old(self) })
+                && final(self).engine@ == (EngineView { status: final(self).engine@.status, ..old(self).engine@ }),
+            // The ladder: rollback, else resync or HorizonExceeded when no live slot
+            // qualifies; an Unrecoverable engine stays so.
+            r is RolledBack || old(self).engine@.status is Unrecoverable && r matches Tick::Terminal(
+                EngineStatus::Unrecoverable { .. },
+            ) || (forall|j: int|
+                !(#[trigger] old(self).engine@.live_at(j) && qualifies(old(self).engine@.slots[j].unwrap(), ancestor)))
+                && exists|h: ReplayHorizon| #[trigger] ladder_tail(old(self).config.start_block, h, r),
+    ))]
     #[cold]
     fn roll_back_to(&mut self, ancestor: u64) -> Tick {
         match self.engine.rollback_at_or_below(ancestor) {
             Ok(to) => {
                 self.caught_up = false;
                 self.clamp_marks(to);
+                #[cfg(verus_keep_ghost)]
+                proof! {
+                    let (pre, post) = (old(self).engine@, self.engine@);
+                    assert forall|j: int| #[trigger] post.live_at(j) implies pre.live_at(j) by {
+                        let c = post.slots[j].unwrap().cursor;
+                        if let Some(c) = c {
+                            let i = choose|i: int| 0 <= i < post.ring.len() && #[trigger] post.ring[i].number == c.block;
+                            assert(pre.ring[i] == post.ring[i]);
+                        }
+                    }
+                    assert(*self == (Driver {
+                        engine: self.engine,
+                        caught_up: false,
+                        last_checkpoint_block: clamp_spec(old(self).last_checkpoint_block, to),
+                        last_snapshot_block: clamp_spec(old(self).last_snapshot_block, to),
+                        ..*old(self)
+                    }));
+                    assert(exists|k: int| #[trigger] pre.rollback_target(ancestor, k) && to == pre.slots[k].unwrap().cursor);
+                    assert(post.cursor == to);
+                    assert(post.ring == pre.ring.subrange(0, post.ring.len() as int));
+                    assert(forall|init: int, log: Seq<(Position, F::Event)>|
+                        #[trigger] pre.inv::<F, F::Event, F::Error>(init, log) ==> post.inv::<F, F::Event, F::Error>(init, upto::<F::Event>(log, to)));
+                    assert(rolled_back(*old(self), *self, ancestor, to));
+                }
                 Tick::RolledBack { to }
             }
             Err(RollbackError::NoCheckpointAtOrBelow { .. }) => self.resync_or_terminal(),
@@ -651,6 +861,42 @@ where
     }
 
     /// Bisects the observed ring for the deepest still-canonical block, then rolls back.
+    // T4c: a RolledBack restore sits at or below a ring block some probe's view confirmed.
+    #[cfg_attr(verus_keep_ghost, verus_spec(r =>
+        requires
+            old(self).wf(),
+            old(self).synced(),
+        ensures
+            ({
+                let (from, hist) = (
+                    sview_log::<S>(&old(self).source).len() as int,
+                    sview_log::<S>(&final(self).source),
+                );
+                let mid = Driver { source: final(self).source, ..*old(self) };
+                let ring = old(self).engine@.ring;
+                &&& final(self).wf()
+                &&& final(self).synced()
+                &&& old(self).durable_ok() ==> final(self).durable_ok()
+                &&& from <= hist.len()
+                &&& hist.subrange(0, from) == sview_log::<S>(&old(self).source)
+                &&& forall|k: int| from <= k < hist.len() ==> a1::<S, S::Event>(#[trigger] hist[k])
+                &&& r matches Tick::RolledBack { to } ==> exists|lo: int, k: int|
+                    0 < lo <= ring.len() && from <= k < hist.len() && #[trigger] probe_held(ring, lo, hist[k])
+                        && rolled_back(mid, *final(self), ring[lo - 1].number, to)
+                &&& r is Resynced ==> resynced(mid, *final(self))
+                &&& r is Terminal ==> *final(self) == (Driver { engine: final(self).engine, ..mid })
+                    && final(self).engine@ == (EngineView { status: final(self).engine@.status, ..old(self).engine@ })
+                &&& r is SourceError ==> *final(self) == (Driver {
+                    consecutive_errors: if old(self).consecutive_errors < u32::MAX {
+                        (old(self).consecutive_errors + 1) as u32
+                    } else {
+                        u32::MAX
+                    },
+                    ..mid
+                })
+                &&& r is RolledBack || r is Resynced || r is Terminal || r is SourceError
+            }),
+    ))]
     #[cold]
     fn recover_via_bisection(&mut self) -> Tick {
         let ring = self.engine.ring();
@@ -658,7 +904,25 @@ where
             Ok(0) => self.resync_or_terminal(),
             Ok(lo) => {
                 let ancestor = ring.get(lo - 1).number;
-                self.roll_back_to(ancestor)
+                let tick = self.roll_back_to(ancestor);
+                #[cfg(verus_keep_ghost)]
+                proof! {
+                    let (from, hist) = (
+                        sview_log::<S>(&old(self).source).len() as int,
+                        sview_log::<S>(&self.source),
+                    );
+                    let ring = old(self).engine@.ring;
+                    if let Tick::RolledBack { to } = tick {
+                        let k = choose|k: int| from <= k < hist.len() && #[trigger] confirms(hist[k], ring[lo - 1])
+                            && (ring_chain(ring) ==> forall|i: int|
+                            0 <= i < lo && hist[k].contains_key(#[trigger] ring[i].number)
+                                ==> hist[k][ring[i].number] == ring[i]) && (ring_chain(ring)
+                            && down_closed(hist[k]) ==> forall|i: int|
+                            0 <= i < lo ==> confirms(hist[k], #[trigger] ring[i]));
+                        assert(probe_held(ring, lo as int, hist[k]));
+                    }
+                }
+                tick
             }
             Err(_) => {
                 self.consecutive_errors = self.consecutive_errors.saturating_add(1);
@@ -673,6 +937,18 @@ where
     }
 
     /// Forces a checkpoint now.
+    #[cfg_attr(verus_keep_ghost, verus_spec(
+        requires
+            old(self).wf(),
+        ensures
+            final(self).wf(),
+            final(self).synced() == old(self).synced(),
+            old(self).durable_ok() ==> final(self).durable_ok(),
+            final(self).engine_view() == checkpointed(old(self).engine_view()),
+            forall|init: int, log: Seq<(Position, F::Event)>|
+                #[trigger] old(self).engine_view().inv::<F, F::Event, F::Error>(init, log)
+                    ==> final(self).engine_view().inv::<F, F::Event, F::Error>(init, log),
+    ))]
     pub fn checkpoint(&mut self) {
         self.run_checkpoint();
     }
@@ -2130,6 +2406,103 @@ spec fn resynced<F: Fold, S: Source<Event = F::Event>, K: SnapshotSink<F>>(
     &&& post.engine@.status is Active
     &&& post.engine@.inv::<F, F::Event, F::Error>(fview::<F>(&pre.initial), Seq::empty())
     &&& sink_offered::<K>(&post.sink) == Set::<Position>::empty()
+}
+
+/// `roll_back_to`'s Ok arm: T5b/T5c/T5d restated for the driver, plus the marks clamped
+/// to the restore point `to`.
+spec fn rolled_back<F: Fold, S: Source<Event = F::Event>, K: SnapshotSink<F>>(
+    pre: Driver<F, S, K>,
+    post: Driver<F, S, K>,
+    ancestor: u64,
+    to: Option<Position>,
+) -> bool {
+    let (e, f) = (pre.engine@, post.engine@);
+    &&& post == Driver {
+        engine: post.engine,
+        caught_up: false,
+        last_checkpoint_block: clamp_spec(pre.last_checkpoint_block, to),
+        last_snapshot_block: clamp_spec(pre.last_snapshot_block, to),
+        ..pre
+    }
+    &&& exists|k: int| #[trigger] e.rollback_target(ancestor, k) && to == e.slots[k].unwrap().cursor
+    &&& f.cursor == to
+    &&& f.ring == e.ring.subrange(0, f.ring.len() as int)
+    &&& to is None ==> f.ring.len() == 0
+    &&& to matches Some(c) ==> prefix_at_or_below(e.ring, c.block, f.ring.len() as int)
+    &&& f.status is Active
+    &&& f.resets == e.resets
+    &&& forall|init: int, log: Seq<(Position, F::Event)>|
+        #[trigger] e.inv::<F, F::Event, F::Error>(init, log) ==> f.inv::<F, F::Event, F::Error>(init, upto::<F::Event>(log, to))
+}
+
+pub open spec fn due_spec(last: Option<u64>, block: u64, interval: u64) -> bool {
+    match last {
+        Some(l) => block >= l.saturating_add(interval),
+        None => true,
+    }
+}
+
+/// `Engine::checkpoint`'s view change: the current state becomes the newest slot.
+pub open spec fn checkpointed(pre: EngineView) -> EngineView {
+    if pre.status is Active && pre.slots.len() > 0 {
+        EngineView {
+            slots: pre.slots.drop_first().push(Some(SlotView { fold: pre.fold, cursor: pre.cursor })),
+            ..pre
+        }
+    } else {
+        pre
+    }
+}
+
+/// Construction refused: the source horizon is above the start block.
+pub open spec fn horizon_refused(e: ConfigError, start_block: u64) -> bool {
+    e matches ConfigError::HorizonExceedsStart { start, horizon } && start == start_block && horizon > start
+}
+
+/// `offer_snapshot`'s trigger: not latched, an interval is set, there is a durable point,
+/// and it is due.
+spec fn snapshot_due<F: Fold, S: Source<Event = F::Event>, K: SnapshotSink<F>>(d: Driver<F, S, K>) -> bool {
+    &&& !d.durability_lost
+    &&& match (d.config.snapshot_interval, d.engine@.durable_point()) {
+        (Some(i), Some(p)) => due_spec(d.last_snapshot_block, p.block, i),
+        _ => false,
+    }
+}
+
+/// `auto_checkpoint`'s trigger: an interval is set, there is a cursor, and it is due.
+spec fn checkpoint_due<F: Fold, S: Source<Event = F::Event>, K: SnapshotSink<F>>(d: Driver<F, S, K>) -> bool {
+    match (d.config.checkpoint_interval, d.engine@.cursor) {
+        (Some(i), Some(c)) => due_spec(d.last_checkpoint_block, c.block, i),
+        _ => false,
+    }
+}
+
+/// `run_checkpoint`'s post-state: the engine checkpointed, the mark at the cursor block.
+spec fn checkpoint_ran<F: Fold, S: Source<Event = F::Event>, K: SnapshotSink<F>>(
+    pre: Driver<F, S, K>,
+    post: Driver<F, S, K>,
+) -> bool {
+    &&& post == Driver {
+        engine: post.engine,
+        last_checkpoint_block: match post.engine@.cursor {
+            Some(c) => Some(c.block),
+            None => pre.last_checkpoint_block,
+        },
+        ..pre
+    }
+    &&& post.engine@ == checkpointed(pre.engine@)
+    &&& forall|init: int, log: Seq<(Position, F::Event)>|
+        #[trigger] pre.engine@.inv::<F, F::Event, F::Error>(init, log) ==> post.engine@.inv::<F, F::Event, F::Error>(init, log)
+    &&& forall|a: Seq<Option<BlockRef>>|
+        #[trigger] pre.engine@.anchored(a) ==> post.engine@.anchored(pre.engine@.stored_anchors(a))
+}
+
+/// T4c: view `v` confirmed `ring[lo - 1]`, so under `ring_chain` it holds `ring[..lo]`.
+pub open spec fn probe_held(ring: Seq<BlockRef>, lo: int, v: ChainView) -> bool {
+    &&& confirms(v, ring[lo - 1])
+    &&& ring_chain(ring) ==> forall|i: int|
+        0 <= i < lo && v.contains_key(#[trigger] ring[i].number) ==> v[ring[i].number] == ring[i]
+    &&& ring_chain(ring) && down_closed(v) ==> forall|i: int| 0 <= i < lo ==> confirms(v, #[trigger] ring[i])
 }
 
 /// The ladder below "no qualifying slot": resync iff the horizon `h` covers the start

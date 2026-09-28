@@ -43,9 +43,11 @@ pub trait SnapshotSink<F> {
 }
 
 /// Sink that persists nothing; the default for drivers without durability.
+#[cfg_attr(verus_keep_ghost, verus_verify)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct NoSink;
 
+#[cfg_attr(verus_keep_ghost, verus_verify)]
 impl<F> SnapshotSink<F> for NoSink {
     fn offer(&mut self, _engine: &Engine<F>) -> Result<(), DurabilityLost> {
         Ok(())
@@ -55,7 +57,12 @@ impl<F> SnapshotSink<F> for NoSink {
         None
     }
 
-    fn reset(&mut self) {}
+    fn reset(&mut self) {
+        #[cfg(verus_keep_ghost)]
+        proof! {
+            crate::verus::tcb::axiom_no_sink_offers_nothing(*self);
+        }
+    }
 }
 
 #[cfg(test)]

@@ -16,9 +16,11 @@ use vstd::prelude::*;
 
 use crate::{
     position::Position,
+    sink::NoSink,
     verus::model::{
         fview,
         pos_cmp,
+        sink_offered,
     },
 };
 
@@ -32,6 +34,15 @@ pub proof fn axiom_clone_preserves_fview<F: Clone>(a: F, b: F)
         cloned(a, b),
     ensures
         fview::<F>(&a) == fview::<F>(&b),
+{
+}
+
+// A6: A4 for `NoSink`, which stores nothing, so no offer is ever held. `sink_offered` is
+// uninterpreted, so the unit sink's empty set is stated here.
+#[verifier::external_body]
+pub proof fn axiom_no_sink_offers_nothing(s: NoSink)
+    ensures
+        sink_offered::<NoSink>(&s) == Set::<Position>::empty(),
 {
 }
 
