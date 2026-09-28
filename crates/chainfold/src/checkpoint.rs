@@ -4,7 +4,10 @@ use alloc::vec::Vec;
 use std::vec::Vec;
 
 use crate::{
-    position::Position,
+    position::{
+        Position,
+        pos_gt,
+    },
     ring::BlockRing,
 };
 
@@ -79,11 +82,18 @@ impl<F> CheckpointRing<F> {
             .find(|slot| slot.cursor.is_none_or(|cursor| cursor.block <= block))
     }
 
-    /// Drops slots with cursor block strictly above the argument.
+    /// Drops every slot whose cursor is after the argument, expired slots included, so
+    /// none can come back to life when a later refold re-enters its block.
     #[cold]
-    pub(crate) fn drop_above(&mut self, block: u64) {
-        for slot in &mut self.slots {
-            slot.take_if(|slot| slot.cursor.is_some_and(|cursor| cursor.block > block));
+    pub(crate) fn drop_newer(&mut self, cursor: Option<Position>) {
+        for i in 0..self.slots.len() {
+            let newer = match &self.slots[i] {
+                Some(slot) => pos_gt(slot.cursor, cursor),
+                None => false,
+            };
+            if newer {
+                self.slots[i] = None;
+            }
         }
     }
 

@@ -15,6 +15,18 @@ impl Position {
     }
 }
 
+/// True when `a` is strictly after `b` in the position order, with None before every
+/// position. Spelled out rather than derived so the verifier can state it.
+pub(crate) fn pos_gt(a: Option<Position>, b: Option<Position>) -> bool {
+    match (a, b) {
+        (Some(a), Some(b)) => {
+            a.block > b.block || (a.block == b.block && a.log_index > b.log_index)
+        }
+        (Some(_), None) => true,
+        (None, _) => false,
+    }
+}
+
 /// A block identified by number and hash; the hash commits to the full ancestry.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -27,7 +39,10 @@ pub struct BlockRef {
 
 #[cfg(test)]
 mod tests {
-    use super::Position;
+    use super::{
+        Position,
+        pos_gt,
+    };
 
     #[test]
     fn position_order_is_block_then_log_index() {
@@ -50,5 +65,23 @@ mod tests {
                 Position::new(2, 3),
             ]
         );
+    }
+
+    #[test]
+    fn pos_gt_agrees_with_the_derived_option_order() {
+        // given positions around one block, plus None
+        let points = [
+            None,
+            Some(Position::new(1, 0)),
+            Some(Position::new(1, 1)),
+            Some(Position::new(2, 0)),
+        ];
+        // when every ordered pair is compared
+        // then pos_gt matches Option's derived order, which puts None first
+        for a in points {
+            for b in points {
+                assert_eq!(pos_gt(a, b), a > b, "{a:?} vs {b:?}");
+            }
+        }
     }
 }

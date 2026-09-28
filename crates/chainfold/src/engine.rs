@@ -245,8 +245,8 @@ impl<F: Fold> Engine<F> {
     /// Restores the newest live checkpoint whose cursor block is at or below the argument,
     /// truncating the ring to that cursor.
     ///
-    /// Clears Halted and Poisoned; drops checkpoints above the argument, the fork
-    /// boundary, so checkpoints between it and the restored cursor stay valid.
+    /// Clears Halted and Poisoned and drops checkpoints newer than the restored cursor,
+    /// expired ones included, so no slot outlives the history it was folded from.
     /// Freshness resets to None, since the restored cursor is unverified until the
     /// next boundary check confirms it. Slots whose cursor block has left the observed
     /// window are expired, so NoCheckpointAtOrBelow also names an exhausted window.
@@ -273,7 +273,7 @@ impl<F: Fold> Engine<F> {
         }
         self.status = EngineStatus::Active;
         self.last_verified = None;
-        self.checkpoints.drop_above(block);
+        self.checkpoints.drop_newer(self.cursor);
         Ok(self.cursor)
     }
 
@@ -1273,6 +1273,46 @@ mod tests {
         let point = engine.durable_point();
         // then None while the cursor-less slot is the oldest
         assert_eq!(point, None);
+    }
+
+    #[test]
+    fn expired_slot_stays_dead_after_rollback_to_a_cursorless_slot() {
+        // given a ring of 2, a cursorless slot, and a slot at (1, 1) that expired once
+        // blocks 2 and 3 pushed block 1 out of the ring
+        let mut engine = Engine::new(
+            RecordingFold::default(),
+            EngineConfig {
+                ring_capacity: 2,
+                checkpoint_slots: 2,
+            },
+        )
+        .unwrap();
+        engine.checkpoint();
+        engine
+            .apply_batch(&batch_of(None, vec![(block(1, 0), vec![0, 1])]))
+            .unwrap();
+        engine.checkpoint();
+        engine
+            .apply_batch(&batch_of(Some(block(1, 0)), vec![(block(2, 0), vec![0])]))
+            .unwrap();
+        engine
+            .apply_batch(&batch_of(Some(block(2, 0)), vec![(block(3, 0), vec![0])]))
+            .unwrap();
+        // when rolling back to the cursorless slot, then folding a replacement block 1
+        let to = engine.rollback_at_or_below(2).unwrap();
+        engine
+            .apply_batch(&batch_of(None, vec![(block(1, 1), vec![0])]))
+            .unwrap();
+        engine.checkpoint();
+        // then the expired slot stays dead: the durable point is the new checkpoint,
+        // which holds only the replacement block's event
+        assert_eq!(to, None);
+        assert_eq!(engine.cursor(), Some(Position::new(1, 0)));
+        assert_eq!(engine.durable_point(), engine.cursor());
+        assert_eq!(
+            engine.durable_fold().map(|fold| fold.applied.clone()),
+            Some(vec![(Position::new(1, 0), 0)])
+        );
     }
 
     #[test]
