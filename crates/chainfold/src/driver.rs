@@ -50,6 +50,14 @@ fn due(last: Option<u64>, block: u64, interval: u64) -> bool {
     last.is_none_or(|last| block >= last.saturating_add(interval))
 }
 
+/// Lowers a cadence mark to a restore point; None when either is None.
+fn clamp(mark: Option<u64>, to: Option<Position>) -> Option<u64> {
+    match (mark, to) {
+        (Some(mark), Some(to)) => Some(mark.min(to.block)),
+        _ => None,
+    }
+}
+
 /// Outcome of one driver tick.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tick {
@@ -363,13 +371,12 @@ where
         Tick::DurabilityLost
     }
 
-    /// Lowers the snapshot mark to the restore point so the next offer is not suppressed.
+    /// Lowers both cadence marks to the restore point so neither the next checkpoint nor
+    /// the next offer is suppressed; a cursorless restore clears them.
     #[cold]
-    fn clamp_snapshot_mark(&mut self, to: Option<Position>) {
-        self.last_snapshot_block = self
-            .last_snapshot_block
-            .zip(to)
-            .map(|(last, point)| last.min(point.block));
+    fn clamp_marks(&mut self, to: Option<Position>) {
+        self.last_checkpoint_block = clamp(self.last_checkpoint_block, to);
+        self.last_snapshot_block = clamp(self.last_snapshot_block, to);
     }
 
     /// Rolls back to the newest checkpoint at or below the ancestor, else escalates.
@@ -378,7 +385,7 @@ where
         match self.engine.rollback_at_or_below(ancestor) {
             Ok(to) => {
                 self.caught_up = false;
-                self.clamp_snapshot_mark(to);
+                self.clamp_marks(to);
                 Tick::RolledBack { to }
             }
             Err(RollbackError::NoCheckpointAtOrBelow { .. }) => self.resync_or_terminal(),
@@ -428,8 +435,7 @@ where
     fn reconcile_reset_slow(&mut self, resets: u64) {
         self.seen_resets = resets;
         self.sink.reset();
-        self.last_checkpoint_block = None;
-        self.last_snapshot_block = None;
+        self.clamp_marks(None);
     }
 
     /// Runs one poll-apply step, then records whether the cursor moved forward.
@@ -1875,5 +1881,39 @@ mod tests {
         // then nothing lies above the cursor, and the boundary still verifies
         assert_eq!(outcome, Tick::Idle);
         assert_eq!(driver.engine().cursor(), Some(Position::new(u64::MAX, 0)));
+    }
+
+    #[test]
+    fn rollback_lowers_the_checkpoint_cadence_mark() {
+        // given twenty blocks checkpointed every 4 from block 1: slots at 1, 5, 9, 13, 17
+        let mut driver = new_driver(
+            one_event_chain(20),
+            EngineConfig {
+                ring_capacity: 64,
+                checkpoint_slots: 16,
+            },
+            DriverConfig {
+                checkpoint_interval: Some(4),
+                snapshot_interval: None,
+                ..DriverConfig::from_block(1)
+            },
+        );
+        run_to_idle(&mut driver);
+        assert_eq!(driver.engine().checkpoint_count(), 5);
+        // when blocks 15..=20 are replaced by 15..=24, rolling back to the slot at 13
+        let replacements: Vec<u64> = (1000..1010).collect();
+        reorg_to(driver.source_mut(), 6, &replacements);
+        let outcome = driver.tick();
+        run_to_idle(&mut driver);
+        // then the refold checkpoints at 17' and 21', four and eight blocks past 13
+        assert_eq!(
+            outcome,
+            Tick::RolledBack {
+                to: Some(Position::new(13, 0)),
+            }
+        );
+        assert_eq!(driver.engine().checkpoint_count(), 6);
+        let restored = driver.engine_mut().rollback_at_or_below(18).unwrap();
+        assert_eq!(restored, Some(Position::new(17, 0)));
     }
 }
