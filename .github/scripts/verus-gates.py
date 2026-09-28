@@ -168,6 +168,7 @@ def check(crate: Path) -> list[str]:
                 errors.append(f"{rel}:{line_of(src, m.start())}: trusted `{construct}` outside {TCB}")
 
     out_of_scope = dict(config.get("out-of-scope", {}))
+    used = set()
     for rel in config.get("in-scope", []):
         path = crate / rel
         if not path.is_file():
@@ -175,11 +176,13 @@ def check(crate: Path) -> list[str]:
             continue
         for qual, line, ok in item_fns(strip(path.read_text())):
             key = f"{rel}::{qual}"
-            if out_of_scope.pop(key, None) is not None:
+            # A cfg-split fn (one body per feature) appears twice under one key.
+            if key in out_of_scope:
+                used.add(key)
                 continue
             if not ok:
                 errors.append(f"{rel}:{line}: `{qual}` has no verus_spec/verus_verify and is not out of scope")
-    errors += [f"out-of-scope entry `{key}` matches no fn" for key in out_of_scope]
+    errors += [f"out-of-scope entry `{key}` matches no fn" for key in out_of_scope if key not in used]
     return errors
 
 
