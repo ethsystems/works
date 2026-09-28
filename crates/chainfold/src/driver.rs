@@ -42,7 +42,14 @@ use {
         popped_tail,
         pushed_block,
     },
-    crate::verus::model::BatchView,
+    crate::verus::model::{
+        BatchView,
+        EngineView,
+        fview,
+        opt_le,
+        sink_offered,
+    },
+    crate::verus::tcb::axiom_clone_preserves_fview,
     vstd::prelude::*,
 };
 
@@ -56,6 +63,13 @@ const DEFAULT_BACKOFF_MAX: Duration = Duration::from_secs(30);
 const DEFAULT_CHECKPOINT_INTERVAL: u64 = 64;
 
 /// True when `block` has reached the next interval step past the last marked block.
+#[cfg_attr(verus_keep_ghost, verus_spec(r =>
+    ensures
+        r == match last {
+            Some(l) => block >= l.saturating_add(interval),
+            None => true,
+        },
+))]
 fn due(last: Option<u64>, block: u64, interval: u64) -> bool {
     match last {
         Some(last) => block >= last.saturating_add(interval),
@@ -64,6 +78,7 @@ fn due(last: Option<u64>, block: u64, interval: u64) -> bool {
 }
 
 /// Lowers a cadence mark to a restore point; None when either is None.
+#[cfg_attr(verus_keep_ghost, verus_spec(r => ensures r == clamp_spec(mark, to)))]
 fn clamp(mark: Option<u64>, to: Option<Position>) -> Option<u64> {
     match (mark, to) {
         (Some(mark), Some(to)) => Some(mark.min(to.block)),
@@ -72,6 +87,7 @@ fn clamp(mark: Option<u64>, to: Option<Position>) -> Option<u64> {
 }
 
 /// Outcome of one driver tick.
+#[cfg_attr(verus_keep_ghost, verus_verify)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tick {
     /// Batch applied; the summary counts what the fold saw.
@@ -94,6 +110,7 @@ pub enum Tick {
 }
 
 /// Point-in-time snapshot of driver and engine state for external observers.
+#[cfg_attr(verus_keep_ghost, verus_verify)]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct DriverStatus {
     /// Most recently applied position.
@@ -118,12 +135,14 @@ pub struct DriverStatus {
 
 impl DriverStatus {
     /// True once the engine can no longer make automated progress.
+    #[cfg_attr(verus_keep_ghost, verus_spec(r => ensures r == !(self.engine is Active)))]
     pub fn is_terminal(&self) -> bool {
         !self.engine.is_active()
     }
 }
 
 /// Poll cadence, backoff, and recovery tuning for a driver.
+#[cfg_attr(verus_keep_ghost, verus_verify)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DriverConfig {
     /// Fold genesis; resync feasibility is judged against this block.
@@ -166,6 +185,7 @@ impl DriverConfig {
 }
 
 /// Poll loop over one source: owns cadence, backoff, scanning, and fork recovery.
+#[cfg_attr(verus_keep_ghost, verus_verify)]
 pub struct Driver<F, S, K = NoSink>
 where
     F: Fold,
@@ -309,16 +329,23 @@ where
     }
 
     /// Borrows the durability sink.
+    #[cfg_attr(verus_keep_ghost, verus_verify)]
     pub fn sink(&self) -> &K {
         &self.sink
     }
 
     /// Consumes the driver, returning the sink for joining or inspection.
+    #[cfg_attr(verus_keep_ghost, verus_verify)]
     pub fn into_sink(self) -> K {
         self.sink
     }
 
     /// Borrows the underlying engine.
+    #[cfg_attr(verus_keep_ghost, verus_spec(r =>
+        ensures
+            r@ == self.engine_view(),
+            self.wf() ==> r.wf(),
+    ))]
     pub fn engine(&self) -> &Engine<F> {
         &self.engine
     }
@@ -334,6 +361,7 @@ where
     }
 
     /// True once the most recent poll returned no new blocks.
+    #[cfg_attr(verus_keep_ghost, verus_verify)]
     pub fn is_caught_up(&self) -> bool {
         self.caught_up
     }
@@ -379,6 +407,11 @@ where
     }
 
     /// Latches the sink refusal so no further offer runs; folding continues unpersisted.
+    #[cfg_attr(verus_keep_ghost, verus_spec(r =>
+        ensures
+            r == Tick::DurabilityLost,
+            *final(self) == (Driver { durability_lost: true, ..*old(self) }),
+    ))]
     #[cold]
     fn lose_durability(&mut self) -> Tick {
         self.durability_lost = true;
@@ -387,6 +420,14 @@ where
 
     /// Lowers both cadence marks to the restore point so neither the next checkpoint nor
     /// the next offer is suppressed; a cursorless restore clears them.
+    #[cfg_attr(verus_keep_ghost, verus_spec(
+        ensures
+            *final(self) == (Driver {
+                last_checkpoint_block: clamp_spec(old(self).last_checkpoint_block, to),
+                last_snapshot_block: clamp_spec(old(self).last_snapshot_block, to),
+                ..*old(self)
+            }),
+    ))]
     #[cold]
     fn clamp_marks(&mut self, to: Option<Position>) {
         self.last_checkpoint_block = clamp(self.last_checkpoint_block, to);
@@ -411,9 +452,24 @@ where
 
     /// Resyncs from genesis when the source horizon still covers the start block,
     /// otherwise marks the engine unrecoverable with the horizon shortfall.
+    // The ladder's last two rungs, over the `horizon()` value `h` read here.
+    #[cfg_attr(verus_keep_ghost, verus_spec(r =>
+        requires
+            old(self).wf(),
+            old(self).synced(),
+        ensures
+            final(self).wf(),
+            final(self).synced(),
+            old(self).durable_ok() ==> final(self).durable_ok(),
+            exists|h: ReplayHorizon| #[trigger] ladder_tail(old(self).config.start_block, h, r),
+            r is Resynced ==> resynced(*old(self), *final(self)),
+            r is Terminal ==> *final(self) == (Driver { engine: final(self).engine, ..*old(self) })
+                && final(self).engine@ == (EngineView { status: final(self).engine@.status, ..old(self).engine@ }),
+    ))]
     #[cold]
     fn resync_or_terminal(&mut self) -> Tick {
-        match self.source.horizon() {
+        let horizon = self.source.horizon();
+        let tick = match horizon {
             // The same shortfall `around` rejects at construction, reached at runtime.
             ReplayHorizon::FromBlock(horizon) if horizon > self.config.start_block => {
                 self.engine
@@ -421,14 +477,41 @@ where
                         needed: self.config.start_block,
                         horizon,
                     });
+                #[cfg(verus_keep_ghost)]
+                proof! {
+                    assert forall|k: int| #[trigger] self.engine@.live_at(k) implies old(self).engine@.live_at(k) by {}
+                }
                 Tick::Terminal(self.engine.status())
             }
             _ => self.resync(),
+        };
+        #[cfg(verus_keep_ghost)]
+        proof! {
+            assert(ladder_tail(old(self).config.start_block, horizon, tick));
         }
+        tick
     }
 
+    #[cfg_attr(verus_keep_ghost, verus_spec(r =>
+        requires
+            old(self).wf(),
+            old(self).synced(),
+        ensures
+            final(self).wf(),
+            final(self).durable_ok(),
+            r == Tick::Resynced,
+            resynced(*old(self), *final(self)),
+    ))]
     #[cold]
     fn resync(&mut self) -> Tick {
+        #[cfg(verus_keep_ghost)]
+        proof! {
+            assert forall|b: F| #[trigger] call_ensures(F::clone, (&self.initial,), b) implies fview::<F>(
+                &b,
+            ) == fview::<F>(&self.initial) by {
+                axiom_clone_preserves_fview::<F>(self.initial, b);
+            }
+        }
         self.engine.reset(self.initial.clone());
         self.caught_up = false;
         self.consecutive_errors = 0;
@@ -438,6 +521,14 @@ where
 
     /// Catches up with an engine reset this driver has not seen: resets the sink so
     /// its durable cursor drops to None, and clears the cadence marks.
+    #[cfg_attr(verus_keep_ghost, verus_spec(
+        ensures
+            final(self).synced(),
+            old(self).synced() ==> *final(self) == *old(self),
+            !old(self).synced() ==> reconciled(*old(self), *final(self)),
+            old(self).durable_ok() ==> final(self).durable_ok(),
+            old(self).wf() ==> final(self).wf(),
+    ))]
     fn reconcile_reset(&mut self) {
         let resets = self.engine.resets();
         if resets != self.seen_resets {
@@ -445,6 +536,17 @@ where
         }
     }
 
+    #[cfg_attr(verus_keep_ghost, verus_spec(
+        ensures
+            *final(self) == (Driver {
+                seen_resets: resets,
+                sink: final(self).sink,
+                last_checkpoint_block: None,
+                last_snapshot_block: None,
+                ..*old(self)
+            }),
+            sink_offered::<K>(&final(self).sink) == Set::<Position>::empty(),
+    ))]
     #[cold]
     fn reconcile_reset_slow(&mut self, resets: u64) {
         self.seen_resets = resets;
@@ -576,6 +678,12 @@ where
     }
 
     /// Snapshots the current driver and engine state.
+    // T6b: the reported durable cursor never leads the cursor.
+    #[cfg_attr(verus_keep_ghost, verus_spec(r =>
+        ensures
+            r.cursor == self.engine_view().cursor,
+            self.durable_ok() ==> opt_le(r.durable_cursor, r.cursor),
+    ))]
     pub fn status(&self) -> DriverStatus {
         DriverStatus {
             cursor: self.engine.cursor(),
@@ -631,6 +739,8 @@ where
         final(entries)@.len() == 0,
         final(batch)@.triples().to_multiset() == old(entries)@.to_multiset(),
 ))]
+// `loop` + `match`, not `while let`: Verus keeps no facts after a `while let` loop.
+#[allow(clippy::while_let_loop)]
 fn group_into<E>(batch: &mut Batch<E>, entries: &mut Vec<(BlockRef, u32, E)>) {
     // `MAX - x` reverses each key lane, so the sort is descending without `Reverse`.
     entries.sort_unstable_by_key(|e| (u64::MAX - e.0.number, u32::MAX - e.1));
@@ -1984,6 +2094,96 @@ mod tests {
 
 #[cfg(verus_keep_ghost)]
 verus! {
+
+pub open spec fn clamp_spec(mark: Option<u64>, to: Option<Position>) -> Option<u64> {
+    match (mark, to) {
+        (Some(m), Some(t)) => Some(if m <= t.block { m } else { t.block }),
+        _ => None,
+    }
+}
+
+/// T6b floor: every offered point is at or below the cursor and every live slot's cursor.
+pub open spec fn floor_ok(off: Set<Position>, e: EngineView) -> bool {
+    forall|p: Position|
+        #[trigger] off.contains(p) ==> opt_le(Some(p), e.cursor) && forall|k: int|
+            #[trigger] e.live_at(k) ==> opt_le(Some(p), e.slots[k].unwrap().cursor)
+}
+
+/// `resync`'s post-state: a fresh engine on `initial`, a reset sink, cleared marks.
+spec fn resynced<F: Fold, S: Source<Event = F::Event>, K: SnapshotSink<F>>(
+    pre: Driver<F, S, K>,
+    post: Driver<F, S, K>,
+) -> bool {
+    &&& post == Driver {
+        engine: post.engine,
+        sink: post.sink,
+        caught_up: false,
+        consecutive_errors: 0,
+        seen_resets: post.engine@.resets,
+        last_checkpoint_block: None,
+        last_snapshot_block: None,
+        ..pre
+    }
+    &&& post.engine@.fold == fview::<F>(&pre.initial)
+    &&& post.engine@.cursor is None
+    &&& post.engine@.ring.len() == 0
+    &&& post.engine@.status is Active
+    &&& post.engine@.inv::<F, F::Event, F::Error>(fview::<F>(&pre.initial), Seq::empty())
+    &&& sink_offered::<K>(&post.sink) == Set::<Position>::empty()
+}
+
+/// The ladder below "no qualifying slot": resync iff the horizon `h` covers the start
+/// block, else `Unrecoverable { HorizonExceeded }` naming `h`.
+pub open spec fn ladder_tail(start: u64, h: ReplayHorizon, r: Tick) -> bool {
+    match h {
+        ReplayHorizon::FromBlock(hb) => if hb > start {
+            r == Tick::Terminal(
+                EngineStatus::Unrecoverable {
+                    cause: DivergenceCause::HorizonExceeded { needed: start, horizon: hb },
+                },
+            )
+        } else {
+            r == Tick::Resynced
+        },
+        ReplayHorizon::Genesis => r == Tick::Resynced,
+    }
+}
+
+/// `reconcile_reset` took the slow path: the sink was reset and the marks cleared.
+spec fn reconciled<F: Fold, S: Source<Event = F::Event>, K: SnapshotSink<F>>(
+    pre: Driver<F, S, K>,
+    post: Driver<F, S, K>,
+) -> bool {
+    &&& post == Driver {
+        seen_resets: pre.engine@.resets,
+        sink: post.sink,
+        last_checkpoint_block: None,
+        last_snapshot_block: None,
+        ..pre
+    }
+    &&& sink_offered::<K>(&post.sink) == Set::<Position>::empty()
+}
+
+impl<F: Fold, S: Source<Event = F::Event>, K: SnapshotSink<F>> Driver<F, S, K> {
+    pub closed spec fn wf(&self) -> bool {
+        self.engine.wf() && self.batch@.wf()
+    }
+
+    pub closed spec fn engine_view(&self) -> EngineView {
+        self.engine@
+    }
+
+    /// The driver has seen every engine reset.
+    pub closed spec fn synced(&self) -> bool {
+        self.seen_resets == self.engine@.resets
+    }
+
+    /// T6b, threaded through every method: while synced, the sink offered nothing past
+    /// the engine's cursor or any live slot.
+    pub closed spec fn durable_ok(&self) -> bool {
+        self.synced() ==> floor_ok(sink_offered::<K>(&self.sink), self.engine@)
+    }
+}
 
 /// Spans below the pushed one keep their entries.
 proof fn lemma_triples_upto_kept<E>(pre: BatchView<E>, post: BatchView<E>, block: BlockRef, m: int)
