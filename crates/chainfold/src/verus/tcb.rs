@@ -139,4 +139,30 @@ impl<'a, E> vstd::std_specs::iter::IteratorSpecImpl for crate::batch::Spans<'a, 
     }
 }
 
+// A6: asserts nothing, as for `Spans`. `Observed` opts out of vstd's iterator laws; the
+// sequence it yields is `Observed@`, which `BlockRing::iter`/`iter_at_or_below` fix.
+impl<'a> vstd::std_specs::iter::IteratorSpecImpl for crate::ring::Observed<'a> {
+    open spec fn obeys_prophetic_iter_laws(&self) -> bool {
+        false
+    }
+
+    #[verifier::prophetic]
+    open spec fn remaining(&self) -> Seq<Self::Item> {
+        Seq::empty()
+    }
+
+    #[verifier::prophetic]
+    open spec fn will_return_none(&self) -> bool {
+        false
+    }
+
+    open spec fn decrease(&self) -> Option<nat> {
+        None
+    }
+
+    open spec fn peek(&self, index: int) -> Option<Self::Item> {
+        None
+    }
+}
+
 } // verus!

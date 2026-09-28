@@ -721,25 +721,43 @@ impl<'a> View for Observed<'a> {
     }
 }
 
+impl<'a> Observed<'a> {
+    /// Holds between field writes in `next` (it lowers `remaining` first), so it is a
+    /// type invariant.
+    #[verifier::type_invariant]
+    spec fn inv(&self) -> bool {
+        &&& self.ring.wf()
+        &&& self.next + self.remaining <= self.ring@.len()
+    }
+}
+
 } // verus!
 
-// `next` and `size_hint` implement std's `Iterator`, which Verus verifies only through
-// vstd's prophetic `IteratorSpecImpl`; the yielded sequence is `Observed@`, fixed by
-// `iter` and `iter_at_or_below`.
+// The yielded sequence is `Observed@`, fixed by `iter` and `iter_at_or_below`. tcb.rs opts
+// `Observed` out of vstd's iterator laws, so this verifies panic- and overflow-free only.
+#[cfg_attr(verus_keep_ghost, cfg_eval, verus_verify)]
 impl<'a> Iterator for Observed<'a> {
     type Item = BlockRef;
 
     fn next(&mut self) -> Option<Self::Item> {
+        #[cfg(verus_keep_ghost)]
+        proof! {
+            use_type_invariant(&*self);
+        }
         if self.remaining == 0 {
             return None;
         }
         let block = self.ring.get(self.next);
-        self.next += 1;
         self.remaining -= 1;
+        self.next += 1;
         Some(block)
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
+        #[cfg(verus_keep_ghost)]
+        proof! {
+            use_type_invariant(self);
+        }
         (self.remaining, Some(self.remaining))
     }
 }

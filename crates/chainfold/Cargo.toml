@@ -75,10 +75,6 @@ in-scope = ["src/ring.rs", "src/position.rs", "src/batch.rs", "src/checkpoint.rs
 
 [package.metadata.verus-gates.out-of-scope]
 "src/batch.rs::BatchShapeError::fmt" = "Display (plan section 5)"
-# std `Iterator` impl: verifying it needs an `IteratorSpecImpl`, which gate (a) treats as
-# trusted. The sequence it yields is `Observed@`, which `iter`/`iter_at_or_below` fix.
-"src/ring.rs::Observed::next" = "std Iterator impl, yields Observed@"
-"src/ring.rs::Observed::size_hint" = "std Iterator impl, yields Observed@"
 "src/engine.rs::Engine::fold_mut" = "A3: returns &mut F, edits must keep fview"
 "src/engine.rs::Engine::apply_batch" = "P5"
 "src/engine.rs::Engine::apply_span" = "P5"
