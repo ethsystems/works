@@ -454,4 +454,21 @@ impl<E> BatchView<E> {
     }
 }
 
+/// `BlockRing::push` (T4a): append `b`, evicting the oldest entry when `r` holds `w`.
+pub open spec fn ring_push(r: Seq<BlockRef>, w: int, b: BlockRef) -> Seq<BlockRef> {
+    if r.len() < w {
+        r.push(b)
+    } else {
+        r.drop_first().push(b)
+    }
+}
+
+/// `k` is the length of `r`'s prefix numbered at or below `n`; with `ring_ascending(r)`
+/// it is unique (T4a `truncate_above`/`iter_at_or_below`, T5c `ring|<=t.block`).
+pub open spec fn prefix_at_or_below(r: Seq<BlockRef>, n: u64, k: int) -> bool {
+    &&& 0 <= k <= r.len()
+    &&& forall|i: int| 0 <= i < k ==> #[trigger] r[i].number <= n
+    &&& forall|i: int| k <= i < r.len() ==> #[trigger] r[i].number > n
+}
+
 } // verus!

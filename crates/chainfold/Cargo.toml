@@ -74,21 +74,10 @@ verify = true
 in-scope = ["src/ring.rs"]
 
 [package.metadata.verus-gates.out-of-scope]
-"src/ring.rs::is_power_of_two" = "P4"
-"src/ring.rs::BlockRing::with_capacity" = "P4"
-"src/ring.rs::BlockRing::push" = "P4"
-"src/ring.rs::BlockRing::newest_number" = "P4"
-"src/ring.rs::BlockRing::get" = "P4"
-"src/ring.rs::BlockRing::hash_at" = "P4"
-"src/ring.rs::BlockRing::index_of" = "P4"
-"src/ring.rs::BlockRing::truncate_above" = "P4"
-"src/ring.rs::BlockRing::clear" = "P4"
-"src/ring.rs::BlockRing::iter" = "P4"
-"src/ring.rs::BlockRing::iter_at_or_below" = "P4"
-"src/ring.rs::BlockRing::observes" = "P4"
-"src/ring.rs::BlockRing::canonical_prefix" = "P4"
-"src/ring.rs::Observed::next" = "P4"
-"src/ring.rs::Observed::size_hint" = "P4"
+# std `Iterator` impl: verifying it needs an `IteratorSpecImpl`, which gate (a) treats as
+# trusted. The sequence it yields is `Observed@`, which `iter`/`iter_at_or_below` fix.
+"src/ring.rs::Observed::next" = "std Iterator impl, yields Observed@"
+"src/ring.rs::Observed::size_hint" = "std Iterator impl, yields Observed@"
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = [

@@ -10,14 +10,30 @@ use std::{
 };
 
 #[cfg(verus_keep_ghost)]
-use vstd::{
-    arithmetic::power2::{
-        lemma_pow2_pos,
-        lemma_pow2_unfold,
-        lemma2_to64,
-        pow2,
+use {
+    crate::verus::model::{
+        observes,
+        prefix_at_or_below,
+        ring_push,
     },
-    prelude::*,
+    vstd::{
+        arithmetic::{
+            logarithm::{
+                lemma_log_is_ordered,
+                lemma_log_nonnegative,
+                lemma_log_pow,
+                log,
+            },
+            power2::{
+                lemma_pow2,
+                lemma_pow2_pos,
+                lemma_pow2_unfold,
+                lemma2_to64,
+                pow2,
+            },
+        },
+        prelude::*,
+    },
 };
 
 use crate::{
@@ -26,12 +42,16 @@ use crate::{
 };
 
 /// True when `n` is a power of two; spelled out rather than std's so the verifier can state it.
+#[cfg_attr(verus_keep_ghost, verus_spec(r =>
+    ensures
+        r == (n != 0 && n & ((n - 1) as usize) == 0),
+))]
 pub(crate) const fn is_power_of_two(n: usize) -> bool {
     n != 0 && n & (n - 1) == 0
 }
 
 /// Bounded history of observed blocks, structure of arrays, power-of-two capacity.
-// Clone gets its spec with the ring proofs (P4); until then clones are unconstrained.
+// Only tests clone a ring, so the derived Clone stays unconstrained.
 #[cfg_attr(
     verus_keep_ghost,
     verus_verify,
@@ -60,14 +80,53 @@ proof fn lemma_mask_is_mod(x: usize, w: usize)
 {
 }
 
+/// Below `2w`, masking with `w - 1` wraps at most once.
+proof fn lemma_mask_wraps(x: usize, w: usize)
+    by (bit_vector)
+    requires
+        w != 0,
+        w & ((w - 1) as usize) == 0,
+        w <= 0x10_0000,
+        x < w + w,
+    ensures
+        x & ((w - 1) as usize) == if x < w {
+            x
+        } else {
+            (x - w) as usize
+        },
+{
+}
+
+/// `floor(log2 n) + 1` bounds `p` when `2^(p-1) <= n` (the bisection probe bound).
+proof fn lemma_probe_bound(p: nat, n: int)
+    requires
+        p > 0 ==> pow2((p - 1) as nat) <= n,
+        n >= 0,
+    ensures
+        p <= log(2, n) + 1,
+{
+    lemma_log_nonnegative(2, n);
+    if p > 0 {
+        let e = (p - 1) as nat;
+        lemma_pow2(e);
+        lemma_log_pow(2, e);
+        lemma_log_is_ordered(2, pow2(e) as int, n);
+        assert(log(2, pow2(e) as int) == e);
+    }
+}
+
 impl BlockRing {
     pub(crate) closed spec fn cap(&self) -> int {
         self.numbers@.len() as int
     }
 
-    /// Physical slot of a logical (oldest-first) index.
+    /// Physical slot of a logical (oldest-first) index below the capacity.
     spec fn slot(&self, logical: int) -> int {
-        (self.head + logical) % self.cap()
+        if self.head + logical < self.cap() {
+            self.head + logical
+        } else {
+            self.head + logical - self.cap()
+        }
     }
 
     /// Well-formedness: power-of-two capacity within the engine's bounds, and
@@ -84,6 +143,27 @@ impl BlockRing {
     }
 }
 
+impl BlockRing {
+    /// Ascending numbers name at most one entry.
+    proof fn lemma_index_unique(&self, k: int)
+        requires
+            self.wf(),
+            0 <= k < self@.len(),
+        ensures
+            forall|i: int|
+                0 <= i < self@.len() && #[trigger] self@[i].number == self@[k].number ==> i == k,
+    {
+        assert forall|i: int|
+            0 <= i < self@.len() && #[trigger] self@[i].number == self@[k].number implies i == k by {
+            if i < k {
+                assert(self@[i].number < self@[k].number);
+            } else if k < i {
+                assert(self@[k].number < self@[i].number);
+            }
+        }
+    }
+}
+
 impl View for BlockRing {
     type V = Seq<BlockRef>;
 
@@ -97,8 +177,18 @@ impl View for BlockRing {
 
 } // verus!
 
+#[cfg_attr(verus_keep_ghost, cfg_eval, verus_verify)]
 impl BlockRing {
     /// Capacity must be a power of two; enforced by EngineConfig validation.
+    #[cfg_attr(verus_keep_ghost, verus_spec(r =>
+        requires
+            2 <= capacity <= 0x10_0000,
+            capacity & ((capacity - 1) as usize) == 0,
+        ensures
+            r.wf(),
+            r.cap() == capacity,
+            r@.len() == 0,
+    ))]
     pub(crate) fn with_capacity(capacity: usize) -> Self {
         debug_assert!(
             is_power_of_two(capacity),
@@ -130,28 +220,63 @@ impl BlockRing {
     fn physical(&self, logical: usize) -> usize {
         #[cfg(verus_keep_ghost)]
         proof! {
-            lemma_mask_is_mod((self.head + logical) as usize, self.cap() as usize);
+            lemma_mask_wraps((self.head + logical) as usize, self.cap() as usize);
         }
         (self.head + logical) & (self.capacity() - 1)
     }
 
     /// Pushes a block with number strictly above the newest; overwrites the oldest when full.
+    #[cfg_attr(verus_keep_ghost, verus_spec(
+        requires
+            old(self).wf(),
+            old(self)@.len() == 0 || old(self)@.last().number < block.number,
+        ensures
+            final(self).wf(),
+            final(self).cap() == old(self).cap(),
+            final(self)@ == ring_push(old(self)@, old(self).cap(), block),
+    ))]
     pub(crate) fn push(&mut self, block: BlockRef) {
+        #[cfg(verus_keep_ghost)]
+        proof_decl! {
+            let ghost pre = self@;
+        }
         let capacity = self.capacity();
         if self.len < capacity {
             let index = self.physical(self.len);
             self.numbers[index] = block.number;
             self.hashes[index] = block.hash;
             self.len += 1;
+            #[cfg(verus_keep_ghost)]
+            proof! {
+                assert(self@ =~= pre.push(block));
+            }
         } else {
             let index = self.head;
             self.numbers[index] = block.number;
             self.hashes[index] = block.hash;
+            #[cfg(verus_keep_ghost)]
+            proof! {
+                lemma_mask_wraps((self.head + 1) as usize, capacity);
+            }
             self.head = (self.head + 1) & (capacity - 1);
+            #[cfg(verus_keep_ghost)]
+            proof! {
+                assert(self@ =~= pre.drop_first().push(block));
+            }
         }
     }
 
     /// Number of the newest entry, without reading the hash lane.
+    #[cfg_attr(verus_keep_ghost, verus_spec(r =>
+        requires
+            self.wf(),
+        ensures
+            r == if self@.len() == 0 {
+                None
+            } else {
+                Some(self@.last().number)
+            },
+    ))]
     #[inline]
     pub(crate) fn newest_number(&self) -> Option<u64> {
         let newest = self.len.checked_sub(1)?;
@@ -159,6 +284,13 @@ impl BlockRing {
     }
 
     /// Oldest-first access; index must be below len.
+    #[cfg_attr(verus_keep_ghost, verus_spec(r =>
+        requires
+            self.wf(),
+            index < self@.len(),
+        ensures
+            r == self@[index as int],
+    ))]
     #[inline]
     pub(crate) fn get(&self, index: usize) -> BlockRef {
         let physical = self.physical(index);
@@ -169,6 +301,15 @@ impl BlockRing {
     }
 
     /// Hash for an exact number if still observed.
+    #[cfg_attr(verus_keep_ghost, verus_spec(r =>
+        requires
+            self.wf(),
+        ensures
+            r is Some <==> observes(self@, number),
+            forall|i: int|
+                0 <= i < self@.len() && #[trigger] self@[i].number == number
+                    ==> r == Some(self@[i].hash),
+    ))]
     pub(crate) fn hash_at(&self, number: u64) -> Option<[u8; 32]> {
         let logical = self.index_of(number)?;
         Some(self.hashes[self.physical(logical)])
@@ -178,14 +319,39 @@ impl BlockRing {
     ///
     /// Numbers ascend by at least one per entry, so the tip-relative guess is the
     /// highest index the number can sit at; a gapped chain falls back to the search.
+    #[cfg_attr(verus_keep_ghost, verus_spec(r =>
+        requires
+            self.wf(),
+        ensures
+            match r {
+                Some(i) => i < self@.len() && self@[i as int].number == number,
+                None => !observes(self@, number),
+            },
+            forall|i: int|
+                0 <= i < self@.len() && #[trigger] self@[i].number == number
+                    ==> r == Some(i as usize),
+    ))]
     fn index_of(&self, number: u64) -> Option<usize> {
         let newest = self.len.checked_sub(1)?;
+        #[cfg(verus_keep_ghost)]
+        proof! {
+            assert forall|i: int| 0 <= i < self@.len() implies #[trigger] self@[i].number
+                <= self@[newest as int].number by {
+                if i < newest {
+                    assert(self@[i].number < self@[newest as int].number);
+                }
+            }
+        }
         let behind = self.numbers[self.physical(newest)].checked_sub(number)?;
         let guess = match usize::try_from(behind) {
             Ok(behind) if behind <= newest => newest - behind,
             _ => 0,
         };
         if self.numbers[self.physical(guess)] == number {
+            #[cfg(verus_keep_ghost)]
+            proof! {
+                self.lemma_index_unique(guess as int);
+            }
             return Some(guess);
         }
         let logical = self.index_at_or_below(number)?;
@@ -197,14 +363,31 @@ impl BlockRing {
     }
 
     /// Drops entries with a number strictly above the argument.
+    #[cfg_attr(verus_keep_ghost, verus_spec(
+        requires
+            old(self).wf(),
+        ensures
+            final(self).wf(),
+            final(self).cap() == old(self).cap(),
+            prefix_at_or_below(old(self)@, number, final(self)@.len() as int),
+            final(self)@ == old(self)@.subrange(0, final(self)@.len() as int),
+    ))]
     #[cold]
     pub(crate) fn truncate_above(&mut self, number: u64) {
+        #[cfg(verus_keep_ghost)]
+        proof_decl! {
+            let ghost pre = self@;
+        }
         self.len = match self.index_at_or_below(number) {
             Some(logical) => logical + 1,
             None => 0,
         };
         if self.len == 0 {
             self.head = 0;
+        }
+        #[cfg(verus_keep_ghost)]
+        proof! {
+            assert(self@ =~= pre.subrange(0, self.len as int));
         }
     }
 
@@ -218,10 +401,21 @@ impl BlockRing {
                 Some(i) => i < self.len && self@[i as int].number <= number
                     && forall|j: int| i < j < self.len ==> #[trigger] self@[j].number > number,
             },
+            prefix_at_or_below(self@, number, match r {
+                Some(i) => i + 1,
+                None => 0,
+            }),
     ))]
     fn index_at_or_below(&self, number: u64) -> Option<usize> {
         let newest = self.len.checked_sub(1)?;
         if self.numbers[self.physical(newest)] <= number {
+            #[cfg(verus_keep_ghost)]
+            proof! {
+                assert forall|i: int| 0 <= i < newest implies #[trigger] self@[i].number
+                    <= number by {
+                    assert(self@[i].number < self@[newest as int].number);
+                }
+            }
             return Some(newest);
         }
         let mut low = 0usize;
@@ -275,6 +469,13 @@ impl BlockRing {
                 probes = probes + 1;
             }
         }
+        // T4b: the loop ran at most floor(log2 len) + 1 times.
+        #[cfg(verus_keep_ghost)]
+        proof! {
+            lemma_probe_bound(probes, newest as int);
+            lemma_log_is_ordered(2, newest as int, self.len as int);
+            assert(probes <= log(2, self.len as int) + 1);
+        }
         if self.numbers[self.physical(low)] <= number {
             Some(low)
         } else {
@@ -283,11 +484,29 @@ impl BlockRing {
     }
 
     /// Empties the ring, keeping the allocation; stale slots stay unreachable below len.
+    #[cfg_attr(verus_keep_ghost, verus_spec(
+        requires
+            old(self).wf(),
+        ensures
+            final(self).wf(),
+            final(self).cap() == old(self).cap(),
+            final(self)@ == Seq::<BlockRef>::empty(),
+    ))]
     pub(crate) fn clear(&mut self) {
         self.head = 0;
         self.len = 0;
+        #[cfg(verus_keep_ghost)]
+        proof! {
+            assert(self@ =~= Seq::<BlockRef>::empty());
+        }
     }
 
+    #[cfg_attr(verus_keep_ghost, verus_spec(r =>
+        requires
+            self.wf(),
+        ensures
+            r@ == self@,
+    ))]
     pub(crate) fn iter(&self) -> Observed<'_> {
         Observed {
             ring: self,
@@ -297,6 +516,13 @@ impl BlockRing {
     }
 
     /// Oldest-first iterator over the entries at or below the argument.
+    #[cfg_attr(verus_keep_ghost, verus_spec(r =>
+        requires
+            self.wf(),
+        ensures
+            prefix_at_or_below(self@, number, r@.len() as int),
+            r@ == self@.subrange(0, r@.len() as int),
+    ))]
     #[cfg(any(feature = "wincode", test))]
     pub(crate) fn iter_at_or_below(&self, number: u64) -> Observed<'_> {
         Observed {
@@ -310,6 +536,12 @@ impl BlockRing {
     }
 
     /// True when the exact number is still observed.
+    #[cfg_attr(verus_keep_ghost, verus_spec(r =>
+        requires
+            self.wf(),
+        ensures
+            r == observes(self@, number),
+    ))]
     pub(crate) fn observes(&self, number: u64) -> bool {
         self.index_of(number).is_some()
     }
@@ -317,12 +549,24 @@ impl BlockRing {
     /// Bisects for the length of the oldest-first prefix the source still confirms, so
     /// entry `lo - 1` is the deepest canonical block and 0 means none is. At most
     /// `floor(log2 len) + 1` `header_at` calls; a source error is returned as is.
+    #[cfg_attr(verus_keep_ghost, verus_spec(r =>
+        requires
+            self.wf(),
+        ensures
+            r matches Ok(lo) ==> lo <= self@.len(),
+    ))]
     pub(crate) fn canonical_prefix<S: Source>(
         &self,
         source: &mut S,
     ) -> Result<usize, S::Error> {
         let mut lo = 0usize;
         let mut hi = self.len;
+        #[cfg_attr(verus_keep_ghost, verus_spec(
+            invariant
+                self.wf(),
+                lo <= hi <= self.len,
+            decreases hi - lo,
+        ))]
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
             let physical = self.physical(mid);
@@ -341,12 +585,30 @@ impl BlockRing {
 }
 
 /// Oldest-first iterator over observed blocks.
+#[cfg_attr(verus_keep_ghost, verus_verify)]
 pub struct Observed<'a> {
     ring: &'a BlockRing,
     next: usize,
     remaining: usize,
 }
 
+#[cfg(verus_keep_ghost)]
+verus! {
+
+impl<'a> View for Observed<'a> {
+    type V = Seq<BlockRef>;
+
+    /// The blocks still to come, oldest first.
+    closed spec fn view(&self) -> Seq<BlockRef> {
+        self.ring@.subrange(self.next as int, self.next + self.remaining)
+    }
+}
+
+} // verus!
+
+// `next` and `size_hint` implement std's `Iterator`, which Verus verifies only through
+// vstd's prophetic `IteratorSpecImpl`; the yielded sequence is `Observed@`, fixed by
+// `iter` and `iter_at_or_below`.
 impl<'a> Iterator for Observed<'a> {
     type Item = BlockRef;
 
