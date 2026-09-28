@@ -28,23 +28,61 @@ use crate::{
 };
 #[cfg(verus_keep_ghost)]
 use {
+    crate::batch::{
+        lemma_end_bounds,
+        lemma_flat_upto,
+    },
     crate::verus::{
         model::{
+            BatchView,
             EngineView,
             SlotView,
+            accepted,
+            applied,
+            calls,
+            checked_freshness,
+            count_le,
+            cursor_after,
+            fold,
+            forked,
             fview,
+            lemma_applied_all,
+            lemma_applied_concat,
+            lemma_applied_extend,
+            lemma_applied_prefix,
+            lemma_applied_stop,
+            lemma_count_le,
+            lemma_flat_prefix,
+            lemma_newer_add,
+            lemma_newer_sorted,
+            lemma_newer_split,
             lemma_opt_lt_order,
+            lemma_ring_ext_from,
+            lemma_ring_ext_push,
+            lemma_run_concat,
+            lemma_run_push,
             lemma_upto,
+            lemma_upto_append,
             lemma_upto_upto,
             live_count,
             lt,
             lt_sorted,
+            newer,
+            ok_calls,
             opt_le,
             opt_lt,
             prefix_at_or_below,
             qualifies,
+            ring_after,
+            ring_ext,
+            ring_push,
+            run,
+            span_refs,
+            split_at_tip,
+            stopped,
             upto,
         },
+
         tcb::axiom_clone_preserves_fview,
     },
     vstd::prelude::*,
@@ -309,16 +347,98 @@ impl<F: Fold> Engine<F> {
     }
 
     /// Applies one poll's batch: total order, dedup, boundary recheck, fork detection.
+    #[cfg_attr(verus_keep_ghost, verus_spec(r =>
+        requires
+            old(self).wf(),
+            batch@.wf(),
+        ensures
+            final(self).wf(),
+            final(self).window() == old(self).window(),
+            // T3a: a rejection changes nothing but the checked freshness.
+            r matches Err(e) && !(e is Halted || e is Poisoned) ==> !accepted(old(self)@, batch@)
+                && final(self)@ == (EngineView {
+                last_verified: checked_freshness(old(self)@, batch@),
+                ..old(self)@
+            }),
+            // T3e: unreachable under wf.
+            !(r matches Err(ApplyError::CursorBlockUnobserved { .. })),
+            r is Ok ==> accepted(old(self)@, batch@) && final(self)@.status == old(self)@.status,
+            accepted(old(self)@, batch@) ==> (r is Ok <==> !stopped::<F, F::Event, F::Error>(
+                old(self)@,
+                batch@,
+            )),
+            r matches Err(e) ==> ((e is Halted || e is Poisoned) ==> accepted(old(self)@, batch@)
+                && stopped::<F, F::Event, F::Error>(old(self)@, batch@) && stops_at(
+                e,
+                final(self)@.status,
+                calls::<F, F::Event, F::Error>(old(self)@, batch@).last().0,
+            )),
+            // T3b, T3f: the fold ran on `calls`, and the counts split the batch.
+            final(self)@.fold == fold::<F, F::Event, F::Error>(
+                old(self)@.fold,
+                calls::<F, F::Event, F::Error>(old(self)@, batch@),
+            ),
+            r matches Ok(s) ==> s.deduped == batch@.flat().len() - newer(
+                old(self)@.cursor,
+                batch@.flat(),
+            ).len() && s.applied + s.skipped == newer(old(self)@.cursor, batch@.flat()).len(),
+            // T3e: cursor and ring.
+            final(self)@.cursor == cursor_after(
+                old(self)@.cursor,
+                ok_calls::<F, F::Event, F::Error>(old(self)@, batch@),
+            ),
+            accepted(old(self)@, batch@) ==> ring_after(
+                old(self)@,
+                final(self)@,
+                batch@,
+                old(self).window(),
+            ),
+            final(self)@.slots == old(self)@.slots,
+            final(self)@.resets == old(self)@.resets,
+            old(self)@.status is Unrecoverable ==> final(self)@.status == old(self)@.status,
+            // T3d: after Ok nothing of the batch is newer than the cursor.
+            r is Ok ==> newer(final(self)@.cursor, batch@.flat()).len() == 0,
+            // T5a/T5d threading.
+            forall|init: int, log: Seq<(Position, F::Event)>|
+                #[trigger] old(self)@.inv::<F, F::Event, F::Error>(init, log) ==> final(self)@.inv::<F, F::Event, F::Error>(init, log + calls::<F, F::Event, F::Error>(old(self)@, batch@)),
+            forall|a: Seq<Option<BlockRef>>|
+                #[trigger] old(self)@.anchored(a) ==> final(self)@.anchored(a),
+    ))]
+    #[cfg_attr(verus_keep_ghost, verifier::spinoff_prover)]
+    #[cfg_attr(verus_keep_ghost, verifier::rlimit(50))]
     pub fn apply_batch(
         &mut self,
         batch: &Batch<F::Event>,
     ) -> Result<ApplySummary, ApplyError<F::Error>> {
+        #[cfg(verus_keep_ghost)]
+        proof_decl! {
+            let ghost v0 = self@;
+            let ghost bv = batch@;
+            let ghost w = self.window();
+            let ghost i0: int = match v0.cursor {
+                None => 0,
+                Some(c) => count_le(bv.blocks, c.block),
+            };
+        }
+        #[cfg(verus_keep_ghost)]
+        proof! {
+            self.lemma_wf();
+            self.ring.lemma_wf();
+            lemma_rejected::<F>(v0, v0, bv);
+        }
         if !self.status.is_active() {
             return Err(ApplyError::NotActive {
                 status: self.status,
             });
         }
-        batch.validate().map_err(ApplyError::Shape)?;
+        if let Err(shape) = batch.validate() {
+            return Err(ApplyError::Shape(shape));
+        }
+        #[cfg(verus_keep_ghost)]
+        proof! {
+            lemma_count_le(bv.blocks, match v0.cursor { None => 0, Some(c) => c.block });
+            assert(split_at_tip(bv, v0.cursor, i0));
+        }
 
         if let Some(cursor) = self.cursor {
             let boundary = batch.boundary.ok_or(ApplyError::MissingBoundary)?;
@@ -328,21 +448,97 @@ impl<F: Fold> Engine<F> {
                     got: boundary.number,
                 });
             }
+            #[cfg(verus_keep_ghost)]
+            proof! {
+                assert(self@.ring[self@.ring.len() - 1].number == cursor.block);
+            }
             let observed_hash = self.ring.hash_at(cursor.block).ok_or(
                 ApplyError::CursorBlockUnobserved {
                     block: cursor.block,
                 },
             )?;
+            #[cfg(verus_keep_ghost)]
+            proof! {
+                assert(observed_hash == self@.ring[self@.ring.len() - 1].hash);
+            }
             if observed_hash != boundary.hash {
                 return Err(fork_suspected(cursor.block, observed_hash, boundary));
             }
+            #[cfg(verus_keep_ghost)]
+            proof! {
+                broadcast use vstd::array::group_array_axioms;
+                assert(observed_hash == boundary.hash);
+                assert(boundary.number == v0.ring.last().number);
+                assert(boundary.hash == v0.ring.last().hash);
+                assert(boundary == v0.ring.last());
+            }
             self.last_verified = Some(boundary);
         }
+        #[cfg(verus_keep_ghost)]
+        proof! {
+            assert(self@ == (EngineView { last_verified: checked_freshness(v0, bv), ..v0 }));
+            lemma_rejected::<F>(v0, self@, bv);
+            assert(bv.flat_upto(0).len() == 0);
+            assert(newer(v0.cursor, bv.flat_upto(0)).len() == 0) by {
+                reveal(Seq::filter);
+            }
+            assert(ring_ext(v0.ring, w, span_refs(bv).subrange(i0, i0)) == v0.ring);
+            assert(setup(v0, bv, w, i0)) by {
+                reveal(setup);
+            }
+            assert(loop_state::<F>(v0, bv, w, i0, self@, 0)) by {
+                reveal(loop_state);
+                reveal(tip_state);
+            }
+        }
 
-        let mut summary = ApplySummary::default();
+        let mut summary = ApplySummary {
+            applied: 0,
+            deduped: 0,
+            skipped: 0,
+        };
         let mut start = 0usize;
+        #[cfg_attr(verus_keep_ghost, verus_spec(
+            invariant
+                self.wf(),
+                self.window() == w,
+                w == old(self).window(),
+                batch@ == bv,
+                v0 == old(self)@,
+                bv.wf(),
+                setup(v0, bv, w, i0),
+                v0.cursor is Some ==> bv.boundary == Some(v0.ring.last()),
+                loop_state::<F>(v0, bv, w, i0, self@, i as int),
+                start == bv.start(i as int),
+                forall|k: int, j: int|
+                    #![trigger bv.blocks[k], v0.ring[j]]
+                    0 <= k < i && k < i0 && 0 <= j < v0.ring.len() && v0.ring[j].number
+                        == bv.blocks[k] ==> v0.ring[j].hash == bv.hashes[k],
+                summary.deduped == bv.flat_upto(i as int).len() - newer(
+                    v0.cursor,
+                    bv.flat_upto(i as int),
+                ).len(),
+                summary.applied + summary.skipped == newer(v0.cursor, bv.flat_upto(i as int)).len(),
+                bv.flat_upto(i as int).len() == start,
+        ))]
         for i in 0..batch.span_count() {
+            #[cfg(verus_keep_ghost)]
+            proof! {
+                self.lemma_wf();
+                lemma_end_bounds(bv, i as int);
+                lemma_flat_upto(bv, i as int);
+                lemma_flat_upto(bv, i as int + 1);
+            }
             let span = batch.span(i, start);
+            #[cfg(verus_keep_ghost)]
+            proof_decl! {
+                let ghost pre = self@;
+            }
+            #[cfg(verus_keep_ghost)]
+            proof! {
+                assert(span_seq(span) =~= bv.span_events(i as int));
+                lemma_span_redelivered::<F>(v0, bv, w, i0, pre, i as int);
+            }
             start += span.events.len();
             let redelivered = match self.cursor {
                 Some(cursor) => span.number <= cursor.block,
@@ -351,18 +547,70 @@ impl<F: Fold> Engine<F> {
             if redelivered {
                 match self.ring.hash_at(span.number) {
                     Some(observed_hash) if &observed_hash != span.hash => {
+                        #[cfg(verus_keep_ghost)]
+                        proof! {
+                            let j = choose|j: int|
+                                0 <= j < v0.ring.len() && #[trigger] v0.ring[j].number == bv.blocks[i as int];
+                            assert(v0.ring[j].hash != bv.hashes[i as int]);
+                            assert(forked(v0, bv));
+                            lemma_rejected::<F>(v0, self@, bv);
+                        }
                         return Err(fork_suspected(
                             span.number,
                             observed_hash,
                             span.block(),
                         ));
                     }
-                    _ => {}
+                    _ => {
+                        #[cfg(verus_keep_ghost)]
+                        proof! {
+                            broadcast use vstd::array::group_array_axioms;
+                            assert forall|j: int|
+                                0 <= j < v0.ring.len() && #[trigger] v0.ring[j].number == bv.blocks[i as int]
+                                    implies v0.ring[j].hash == bv.hashes[i as int] by {
+                                assert(self.ring@[j].number == span.number);
+                            }
+                        }
+                    }
                 }
             }
-            self.apply_span(&span, &mut summary)?;
+            #[cfg(verus_keep_ghost)]
+            proof! {
+                lemma_span_indices(v0, bv, w, i0, i as int, span.log_indices@);
+            }
+            let applied = self.apply_span(&span, &mut summary);
+            #[cfg(verus_keep_ghost)]
+            proof! {
+                lemma_span_newer::<F>(v0, bv, w, i0, pre, i as int);
+                if applied is Ok {
+                    lemma_span_ok::<F>(v0, bv, w, i0, pre, self@, i as int);
+                } else {
+                    lemma_span_stop::<F>(v0, bv, w, i0, pre, self@, i as int);
+                }
+            }
+            match applied {
+                Ok(()) => {}
+                Err(e) => {
+                    #[cfg(verus_keep_ghost)]
+                    proof! {
+                        reveal(setup);
+                        reveal(stop_state);
+                        let k = if tip_state(v0, bv, w, i0, self@, i as int) { i as int } else { i as int + 1 };
+                        lemma_not_forked(v0, bv, w, i0, i as int + 1);
+                        lemma_apply_post::<F>(v0, bv, w, i0, self@, k);
+                    }
+                    return Err(e);
+                }
+            }
         }
-
+        #[cfg(verus_keep_ghost)]
+        proof! {
+            let n = bv.ends.len() as int;
+            reveal(setup);
+            lemma_not_forked(v0, bv, w, i0, n);
+            lemma_loop_done::<F>(v0, bv, w, i0, self@);
+            lemma_apply_post::<F>(v0, bv, w, i0, self@, n);
+        }
         Ok(summary)
     }
 
@@ -450,6 +698,8 @@ impl<F: Fold> Engine<F> {
             r matches Err(RollbackError::NoCheckpointAtOrBelow { .. }) ==> forall|j: int|
                 !(#[trigger] old(self)@.live_at(j) && qualifies(old(self)@.slots[j].unwrap(), block)),
             r matches Err(RollbackError::Unrecoverable { .. }) ==> old(self)@.status is Unrecoverable,
+            // Unrecoverable is left only by `reset`: rollback refuses it.
+            old(self)@.status is Unrecoverable ==> r is Err,
             // T5b: the target is the newest stored qualifying live slot, whose cursor is the
             // maximum over them; T5c: the post-state.
             r matches Ok(t) ==> exists|k: int|
@@ -613,18 +863,69 @@ impl<F: Fold> Engine<F> {
     }
 
     /// Applies every event of one span, deduping positions at or below the cursor.
+    #[cfg_attr(verus_keep_ghost, verus_spec(r =>
+        requires
+            old(self).wf(),
+            old(self)@.status is Active,
+            span.log_indices@.len() == span.events@.len(),
+            forall|j: int, k: int|
+                0 <= j < k < span.log_indices@.len() ==> span.log_indices@[j] < span.log_indices@[k],
+            old(summary).deduped + old(summary).applied + old(summary).skipped + span.events@.len()
+                <= usize::MAX,
+        ensures
+            final(self).wf(),
+            final(self).window() == old(self).window(),
+            span_post::<F>(
+                old(self)@,
+                final(self)@,
+                old(self).window(),
+                span_seq(*span),
+                BlockRef { number: span.number, hash: *span.hash },
+                r is Ok,
+            ),
+            r matches Err(e) ==> stops_at(
+                e,
+                final(self)@.status,
+                applied::<F, F::Event, F::Error>(
+                    old(self)@.fold,
+                    newer(old(self)@.cursor, span_seq(*span)),
+                ).last().0,
+            ),
+            r is Ok ==> final(summary).deduped == old(summary).deduped + span.events@.len() - newer(
+                old(self)@.cursor,
+                span_seq(*span),
+            ).len(),
+            r is Ok ==> final(summary).applied + final(summary).skipped == old(summary).applied
+                + old(summary).skipped + newer(old(self)@.cursor, span_seq(*span)).len(),
+    ))]
     fn apply_span(
         &mut self,
         span: &SpanView<'_, F::Event>,
         summary: &mut ApplySummary,
     ) -> Result<(), ApplyError<F::Error>> {
         let number = span.number;
+        #[cfg(verus_keep_ghost)]
+        proof_decl! {
+            let ghost pre = self@;
+            let ghost sq = span_seq(*span);
+            let ghost p = newer(pre.cursor, sq);
+        }
         let deduped = match self.cursor {
             Some(cursor) if number > cursor.block => 0,
             Some(cursor) if number < cursor.block => span.log_indices.len(),
             Some(cursor) => count_at_or_below(span.log_indices, cursor.log_index),
             None => 0,
         };
+        #[cfg(verus_keep_ghost)]
+        proof! {
+            assert forall|k: int| 0 <= k < deduped implies !opt_lt(pre.cursor, Some(#[trigger] sq[k].0)) by {
+                assert(sq[k].0.log_index == span.log_indices@[k] as u64);
+            }
+            assert forall|k: int| deduped <= k < sq.len() implies opt_lt(pre.cursor, Some(#[trigger] sq[k].0)) by {
+                assert(sq[k].0.log_index == span.log_indices@[k] as u64);
+            }
+            lemma_newer_split(pre.cursor, sq, deduped as int);
+        }
         summary.deduped += deduped as u64;
         let (indices, events) = if deduped == 0 {
             (span.log_indices, span.events)
@@ -634,8 +935,24 @@ impl<F: Fold> Engine<F> {
                 span.events.split_at(deduped).1,
             )
         };
+        #[cfg(verus_keep_ghost)]
+        proof! {
+            assert(indices@ =~= span.log_indices@.subrange(deduped as int, sq.len() as int));
+            assert(events@ =~= span.events@.subrange(deduped as int, sq.len() as int));
+            assert forall|k: int| 0 <= k < p.len() implies #[trigger] p[k] == (
+                Position { block: number, log_index: indices@[k] as u64 },
+                events@[k],
+            ) && opt_lt(pre.cursor, Some(p[k].0)) by {
+                assert(p[k] == sq[deduped + k]);
+            }
+        }
         let len = indices.len();
         if len == 0 {
+            #[cfg(verus_keep_ghost)]
+            proof! {
+                assert(p.len() == 0);
+                assert(self@ == pre);
+            }
             return Ok(());
         }
         // lanes are equal length by construction, so the paired walk drops no event
@@ -645,8 +962,40 @@ impl<F: Fold> Engine<F> {
             events.len()
         };
 
+        #[cfg_attr(verus_keep_ghost, verus_spec(
+            invariant
+                self.wf(),
+                self.window() == old(self).window(),
+                pre == old(self)@,
+                self@ == (EngineView { fold: self@.fold, skips: self@.skips, ..pre }),
+                paired == len,
+                len == indices@.len(),
+                len == events@.len(),
+                len == p.len(),
+                p == newer(pre.cursor, span_seq(*span)),
+                forall|k: int|
+                    0 <= k < p.len() ==> #[trigger] p[k] == (
+                        Position { block: number, log_index: indices@[k] as u64 },
+                        events@[k],
+                    ) && opt_lt(pre.cursor, Some(p[k].0)),
+                run::<F, F::Event, F::Error>((pre.fold, false), p.subrange(0, offset as int))
+                    == (self@.fold, false),
+                number == span.number,
+                deduped + len == span.events@.len(),
+                summary.deduped == old(summary).deduped + deduped,
+                summary.applied + summary.skipped == old(summary).applied + old(summary).skipped
+                    + offset,
+                old(summary).deduped + old(summary).applied + old(summary).skipped
+                    + span.events@.len() <= usize::MAX,
+        ))]
         for offset in 0..paired {
             let at = span_pos(number, indices[offset]);
+            #[cfg(verus_keep_ghost)]
+            proof! {
+                let head = p.subrange(0, offset as int);
+                assert(p.subrange(0, offset + 1) =~= head.push(p[offset as int]));
+                lemma_run_push::<F, F::Event, F::Error>((pre.fold, false), head, p[offset as int]);
+            }
             match self.fold.apply(at, &events[offset]) {
                 Ok(()) => summary.applied += 1,
                 Err(FoldError::Skip(_)) => {
@@ -654,14 +1003,27 @@ impl<F: Fold> Engine<F> {
                     summary.skipped += 1;
                 }
                 Err(FoldError::Halt(error)) => {
+                    #[cfg(verus_keep_ghost)]
+                    proof! {
+                        lemma_applied_stop::<F, F::Event, F::Error>(pre.fold, p, offset as int);
+                    }
                     self.consumed_through(span, indices, offset);
                     return Err(self.halt(at, error));
                 }
                 Err(FoldError::Poison(error)) => {
+                    #[cfg(verus_keep_ghost)]
+                    proof! {
+                        lemma_applied_stop::<F, F::Event, F::Error>(pre.fold, p, offset as int);
+                    }
                     self.consumed_through(span, indices, offset);
                     return Err(self.poison(at, error));
                 }
             }
+        }
+        #[cfg(verus_keep_ghost)]
+        proof! {
+            assert(p.subrange(0, len as int) =~= p);
+            lemma_applied_all::<F, F::Event, F::Error>(pre.fold, p);
         }
         self.advance(span.number, span.hash, span_pos(number, indices[len - 1]));
         Ok(())
@@ -669,6 +1031,27 @@ impl<F: Fold> Engine<F> {
 
     /// Places the cursor at the predecessor of `indices[offset]`; a no-op at offset 0,
     /// since nothing in this span was consumed yet.
+    #[cfg_attr(verus_keep_ghost, verus_spec(
+        requires
+            old(self).wf(),
+            0 < offset <= indices@.len() ==> opt_le(
+                old(self)@.cursor,
+                Some(Position { block: span.number, log_index: indices@[offset - 1] as u64 }),
+            ),
+        ensures
+            final(self).wf(),
+            final(self).window() == old(self).window(),
+            final(self)@ == if 0 < offset <= indices@.len() {
+                advanced(
+                    old(self)@,
+                    old(self).window(),
+                    BlockRef { number: span.number, hash: *span.hash },
+                    Position { block: span.number, log_index: indices@[offset - 1] as u64 },
+                )
+            } else {
+                old(self)@
+            },
+    ))]
     #[cold]
     fn consumed_through(
         &mut self,
@@ -676,7 +1059,10 @@ impl<F: Fold> Engine<F> {
         indices: &[u32],
         offset: usize,
     ) {
-        if let Some(log_index) = offset.checked_sub(1).and_then(|i| indices.get(i)) {
+        let Some(i) = offset.checked_sub(1) else {
+            return;
+        };
+        if let Some(log_index) = indices.get(i) {
             let pos = Position::new(span.number, u64::from(*log_index));
             self.advance(span.number, span.hash, pos);
         }
@@ -686,6 +1072,16 @@ impl<F: Fold> Engine<F> {
     ///
     /// Ring and cursor move together, so the ring's newest entry is the cursor block
     /// at every point a batch can return from.
+    #[cfg_attr(verus_keep_ghost, verus_spec(
+        requires
+            old(self).wf(),
+            pos.block == number,
+            opt_le(old(self)@.cursor, Some(pos)),
+        ensures
+            final(self).wf(),
+            final(self).window() == old(self).window(),
+            final(self)@ == advanced(old(self)@, old(self).window(), BlockRef { number, hash: *hash }, pos),
+    ))]
     fn advance(&mut self, number: u64, hash: &[u8; 32], pos: Position) {
         let entered = match self.ring.newest_number() {
             Some(newest) => newest < number,
@@ -700,14 +1096,47 @@ impl<F: Fold> Engine<F> {
             self.last_verified = Some(block);
         }
         self.cursor = Some(pos);
+        #[cfg(verus_keep_ghost)]
+        proof! {
+            self.ring.lemma_wf();
+            let (pre, post) = (old(self)@, self@);
+            if pre.cursor is Some {
+                lemma_opt_lt_order(pre.cursor, pre.cursor, Some(pos));
+            }
+            assert forall|i: int|
+                0 <= i < post.slots.len() && #[trigger] post.slots[i] is Some implies opt_le(
+                post.slots[i].unwrap().cursor,
+                post.cursor,
+            ) by {
+                lemma_opt_lt_order(post.slots[i].unwrap().cursor, pre.cursor, Some(pos));
+            }
+        }
     }
 
+    #[cfg_attr(verus_keep_ghost, verus_spec(r =>
+        requires
+            old(self).wf(),
+        ensures
+            final(self).wf(),
+            final(self).window() == old(self).window(),
+            final(self)@ == (EngineView { status: EngineStatus::Halted { at }, ..old(self)@ }),
+            r == (ApplyError::Halted { at, error }),
+    ))]
     #[cold]
     fn halt(&mut self, at: Position, error: F::Error) -> ApplyError<F::Error> {
         self.status = EngineStatus::Halted { at };
         ApplyError::Halted { at, error }
     }
 
+    #[cfg_attr(verus_keep_ghost, verus_spec(r =>
+        requires
+            old(self).wf(),
+        ensures
+            final(self).wf(),
+            final(self).window() == old(self).window(),
+            final(self)@ == (EngineView { status: EngineStatus::Poisoned { at }, ..old(self)@ }),
+            r == (ApplyError::Poisoned { at, error }),
+    ))]
     #[cold]
     fn poison(&mut self, at: Position, error: F::Error) -> ApplyError<F::Error> {
         self.status = EngineStatus::Poisoned { at };
@@ -716,24 +1145,77 @@ impl<F: Fold> Engine<F> {
 }
 
 /// Position of a span event.
+#[cfg_attr(verus_keep_ghost, verus_spec(r =>
+    ensures
+        r == (Position { block: number, log_index: log_index as u64 }),
+))]
 fn span_pos(number: u64, log_index: u32) -> Position {
     Position::new(number, u64::from(log_index))
 }
 
 /// Count of the leading log indices at or below `bound`; the lane is strictly ascending.
+#[cfg_attr(verus_keep_ghost, verus_spec(r =>
+    requires
+        log_indices@.len() <= usize::MAX,
+        forall|i: int, j: int|
+            0 <= i < j < log_indices@.len() ==> log_indices@[i] < log_indices@[j],
+    ensures
+        r <= log_indices@.len(),
+        forall|k: int| 0 <= k < r ==> #[trigger] log_indices@[k] as u64 <= bound,
+        forall|k: int| r <= k < log_indices@.len() ==> #[trigger] log_indices@[k] as u64 > bound,
+))]
 fn count_at_or_below(log_indices: &[u32], bound: u64) -> usize {
     let mut base = 0usize;
     let mut rest = log_indices;
+    #[cfg_attr(verus_keep_ghost, verus_spec(
+        invariant
+            log_indices@.len() <= usize::MAX,
+            forall|i: int, j: int|
+                0 <= i < j < log_indices@.len() ==> log_indices@[i] < log_indices@[j],
+            base + rest@.len() <= log_indices@.len(),
+            rest@ == log_indices@.subrange(base as int, base + rest@.len()),
+            forall|k: int| 0 <= k < base ==> #[trigger] log_indices@[k] as u64 <= bound,
+            forall|k: int|
+                base + rest@.len() <= k < log_indices@.len() ==> #[trigger] log_indices@[k] as u64 > bound,
+        decreases rest@.len(),
+    ))]
     while rest.len() > 1 {
         // both candidate windows keep len - half entries, as in std's binary search
         let half = rest.len() / 2;
         let high = rest.split_at(half).1;
         let low = rest.split_at(high.len()).0;
+        #[cfg(verus_keep_ghost)]
+        proof! {
+            assert(rest@[half as int] == log_indices@[base + half]);
+        }
         if u64::from(rest[half]) <= bound {
+            #[cfg(verus_keep_ghost)]
+            proof! {
+                assert forall|k: int| 0 <= k < base + half implies #[trigger] log_indices@[k] as u64 <= bound by {
+                    if k >= base {
+                        assert(log_indices@[k] <= log_indices@[base + half]);
+                    }
+                }
+            }
             base += half;
             rest = high;
         } else {
+            #[cfg(verus_keep_ghost)]
+            proof! {
+                assert forall|k: int|
+                    base + low@.len() <= k < log_indices@.len() implies #[trigger] log_indices@[k] as u64 > bound by {
+                    if k < base + rest@.len() {
+                        assert(log_indices@[base + half] <= log_indices@[k]);
+                    }
+                }
+            }
             rest = low;
+        }
+    }
+    #[cfg(verus_keep_ghost)]
+    proof! {
+        if rest@.len() == 1 {
+            assert(rest@[0] == log_indices@[base as int]);
         }
     }
     if rest.len() == 1 && u64::from(rest[0]) <= bound {
@@ -745,6 +1227,13 @@ fn count_at_or_below(log_indices: &[u32], bound: u64) -> usize {
 
 /// Builds the fork report comparing the hash the ring observed for a block against
 /// the refetched header for that same block.
+#[cfg_attr(verus_keep_ghost, verus_spec(r =>
+    ensures
+        r == (ApplyError::<E>::ForkSuspected {
+            observed: BlockRef { number, hash: observed_hash },
+            refetched,
+        }),
+))]
 #[cold]
 fn fork_suspected<E>(
     number: u64,
@@ -1749,6 +2238,8 @@ mod tests {
 
 #[cfg(verus_keep_ghost)]
 verus! {
+broadcast use crate::batch::lemma_batch_view;
+
 impl<F> View for Engine<F> {
     type V = EngineView;
 
@@ -1788,6 +2279,11 @@ impl<F> Engine<F> {
             skips: 0,
             resets: 0,
         }
+    }
+
+    /// Capacity of the observed-block ring (`EngineConfig::ring_capacity`).
+    pub closed spec fn window(&self) -> int {
+        self.ring.cap()
     }
 
     /// Plan `wf(Engine)`: ring and slot representation plus the view-level clauses.
@@ -1861,6 +2357,776 @@ impl<F> Engine<F> {
             }
             self@.lemma_no_live(0);
         }
+    }
+}
+
+/// Events of a span with their positions.
+spec fn span_seq<'a, E>(s: SpanView<'a, E>) -> Seq<(Position, E)> {
+    Seq::new(
+        s.events@.len(),
+        |k: int| (Position { block: s.number, log_index: s.log_indices@[k] as u64 }, s.events@[k]),
+    )
+}
+
+/// `apply_span`'s post-state over the span's entries `s` and header `blk`: the fold runs
+/// on the entries after the cursor through the first stop, and the cursor and ring
+/// follow the entries that consumed their position.
+spec fn span_post<F: Fold>(
+    pre: EngineView,
+    post: EngineView,
+    w: int,
+    s: Seq<(Position, F::Event)>,
+    blk: BlockRef,
+    ok: bool,
+) -> bool {
+    let q = applied::<F, F::Event, F::Error>(pre.fold, newer(pre.cursor, s));
+    let st = run::<F, F::Event, F::Error>((pre.fold, false), q);
+    let done = if st.1 { q.drop_last() } else { q };
+    let entered = done.len() > 0 && (pre.ring.len() == 0 || pre.ring.last().number < blk.number);
+    &&& ok == !st.1
+    &&& post.fold == st.0
+    &&& post.cursor == cursor_after(pre.cursor, done)
+    &&& post.ring == if entered { ring_push(pre.ring, w, blk) } else { pre.ring }
+    &&& post.last_verified == if entered { Some(blk) } else { pre.last_verified }
+    &&& post.slots == pre.slots
+    &&& post.resets == pre.resets
+    &&& ok ==> post.status == pre.status
+    &&& q.len() == 0 ==> post == pre
+}
+
+/// Facts fixed once `apply_batch` has passed its checks; `i0` spans are at or below the
+/// cursor block.
+#[verifier::opaque]
+spec fn setup<E>(v0: EngineView, bv: BatchView<E>, w: int, i0: int) -> bool {
+    &&& v0.wf()
+    &&& bv.wf()
+    &&& bv.shaped()
+    &&& lt_sorted(bv.flat())
+    &&& v0.status is Active
+    &&& 0 < w
+    &&& split_at_tip(bv, v0.cursor, i0)
+}
+
+/// Cursor, ring and freshness after `i` spans: past the old tip the cursor sits on
+/// span `i - 1` and the ring gained spans `i0..i`; below it nothing moved but the cursor
+/// within the tip block.
+#[verifier::opaque]
+spec fn tip_state<E>(v0: EngineView, bv: BatchView<E>, w: int, i0: int, v: EngineView, i: int) -> bool {
+    if i > i0 {
+        &&& v.cursor is Some
+        &&& v.cursor.unwrap().block == bv.blocks[i - 1]
+        &&& v.ring == ring_ext(v0.ring, w, span_refs(bv).subrange(i0, i))
+        &&& v.last_verified == Some(v.ring.last())
+    } else {
+        &&& v.ring == v0.ring
+        &&& v.last_verified == checked_freshness(v0, bv)
+        &&& match v0.cursor {
+            None => v.cursor is None,
+            Some(c) => v.cursor is Some && v.cursor.unwrap().block == c.block,
+        }
+    }
+}
+
+/// `apply_batch`'s loop invariant after `i` spans applied without a stop.
+#[verifier::opaque]
+spec fn loop_state<F: Fold>(
+    v0: EngineView,
+    bv: BatchView<F::Event>,
+    w: int,
+    i0: int,
+    v: EngineView,
+    i: int,
+) -> bool {
+    let g = newer(v0.cursor, bv.flat_upto(i));
+    &&& 0 <= i <= bv.ends.len()
+    &&& run::<F, F::Event, F::Error>((v0.fold, false), g) == (v.fold, false)
+    &&& v.cursor == cursor_after(v0.cursor, g)
+    &&& v.status == v0.status
+    &&& v.slots == v0.slots
+    &&& v.resets == v0.resets
+    &&& g.len() == 0 ==> v == (EngineView { last_verified: v.last_verified, ..v0 })
+    &&& i < i0 ==> g.len() == 0
+    &&& tip_state(v0, bv, w, i0, v, i)
+}
+
+/// The entries `F::apply` runs on when the batch is accepted.
+spec fn run_calls<F: Fold>(v0: EngineView, bv: BatchView<F::Event>) -> Seq<(Position, F::Event)> {
+    applied::<F, F::Event, F::Error>(v0.fold, newer(v0.cursor, bv.flat()))
+}
+
+/// `apply_batch`'s state after span `i` stopped the fold.
+#[verifier::opaque]
+spec fn stop_state<F: Fold>(
+    v0: EngineView,
+    bv: BatchView<F::Event>,
+    w: int,
+    i0: int,
+    pre: EngineView,
+    post: EngineView,
+    i: int,
+) -> bool {
+    let c = run_calls::<F>(v0, bv);
+    let q = applied::<F, F::Event, F::Error>(pre.fold, newer(pre.cursor, bv.span_events(i)));
+    &&& c.len() > 0
+    &&& run::<F, F::Event, F::Error>((v0.fold, false), c).1
+    &&& c.last() == q.last()
+    &&& post.fold == run::<F, F::Event, F::Error>((v0.fold, false), c).0
+    &&& post.cursor == cursor_after(v0.cursor, c.drop_last())
+    &&& i0 <= i + 1
+    &&& tip_state(v0, bv, w, i0, post, i) || tip_state(v0, bv, w, i0, post, i + 1)
+    &&& post.slots == v0.slots
+    &&& post.resets == v0.resets
+}
+
+/// A rejected batch calls the fold zero times, so every threaded clause carries over.
+proof fn lemma_rejected<F: Fold>(v0: EngineView, post: EngineView, bv: BatchView<F::Event>)
+    requires
+        post == (EngineView { last_verified: post.last_verified, ..v0 }),
+    ensures
+        !accepted(v0, bv) ==> {
+            &&& calls::<F, F::Event, F::Error>(v0, bv).len() == 0
+            &&& post.fold == fold::<F, F::Event, F::Error>(v0.fold, calls::<F, F::Event, F::Error>(v0, bv))
+            &&& post.cursor == cursor_after(v0.cursor, ok_calls::<F, F::Event, F::Error>(v0, bv))
+            &&& forall|init: int, log: Seq<(Position, F::Event)>|
+                #[trigger] v0.inv::<F, F::Event, F::Error>(init, log) ==> post.inv::<F, F::Event, F::Error>(
+                    init,
+                    log + calls::<F, F::Event, F::Error>(v0, bv),
+                )
+            &&& forall|a: Seq<Option<BlockRef>>| #[trigger] v0.anchored(a) ==> post.anchored(a)
+        },
+{
+    if !accepted(v0, bv) {
+        assert forall|init: int, log: Seq<(Position, F::Event)>|
+            #[trigger] v0.inv::<F, F::Event, F::Error>(init, log) implies post.inv::<F, F::Event, F::Error>(
+            init,
+            log + calls::<F, F::Event, F::Error>(v0, bv),
+        ) by {
+            assert(log + calls::<F, F::Event, F::Error>(v0, bv) =~= log);
+        }
+    }
+}
+
+/// Span `i` of `b`: non-empty, strictly ascending, every entry on block `i`.
+proof fn lemma_span_sorted<E>(bv: BatchView<E>, i: int)
+    requires
+        bv.wf(),
+        bv.shaped(),
+        0 <= i < bv.ends.len(),
+    ensures
+        bv.span_events(i).len() > 0,
+        lt_sorted(bv.span_events(i)),
+        forall|k: int|
+            0 <= k < bv.span_events(i).len() ==> (#[trigger] bv.span_events(i)[k]).0.block == bv.blocks[i],
+{
+    lemma_end_bounds(bv, i);
+    assert(bv.start(i) < bv.ends[i]);
+    let sp = bv.span_events(i);
+    assert forall|a: int, b: int| #![trigger sp[a], sp[b]] 0 <= a < b < sp.len() implies lt(sp[a].0, sp[b].0) by {
+        assert(bv.log_indices[bv.start(i) + a] < bv.log_indices[bv.start(i) + b]);
+    }
+}
+
+/// The `setup` facts every loop lemma uses; `shaped` stays hidden, since its span-bound
+/// clause instantiates itself through `start(i) == ends[i - 1]`.
+proof fn lemma_setup<E>(v0: EngineView, bv: BatchView<E>, w: int, i0: int)
+    requires
+        setup(v0, bv, w, i0),
+    ensures
+        v0.wf(),
+        bv.wf(),
+        lt_sorted(bv.flat()),
+        v0.status is Active,
+        0 < w,
+        split_at_tip(bv, v0.cursor, i0),
+        forall|i: int, j: int|
+            #![trigger bv.blocks[i], bv.blocks[j]]
+            0 <= i < j < bv.blocks.len() ==> bv.blocks[i] < bv.blocks[j],
+{
+    reveal(setup);
+}
+
+proof fn lemma_setup_span<E>(v0: EngineView, bv: BatchView<E>, w: int, i0: int, i: int)
+    requires
+        setup(v0, bv, w, i0),
+        0 <= i < bv.ends.len(),
+    ensures
+        bv.span_events(i).len() > 0,
+        lt_sorted(bv.span_events(i)),
+        forall|k: int|
+            0 <= k < bv.span_events(i).len() ==> (#[trigger] bv.span_events(i)[k]).0.block == bv.blocks[i],
+{
+    reveal(setup);
+    lemma_span_sorted(bv, i);
+}
+
+/// No fork once every span at or below the old tip matched the ring.
+proof fn lemma_not_forked<E>(v0: EngineView, bv: BatchView<E>, w: int, i0: int, m: int)
+    requires
+        setup(v0, bv, w, i0),
+        i0 <= m,
+        forall|k: int, j: int|
+            #![trigger bv.blocks[k], v0.ring[j]]
+            0 <= k < m && k < i0 && 0 <= j < v0.ring.len() && v0.ring[j].number == bv.blocks[k]
+                ==> v0.ring[j].hash == bv.hashes[k],
+    ensures
+        !forked(v0, bv),
+{
+    reveal(setup);
+    if forked(v0, bv) {
+        let (k2, j) = choose|k2: int, j: int|
+            #![trigger bv.blocks[k2], v0.ring[j]]
+            0 <= k2 < bv.blocks.len() && 0 <= j < v0.ring.len() && bv.blocks[k2] <= v0.cursor.unwrap().block
+                && v0.ring[j].number == bv.blocks[k2] && v0.ring[j].hash != bv.hashes[k2];
+        assert(span_refs(bv)[k2].number == bv.blocks[k2]);
+    }
+}
+
+/// The log indices of span `i` ascend strictly.
+proof fn lemma_span_indices<E>(v0: EngineView, bv: BatchView<E>, w: int, i0: int, i: int, li: Seq<u32>)
+    requires
+        setup(v0, bv, w, i0),
+        0 <= i < bv.ends.len(),
+        li == bv.log_indices.subrange(bv.start(i), bv.ends[i] as int),
+    ensures
+        forall|j: int, k: int| 0 <= j < k < li.len() ==> li[j] < li[k],
+{
+    reveal(setup);
+    lemma_end_bounds(bv, i);
+    assert forall|j: int, k: int| 0 <= j < k < li.len() implies li[j] < li[k] by {
+        assert(li[j] == bv.log_indices[bv.start(i) + j]);
+        assert(li[k] == bv.log_indices[bv.start(i) + k]);
+        assert(bv.start(i) + k < bv.ends[i]);
+    }
+}
+
+/// At span `i`, the redelivery test holds exactly for the spans at or below the old
+/// tip, and there the engine still has its checked pre-state.
+proof fn lemma_span_redelivered<F: Fold>(
+    v0: EngineView,
+    bv: BatchView<F::Event>,
+    w: int,
+    i0: int,
+    pre: EngineView,
+    i: int,
+)
+    requires
+        setup(v0, bv, w, i0),
+        0 <= i < bv.ends.len(),
+        loop_state::<F>(v0, bv, w, i0, pre, i),
+    ensures
+        (pre.cursor matches Some(c) && bv.blocks[i] <= c.block) <==> i < i0,
+        pre.status is Active,
+        i < i0 ==> pre == (EngineView { last_verified: checked_freshness(v0, bv), ..v0 }),
+{
+    lemma_setup(v0, bv, w, i0);
+    reveal(tip_state);
+    reveal(loop_state);
+    let r = span_refs(bv);
+    assert(r[i].number == bv.blocks[i]);
+    if i > i0 {
+        assert(bv.blocks[i - 1] < bv.blocks[i]);
+    }
+}
+
+/// Span `i` against the old cursor: which of its entries are new, and where the ring
+/// stands before it.
+proof fn lemma_span_newer<F: Fold>(
+    v0: EngineView,
+    bv: BatchView<F::Event>,
+    w: int,
+    i0: int,
+    pre: EngineView,
+    i: int,
+)
+    requires
+        setup(v0, bv, w, i0),
+        0 <= i < bv.ends.len(),
+        loop_state::<F>(v0, bv, w, i0, pre, i),
+        pre.wf(),
+    ensures
+        newer(pre.cursor, bv.span_events(i)) == newer(v0.cursor, bv.span_events(i)),
+        newer(v0.cursor, bv.flat_upto(i + 1)) == newer(v0.cursor, bv.flat_upto(i)) + newer(
+            v0.cursor,
+            bv.span_events(i),
+        ),
+        forall|j: int|
+            0 <= j < newer(v0.cursor, bv.span_events(i)).len() ==> (#[trigger] newer(
+                v0.cursor,
+                bv.span_events(i),
+            )[j]).0.block == bv.blocks[i] && opt_lt(
+                v0.cursor,
+                Some(newer(v0.cursor, bv.span_events(i))[j].0),
+            ),
+        i >= i0 ==> newer(v0.cursor, bv.span_events(i)) == bv.span_events(i) && bv.span_events(i).len() > 0
+            && (pre.ring.len() == 0 || pre.ring.last().number < bv.blocks[i])
+            && ring_push(pre.ring, w, bv.block(i)) == ring_ext(v0.ring, w, span_refs(bv).subrange(i0, i + 1))
+            && ring_push(pre.ring, w, bv.block(i)).last() == bv.block(i),
+        i + 1 < i0 ==> newer(v0.cursor, bv.span_events(i)).len() == 0,
+        i < i0 ==> v0.cursor is Some && pre.ring == v0.ring && pre.ring.len() > 0
+            && pre.ring.last().number >= bv.blocks[i] && (newer(v0.cursor, bv.span_events(i)).len() > 0
+            ==> bv.blocks[i] == v0.cursor.unwrap().block),
+{
+    lemma_setup(v0, bv, w, i0);
+    reveal(tip_state);
+    reveal(loop_state);
+    let c0 = v0.cursor;
+    let sp = bv.span_events(i);
+    let fl = bv.flat_upto(i);
+    let r = span_refs(bv);
+    lemma_setup_span(v0, bv, w, i0, i);
+    lemma_newer_add(c0, fl, sp);
+    assert(bv.flat_upto(i + 1) == fl + sp);
+    lemma_newer_sorted(c0, sp);
+    let p = newer(c0, sp);
+    assert forall|j: int| 0 <= j < p.len() implies (#[trigger] p[j]).0.block == bv.blocks[i] && opt_lt(
+        c0,
+        Some(p[j].0),
+    ) by {
+        assert(p[j] == sp[sp.len() - p.len() + j]);
+    }
+    assert(r[i].number == bv.blocks[i]);
+    assert(r[i] == bv.block(i));
+    if i + 1 < bv.ends.len() {
+        assert(r[i + 1].number == bv.blocks[i + 1]);
+    }
+    if i >= i0 {
+        if i > i0 {
+            assert(bv.blocks[i - 1] < bv.blocks[i]);
+        } else {
+            assert(r.subrange(i0, i0) =~= Seq::<BlockRef>::empty());
+        }
+        assert forall|k: int| 0 <= k < sp.len() implies opt_lt(c0, Some(#[trigger] sp[k].0)) && opt_lt(
+            pre.cursor,
+            Some(sp[k].0),
+        ) by {
+            assert(sp[k].0.block == bv.blocks[i]);
+        }
+        lemma_newer_split(c0, sp, 0);
+        lemma_newer_split(pre.cursor, sp, 0);
+        assert(sp.subrange(0, sp.len() as int) =~= sp);
+        assert(r.subrange(i0, i + 1) =~= r.subrange(i0, i).push(r[i]));
+        lemma_ring_ext_push(v0.ring, w, r.subrange(i0, i), r[i]);
+    } else {
+        assert(r[i].number <= c0.unwrap().block);
+        if p.len() > 0 {
+            assert(p[0].0.block == bv.blocks[i]);
+        }
+    }
+    if i + 1 < i0 {
+        assert(bv.blocks[i] < bv.blocks[i + 1]);
+        assert forall|k: int| 0 <= k < sp.len() implies !opt_lt(c0, Some(#[trigger] sp[k].0)) by {
+            assert(sp[k].0.block == bv.blocks[i]);
+        }
+        lemma_newer_split(c0, sp, sp.len() as int);
+    }
+}
+
+/// A span that did not stop keeps the loop invariant.
+proof fn lemma_span_ok<F: Fold>(
+    v0: EngineView,
+    bv: BatchView<F::Event>,
+    w: int,
+    i0: int,
+    pre: EngineView,
+    post: EngineView,
+    i: int,
+)
+    requires
+        setup(v0, bv, w, i0),
+        0 <= i < bv.ends.len(),
+        loop_state::<F>(v0, bv, w, i0, pre, i),
+        pre.wf(),
+        span_post::<F>(pre, post, w, bv.span_events(i), bv.block(i), true),
+    ensures
+        loop_state::<F>(v0, bv, w, i0, post, i + 1),
+{
+    lemma_setup(v0, bv, w, i0);
+    reveal(tip_state);
+    reveal(loop_state);
+    lemma_span_newer::<F>(v0, bv, w, i0, pre, i);
+    let g = newer(v0.cursor, bv.flat_upto(i));
+    let p = newer(v0.cursor, bv.span_events(i));
+    lemma_applied_prefix::<F, F::Event, F::Error>(pre.fold, p);
+    lemma_run_concat::<F, F::Event, F::Error>((v0.fold, false), g, p);
+    if p.len() == 0 {
+        assert(g + p =~= g);
+    } else {
+        assert((g + p).last() == p.last());
+        assert(p.last() == p[p.len() - 1]);
+    }
+}
+
+/// When span `i` stops the fold, the batch's calls end at that stop.
+proof fn lemma_calls_split<F: Fold>(v0: EngineView, bv: BatchView<F::Event>, i: int, v: int)
+    requires
+        bv.wf(),
+        0 <= i < bv.ends.len(),
+        run::<F, F::Event, F::Error>((v0.fold, false), newer(v0.cursor, bv.flat_upto(i))) == (v, false),
+        newer(v0.cursor, bv.flat_upto(i + 1)) == newer(v0.cursor, bv.flat_upto(i)) + newer(
+            v0.cursor,
+            bv.span_events(i),
+        ),
+        run::<F, F::Event, F::Error>(
+            (v, false),
+            applied::<F, F::Event, F::Error>(v, newer(v0.cursor, bv.span_events(i))),
+        ).1,
+    ensures
+        run_calls::<F>(v0, bv) == newer(v0.cursor, bv.flat_upto(i)) + applied::<F, F::Event, F::Error>(
+            v,
+            newer(v0.cursor, bv.span_events(i)),
+        ),
+{
+    let c0 = v0.cursor;
+    let f0 = v0.fold;
+    let g = newer(c0, bv.flat_upto(i));
+    let p = newer(c0, bv.span_events(i));
+    let pre_fold = v;
+    let n = bv.ends.len() as int;
+    let whole = bv.flat();
+    let l = bv.flat_upto(i + 1).len() as int;
+    lemma_flat_prefix(bv, i + 1, n);
+    let rest = whole.subrange(l, whole.len() as int);
+    assert(whole =~= bv.flat_upto(i + 1) + rest);
+    lemma_newer_add(c0, bv.flat_upto(i + 1), rest);
+    let nr = newer(c0, rest);
+    assert(g + p + nr =~= g + (p + nr));
+    lemma_applied_concat::<F, F::Event, F::Error>(f0, g, p + nr);
+    lemma_applied_extend::<F, F::Event, F::Error>(pre_fold, p, nr);
+}
+
+/// A span that stopped the fold: the whole batch's calls end at its stop.
+proof fn lemma_span_stop<F: Fold>(
+    v0: EngineView,
+    bv: BatchView<F::Event>,
+    w: int,
+    i0: int,
+    pre: EngineView,
+    post: EngineView,
+    i: int,
+)
+    requires
+        setup(v0, bv, w, i0),
+        0 <= i < bv.ends.len(),
+        loop_state::<F>(v0, bv, w, i0, pre, i),
+        pre.wf(),
+        span_post::<F>(pre, post, w, bv.span_events(i), bv.block(i), false),
+    ensures
+        stop_state::<F>(v0, bv, w, i0, pre, post, i),
+{
+    lemma_setup(v0, bv, w, i0);
+    reveal(tip_state);
+    reveal(loop_state);
+    reveal(stop_state);
+    lemma_span_newer::<F>(v0, bv, w, i0, pre, i);
+    let c0 = v0.cursor;
+    let f0 = v0.fold;
+    let g = newer(c0, bv.flat_upto(i));
+    let p = newer(c0, bv.span_events(i));
+    let q = applied::<F, F::Event, F::Error>(pre.fold, p);
+    lemma_applied_prefix::<F, F::Event, F::Error>(pre.fold, p);
+    assert(q.len() > 0);
+    let done = q.drop_last();
+    if done.len() > 0 {
+        assert(done.last() == p[done.len() - 1]);
+    }
+    lemma_calls_split::<F>(v0, bv, i, pre.fold);
+    lemma_run_concat::<F, F::Event, F::Error>((f0, false), g, q);
+    assert(run_calls::<F>(v0, bv) == g + q);
+    assert((g + q).drop_last() =~= g + done);
+    assert((g + q).last() == q.last());
+    if done.len() == 0 {
+        assert(g + done =~= g);
+    } else {
+        assert((g + done).last() == done.last());
+    }
+}
+
+/// The loop ran every span without a stop.
+proof fn lemma_loop_done<F: Fold>(v0: EngineView, bv: BatchView<F::Event>, w: int, i0: int, post: EngineView)
+    requires
+        setup(v0, bv, w, i0),
+        loop_state::<F>(v0, bv, w, i0, post, bv.ends.len() as int),
+    ensures
+        run_calls::<F>(v0, bv) == newer(v0.cursor, bv.flat()),
+        !run::<F, F::Event, F::Error>((v0.fold, false), run_calls::<F>(v0, bv)).1,
+        post.fold == run::<F, F::Event, F::Error>((v0.fold, false), run_calls::<F>(v0, bv)).0,
+        post.cursor == cursor_after(v0.cursor, run_calls::<F>(v0, bv)),
+        tip_state(v0, bv, w, i0, post, bv.ends.len() as int),
+        post.status == v0.status,
+        post.slots == v0.slots,
+        post.resets == v0.resets,
+{
+    lemma_setup(v0, bv, w, i0);
+    reveal(loop_state);
+    lemma_applied_all::<F, F::Event, F::Error>(v0.fold, newer(v0.cursor, bv.flat()));
+}
+
+/// The calls of an accepted batch are sorted, after the old cursor, and, without a
+/// stop, reach the last entry of the batch.
+proof fn lemma_calls_facts<F: Fold>(v0: EngineView, bv: BatchView<F::Event>, w: int, i0: int)
+    requires
+        setup(v0, bv, w, i0),
+    ensures
+        lt_sorted(run_calls::<F>(v0, bv)),
+        forall|j: int|
+            0 <= j < run_calls::<F>(v0, bv).len() ==> opt_lt(v0.cursor, Some(#[trigger] run_calls::<F>(v0, bv)[j].0)),
+        !run::<F, F::Event, F::Error>((v0.fold, false), run_calls::<F>(v0, bv)).1 ==> newer(
+            cursor_after(v0.cursor, run_calls::<F>(v0, bv)),
+            bv.flat(),
+        ).len() == 0,
+{
+    lemma_setup(v0, bv, w, i0);
+    let c0 = v0.cursor;
+    let f0 = v0.fold;
+    let fl = bv.flat();
+    let nn = fl.len() as int;
+    let sa = newer(c0, fl);
+    let c = run_calls::<F>(v0, bv);
+    lemma_newer_sorted(c0, fl);
+    lemma_applied_prefix::<F, F::Event, F::Error>(f0, sa);
+    let m = sa.len() as int;
+    assert forall|j: int| 0 <= j < c.len() implies #[trigger] c[j] == fl[nn - m + j] && opt_lt(
+        c0,
+        Some(c[j].0),
+    ) by {
+        assert(c[j] == sa[j]);
+    }
+    assert forall|a: int, b: int| #![trigger c[a], c[b]] 0 <= a < b < c.len() implies lt(c[a].0, c[b].0) by {
+        assert(c[a] == fl[nn - m + a] && c[b] == fl[nn - m + b]);
+    }
+    if !run::<F, F::Event, F::Error>((f0, false), c).1 && c.len() > 0 {
+        assert(c == sa);
+        let top = fl[nn - 1];
+        assert(c[c.len() - 1] == top);
+        let pc = cursor_after(c0, c);
+        assert forall|j: int| 0 <= j < nn implies !opt_lt(pc, Some(#[trigger] fl[j].0)) by {
+            if j < nn - 1 {
+                assert(lt(fl[j].0, top.0));
+            }
+        }
+        lemma_newer_split(pc, fl, nn);
+    }
+}
+
+/// The ring after the loop, for a state at `tip_state(k)`.
+proof fn lemma_post_ring<E>(v0: EngineView, bv: BatchView<E>, w: int, i0: int, post: EngineView, k: int)
+    requires
+        setup(v0, bv, w, i0),
+        0 <= k <= bv.ends.len(),
+        tip_state(v0, bv, w, i0, post, k),
+    ensures
+        ring_after(v0, post, bv, w),
+        forall|j: int|
+            0 <= j < post.ring.len() && v0.cursor is Some && post.ring[j].number <= v0.cursor.unwrap().block
+                ==> v0.ring.contains(#[trigger] post.ring[j]),
+{
+    lemma_setup(v0, bv, w, i0);
+    reveal(tip_state);
+    let c0 = v0.cursor;
+    let r = span_refs(bv);
+    let i1 = if k > i0 { k } else { i0 };
+    if k > i0 {
+        assert forall|j: int| 0 <= j < k implies #[trigger] r[j].number <= post.cursor.unwrap().block by {
+            if j < k - 1 {
+                assert(bv.blocks[j] < bv.blocks[k - 1]);
+            }
+        }
+        assert forall|j: int| k <= j < r.len() implies #[trigger] r[j].number > post.cursor.unwrap().block by {
+            assert(bv.blocks[k - 1] < bv.blocks[j]);
+        }
+    } else {
+        assert(r.subrange(i0, i0) =~= Seq::<BlockRef>::empty());
+    }
+    assert(split_at_tip(bv, post.cursor, i1));
+    assert(split_at_tip(bv, c0, i0));
+    assert(post.ring == ring_ext(v0.ring, w, r.subrange(i0, i1)));
+    lemma_ring_ext_from(v0.ring, w, r.subrange(i0, i1));
+    assert forall|j: int|
+        0 <= j < post.ring.len() && c0 is Some && post.ring[j].number <= c0.unwrap().block
+            implies v0.ring.contains(#[trigger] post.ring[j]) by {
+        if !v0.ring.contains(post.ring[j]) {
+            let u = choose|u: int| 0 <= u < r.subrange(i0, i1).len() && r.subrange(i0, i1)[u] == post.ring[j];
+            assert(r[i0 + u].number > c0.unwrap().block);
+        }
+    }
+}
+
+/// T5d `Inv` across an apply that ran the fold on `c`.
+proof fn lemma_post_inv<F: Fold>(v0: EngineView, post: EngineView, c: Seq<(Position, F::Event)>)
+    requires
+        v0.wf(),
+        v0.status is Active,
+        lt_sorted(c),
+        forall|j: int| 0 <= j < c.len() ==> opt_lt(v0.cursor, Some(#[trigger] c[j].0)),
+        post.fold == run::<F, F::Event, F::Error>((v0.fold, false), c).0,
+        post.slots == v0.slots,
+        post.status is Active ==> !run::<F, F::Event, F::Error>((v0.fold, false), c).1 && post.cursor
+            == cursor_after(v0.cursor, c),
+    ensures
+        forall|init: int, log: Seq<(Position, F::Event)>|
+            #[trigger] v0.inv::<F, F::Event, F::Error>(init, log) ==> post.inv::<F, F::Event, F::Error>(
+                init,
+                log + c,
+            ),
+{
+    let c0 = v0.cursor;
+    assert forall|init: int, log: Seq<(Position, F::Event)>|
+        #[trigger] v0.inv::<F, F::Event, F::Error>(init, log) implies post.inv::<F, F::Event, F::Error>(
+        init,
+        log + c,
+    ) by {
+        let l2 = log + c;
+        assert forall|a: int, b: int| #![trigger l2[a], l2[b]] 0 <= a < b < l2.len() implies lt(l2[a].0, l2[b].0) by {
+            if b >= log.len() {
+                assert(l2[b] == c[b - log.len()]);
+                if a >= log.len() {
+                    assert(l2[a] == c[a - log.len()]);
+                } else {
+                    assert(l2[a] == log[a]);
+                    assert(opt_le(Some(log[a].0), c0));
+                    lemma_opt_lt_order(Some(log[a].0), c0, Some(c[b - log.len()].0));
+                }
+            } else {
+                assert(l2[a] == log[a] && l2[b] == log[b]);
+            }
+        }
+        lemma_run_concat::<F, F::Event, F::Error>((init, false), log, c);
+        if post.status is Active {
+            assert forall|j: int| 0 <= j < l2.len() implies opt_le(Some(#[trigger] l2[j].0), post.cursor) by {
+                if c.len() > 0 {
+                    let top = c[c.len() - 1];
+                    if j >= log.len() {
+                        assert(l2[j] == c[j - log.len()]);
+                    } else {
+                        assert(l2[j] == log[j]);
+                        assert(opt_le(Some(log[j].0), c0));
+                        lemma_opt_lt_order(Some(log[j].0), c0, Some(top.0));
+                    }
+                } else {
+                    assert(l2[j] == log[j]);
+                }
+            }
+        }
+        assert forall|q: int|
+            0 <= q < post.slots.len() && #[trigger] post.slots[q] is Some implies run::<F, F::Event, F::Error>(
+            (init, false),
+            upto::<F::Event>(l2, post.slots[q].unwrap().cursor),
+        ) == (post.slots[q].unwrap().fold, false) by {
+            let sc = post.slots[q].unwrap().cursor;
+            assert(v0.slots[q] is Some);
+            assert(opt_le(sc, c0));
+            assert forall|j: int| 0 <= j < c.len() implies opt_lt(sc, Some(#[trigger] c[j].0)) by {
+                lemma_opt_lt_order(sc, c0, Some(c[j].0));
+            }
+            lemma_upto_append::<F::Event>(log, c, sc);
+        }
+    }
+}
+
+/// Anchors across a ring that only gained entries above the old tip: a slot live after
+/// was live before, on the same entry, so a dead slot stays dead.
+proof fn lemma_post_anchors(v0: EngineView, post: EngineView)
+    requires
+        v0.wf(),
+        post.slots == v0.slots,
+        forall|j: int|
+            0 <= j < post.ring.len() && v0.cursor is Some && post.ring[j].number <= v0.cursor.unwrap().block
+                ==> v0.ring.contains(#[trigger] post.ring[j]),
+    ensures
+        forall|a: Seq<Option<BlockRef>>| #[trigger] v0.anchored(a) ==> post.anchored(a),
+{
+    let c0 = v0.cursor;
+    assert forall|a: Seq<Option<BlockRef>>| #[trigger] v0.anchored(a) implies post.anchored(a) by {
+        assert forall|q: int|
+            #![trigger post.slots[q]]
+            post.live_at(q) && post.slots[q].unwrap().cursor is Some implies {
+                &&& a[q] is Some
+                &&& a[q].unwrap().number == post.slots[q].unwrap().cursor.unwrap().block
+                &&& post.ring.contains(a[q].unwrap())
+            } by {
+            let sc = post.slots[q].unwrap().cursor.unwrap();
+            assert(v0.slots[q] is Some);
+            assert(opt_le(Some(sc), c0));
+            let j = choose|j: int| 0 <= j < post.ring.len() && #[trigger] post.ring[j].number == sc.block;
+            assert(v0.ring.contains(post.ring[j]));
+            let u = choose|u: int| 0 <= u < v0.ring.len() && v0.ring[u] == post.ring[j];
+            assert(v0.live_at(q));
+            let u2 = choose|u2: int| 0 <= u2 < v0.ring.len() && v0.ring[u2] == a[q].unwrap();
+            assert(u2 == u) by {
+                if u2 < u {
+                    assert(v0.ring[u2].number < v0.ring[u].number);
+                } else if u < u2 {
+                    assert(v0.ring[u].number < v0.ring[u2].number);
+                }
+            }
+        }
+    }
+}
+
+/// The final clauses of an accepted batch: ring, `Inv`, anchors and T3d.
+proof fn lemma_apply_post<F: Fold>(
+    v0: EngineView,
+    bv: BatchView<F::Event>,
+    w: int,
+    i0: int,
+    post: EngineView,
+    k: int,
+)
+    requires
+        setup(v0, bv, w, i0),
+        accepted(v0, bv),
+        0 <= k <= bv.ends.len(),
+        tip_state(v0, bv, w, i0, post, k),
+        post.fold == run::<F, F::Event, F::Error>((v0.fold, false), run_calls::<F>(v0, bv)).0,
+        post.cursor == cursor_after(
+            v0.cursor,
+            if run::<F, F::Event, F::Error>((v0.fold, false), run_calls::<F>(v0, bv)).1 {
+                run_calls::<F>(v0, bv).drop_last()
+            } else {
+                run_calls::<F>(v0, bv)
+            },
+        ),
+        post.slots == v0.slots,
+        post.status is Active ==> !run::<F, F::Event, F::Error>((v0.fold, false), run_calls::<F>(v0, bv)).1,
+    ensures
+        ring_after(v0, post, bv, w),
+        forall|init: int, log: Seq<(Position, F::Event)>|
+            #[trigger] v0.inv::<F, F::Event, F::Error>(init, log) ==> post.inv::<F, F::Event, F::Error>(
+                init,
+                log + calls::<F, F::Event, F::Error>(v0, bv),
+            ),
+        forall|a: Seq<Option<BlockRef>>| #[trigger] v0.anchored(a) ==> post.anchored(a),
+        !run::<F, F::Event, F::Error>((v0.fold, false), run_calls::<F>(v0, bv)).1 ==> newer(
+            post.cursor,
+            bv.flat(),
+        ).len() == 0,
+{
+    lemma_setup(v0, bv, w, i0);
+    assert(calls::<F, F::Event, F::Error>(v0, bv) == run_calls::<F>(v0, bv));
+    lemma_calls_facts::<F>(v0, bv, w, i0);
+    lemma_post_ring(v0, bv, w, i0, post, k);
+    lemma_post_inv::<F>(v0, post, run_calls::<F>(v0, bv));
+    lemma_post_anchors(v0, post);
+}
+
+/// `e` is the Halt or Poison stop at `at`, and `status` records it.
+pub open spec fn stops_at<Er>(e: ApplyError<Er>, status: EngineStatus, at: Position) -> bool {
+    match e {
+        ApplyError::Halted { at: a, .. } => a == at && status == (EngineStatus::Halted { at }),
+        ApplyError::Poisoned { at: a, .. } => a == at && status == (EngineStatus::Poisoned { at }),
+        _ => false,
+    }
+}
+
+/// `Engine::advance`: the cursor moves to `pos`, and the ring and freshness take `blk`
+/// when the cursor enters its block.
+spec fn advanced(v: EngineView, w: int, blk: BlockRef, pos: Position) -> EngineView {
+    let entered = v.ring.len() == 0 || v.ring.last().number < blk.number;
+    EngineView {
+        cursor: Some(pos),
+        ring: if entered { ring_push(v.ring, w, blk) } else { v.ring },
+        last_verified: if entered { Some(blk) } else { v.last_verified },
+        ..v
     }
 }
 

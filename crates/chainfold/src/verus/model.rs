@@ -850,4 +850,474 @@ impl<E> BatchView<E> {
     }
 }
 
+
+// P5: engine apply (T3).
+
+/// Prefix of `s` through its first stopping step: the entries `F::apply` runs on (T3b).
+pub open spec fn applied<F: ?Sized, E, Er>(v: int, s: Seq<(Position, E)>) -> Seq<(Position, E)>
+    decreases s.len(),
+{
+    if s.len() == 0 || !run::<F, E, Er>((v, false), s.drop_last()).1 {
+        s
+    } else {
+        applied::<F, E, Er>(v, s.drop_last())
+    }
+}
+
+/// Header of every span of `b`, oldest first.
+pub open spec fn span_refs<E>(b: BatchView<E>) -> Seq<BlockRef> {
+    Seq::new(b.blocks.len(), |i: int| b.block(i))
+}
+
+/// `r` after pushing each of `bs` in order into a ring of capacity `w`.
+pub open spec fn ring_ext(r: Seq<BlockRef>, w: int, bs: Seq<BlockRef>) -> Seq<BlockRef>
+    decreases bs.len(),
+{
+    if bs.len() == 0 {
+        r
+    } else {
+        ring_push(ring_ext(r, w, bs.drop_last()), w, bs.last())
+    }
+}
+
+/// `k` spans of `b` are at or below the block of cursor `c` (none for a None cursor).
+pub open spec fn split_at_tip<E>(b: BatchView<E>, c: Option<Position>, k: int) -> bool {
+    match c {
+        None => k == 0,
+        Some(p) => prefix_at_or_below(span_refs(b), p.block, k),
+    }
+}
+
+/// A span at or below the cursor block carries a hash the ring disagrees with.
+pub open spec fn forked<E>(v: EngineView, b: BatchView<E>) -> bool {
+    &&& v.cursor is Some
+    &&& exists|i: int, j: int|
+        #![trigger b.blocks[i], v.ring[j]]
+        0 <= i < b.blocks.len() && 0 <= j < v.ring.len() && b.blocks[i] <= v.cursor.unwrap().block
+            && v.ring[j].number == b.blocks[i] && v.ring[j].hash != b.hashes[i]
+}
+
+/// `apply_batch` runs the fold on `b` (every check before the first `F::apply` passes).
+pub open spec fn accepted<E>(v: EngineView, b: BatchView<E>) -> bool {
+    &&& v.status is Active
+    &&& b.shaped()
+    &&& v.cursor is Some ==> b.boundary == Some(v.ring.last())
+    &&& !forked(v, b)
+}
+
+/// T3b: the entries `apply_batch` runs `F::apply` on, in call order.
+pub open spec fn calls<F: ?Sized, E, Er>(v: EngineView, b: BatchView<E>) -> Seq<(Position, E)> {
+    if accepted(v, b) {
+        applied::<F, E, Er>(v.fold, newer(v.cursor, b.flat()))
+    } else {
+        Seq::empty()
+    }
+}
+
+pub open spec fn stopped<F: ?Sized, E, Er>(v: EngineView, b: BatchView<E>) -> bool {
+    run::<F, E, Er>((v.fold, false), calls::<F, E, Er>(v, b)).1
+}
+
+/// The calls that consumed their position: all of them, or all but the stopping one.
+pub open spec fn ok_calls<F: ?Sized, E, Er>(v: EngineView, b: BatchView<E>) -> Seq<(Position, E)> {
+    if stopped::<F, E, Er>(v, b) {
+        calls::<F, E, Er>(v, b).drop_last()
+    } else {
+        calls::<F, E, Er>(v, b)
+    }
+}
+
+pub open spec fn cursor_after<E>(c: Option<Position>, ok: Seq<(Position, E)>) -> Option<Position> {
+    if ok.len() == 0 {
+        c
+    } else {
+        Some(ok.last().0)
+    }
+}
+
+pub proof fn lemma_run_stopped<F: ?Sized, E, Er>(w: int, y: Seq<(Position, E)>)
+    ensures
+        run::<F, E, Er>((w, true), y) == (w, true),
+    decreases y.len(),
+{
+    if y.len() > 0 {
+        lemma_run_stopped::<F, E, Er>(w, y.drop_last());
+    }
+}
+
+/// A stopped run stays stopped.
+pub proof fn lemma_run_absorb<F: ?Sized, E, Er>(
+    s: (int, bool),
+    x: Seq<(Position, E)>,
+    y: Seq<(Position, E)>,
+)
+    requires
+        run::<F, E, Er>(s, x).1,
+    ensures
+        run::<F, E, Er>(s, x + y) == run::<F, E, Er>(s, x),
+{
+    lemma_run_concat::<F, E, Er>(s, x, y);
+    lemma_run_stopped::<F, E, Er>(run::<F, E, Er>(s, x).0, y);
+}
+
+pub proof fn lemma_applied_prefix<F: ?Sized, E, Er>(v: int, s: Seq<(Position, E)>)
+    ensures
+        applied::<F, E, Er>(v, s).len() <= s.len(),
+        applied::<F, E, Er>(v, s) == s.subrange(0, applied::<F, E, Er>(v, s).len() as int),
+        !run::<F, E, Er>((v, false), applied::<F, E, Er>(v, s)).1 ==> applied::<F, E, Er>(v, s) == s,
+    decreases s.len(),
+{
+    if s.len() > 0 && run::<F, E, Er>((v, false), s.drop_last()).1 {
+        lemma_applied_prefix::<F, E, Er>(v, s.drop_last());
+    } else {
+        assert(s == s.subrange(0, s.len() as int));
+    }
+}
+
+pub proof fn lemma_applied_all<F: ?Sized, E, Er>(v: int, s: Seq<(Position, E)>)
+    requires
+        !run::<F, E, Er>((v, false), s).1,
+    ensures
+        applied::<F, E, Er>(v, s) == s,
+{
+    if s.len() > 0 && run::<F, E, Er>((v, false), s.drop_last()).1 {
+        assert(s.drop_last() + seq![s.last()] =~= s);
+        lemma_run_absorb::<F, E, Er>((v, false), s.drop_last(), seq![s.last()]);
+    }
+}
+
+/// A prefix `G` that did not stop is applied whole.
+pub proof fn lemma_applied_concat<F: ?Sized, E, Er>(
+    v: int,
+    g: Seq<(Position, E)>,
+    p: Seq<(Position, E)>,
+)
+    requires
+        !run::<F, E, Er>((v, false), g).1,
+    ensures
+        applied::<F, E, Er>(v, g + p) == g + applied::<F, E, Er>(run::<F, E, Er>((v, false), g).0, p),
+    decreases p.len(),
+{
+    let w = run::<F, E, Er>((v, false), g).0;
+    if p.len() == 0 {
+        assert(g + p =~= g);
+        lemma_applied_all::<F, E, Er>(v, g);
+        assert(g + applied::<F, E, Er>(w, p) =~= g);
+    } else {
+        assert((g + p).drop_last() =~= g + p.drop_last());
+        lemma_run_concat::<F, E, Er>((v, false), g, p.drop_last());
+        if run::<F, E, Er>((w, false), p.drop_last()).1 {
+            lemma_applied_concat::<F, E, Er>(v, g, p.drop_last());
+        }
+    }
+}
+
+/// Entries after the stop are never applied.
+pub proof fn lemma_applied_extend<F: ?Sized, E, Er>(
+    v: int,
+    p: Seq<(Position, E)>,
+    r: Seq<(Position, E)>,
+)
+    requires
+        run::<F, E, Er>((v, false), applied::<F, E, Er>(v, p)).1,
+    ensures
+        applied::<F, E, Er>(v, p + r) == applied::<F, E, Er>(v, p),
+    decreases r.len(),
+{
+    if r.len() == 0 {
+        assert(p + r =~= p);
+    } else {
+        lemma_applied_extend::<F, E, Er>(v, p, r.drop_last());
+        lemma_applied_prefix::<F, E, Er>(v, p);
+        let a = applied::<F, E, Er>(v, p);
+        let q = p + r.drop_last();
+        assert((p + r).drop_last() =~= q);
+        assert(q =~= a + q.subrange(a.len() as int, q.len() as int));
+        lemma_run_absorb::<F, E, Er>((v, false), a, q.subrange(a.len() as int, q.len() as int));
+    }
+}
+
+/// The first stopping entry of `p` is at `m`.
+pub proof fn lemma_applied_stop<F: ?Sized, E, Er>(v: int, p: Seq<(Position, E)>, m: int)
+    requires
+        0 <= m < p.len(),
+        !run::<F, E, Er>((v, false), p.subrange(0, m)).1,
+        run::<F, E, Er>((v, false), p.subrange(0, m + 1)).1,
+    ensures
+        applied::<F, E, Er>(v, p) == p.subrange(0, m + 1),
+{
+    let x = p.subrange(0, m + 1);
+    assert(x.drop_last() =~= p.subrange(0, m));
+    lemma_applied_extend::<F, E, Er>(v, x, p.subrange(m + 1, p.len() as int));
+    assert(x + p.subrange(m + 1, p.len() as int) =~= p);
+}
+
+/// On a sorted log, the entries after `c` are a suffix, in order.
+pub proof fn lemma_newer_sorted<E>(c: Option<Position>, s: Seq<(Position, E)>)
+    requires
+        lt_sorted(s),
+    ensures
+        newer(c, s).len() <= s.len(),
+        newer(c, s) == s.subrange(s.len() - newer(c, s).len(), s.len() as int),
+        forall|k: int| 0 <= k < s.len() - newer(c, s).len() ==> !opt_lt(c, Some(#[trigger] s[k].0)),
+        forall|k: int| s.len() - newer(c, s).len() <= k < s.len() ==> opt_lt(c, Some(#[trigger] s[k].0)),
+    decreases s.len(),
+{
+    reveal(Seq::filter);
+    if s.len() > 0 {
+        let t = s.drop_last();
+        assert(lt_sorted(t)) by {
+            assert forall|i: int, j: int| 0 <= i < j < t.len() implies lt(t[i].0, t[j].0) by {
+                assert(t[i] == s[i] && t[j] == s[j]);
+            }
+        }
+        lemma_newer_sorted(c, t);
+        let x = s.last();
+        if !opt_lt(c, Some(x.0)) {
+            assert forall|k: int| 0 <= k < t.len() implies !opt_lt(c, Some(#[trigger] t[k].0)) by {
+                assert(lt(s[k].0, s[s.len() - 1].0));
+                if opt_lt(c, Some(t[k].0)) {
+                    lemma_opt_lt_order(c, Some(t[k].0), Some(x.0));
+                }
+            }
+            assert(newer(c, t).len() == 0);
+            assert(newer(c, s) == newer(c, t));
+            assert(newer(c, s) =~= s.subrange(s.len() as int, s.len() as int));
+        } else {
+            assert(newer(c, s) == newer(c, t).push(x));
+            assert(newer(c, s) =~= s.subrange(s.len() - newer(c, s).len(), s.len() as int));
+        }
+        assert forall|k: int| 0 <= k < s.len() - newer(c, s).len() implies !opt_lt(c, Some(#[trigger] s[k].0)) by {
+            if k < t.len() {
+                assert(s[k] == t[k]);
+            }
+        }
+        assert forall|k: int| s.len() - newer(c, s).len() <= k < s.len() implies opt_lt(c, Some(#[trigger] s[k].0)) by {
+            if k < t.len() {
+                assert(s[k] == t[k]);
+            }
+        }
+    }
+}
+
+/// `newer` of a sequence split at `d`: nothing before `d` is newer, everything after is.
+pub proof fn lemma_newer_split<E>(c: Option<Position>, s: Seq<(Position, E)>, d: int)
+    requires
+        0 <= d <= s.len(),
+        forall|k: int| 0 <= k < d ==> !opt_lt(c, Some(#[trigger] s[k].0)),
+        forall|k: int| d <= k < s.len() ==> opt_lt(c, Some(#[trigger] s[k].0)),
+    ensures
+        newer(c, s) == s.subrange(d, s.len() as int),
+    decreases s.len(),
+{
+    reveal(Seq::filter);
+    if s.len() > 0 {
+        let t = s.drop_last();
+        let e = if d == s.len() { d - 1 } else { d };
+        assert forall|k: int| 0 <= k < e implies !opt_lt(c, Some(#[trigger] t[k].0)) by {
+            assert(t[k] == s[k]);
+        }
+        assert forall|k: int| e <= k < t.len() implies opt_lt(c, Some(#[trigger] t[k].0)) by {
+            assert(t[k] == s[k]);
+        }
+        lemma_newer_split(c, t, e);
+        assert(newer(c, s) =~= s.subrange(d, s.len() as int));
+    } else {
+        assert(newer(c, s) =~= s.subrange(d, s.len() as int));
+    }
+}
+
+pub proof fn lemma_newer_add<E>(c: Option<Position>, a: Seq<(Position, E)>, b: Seq<(Position, E)>)
+    ensures
+        newer(c, a + b) == newer(c, a) + newer(c, b),
+    decreases b.len(),
+{
+    reveal(Seq::filter);
+    if b.len() == 0 {
+        assert(a + b =~= a);
+        assert(newer(c, a) + newer(c, b) =~= newer(c, a));
+    } else {
+        assert((a + b).drop_last() =~= a + b.drop_last());
+        lemma_newer_add(c, a, b.drop_last());
+        if opt_lt(c, Some(b.last().0)) {
+            assert(newer(c, a + b) =~= newer(c, a) + newer(c, b));
+        } else {
+            assert(newer(c, a + b) =~= newer(c, a) + newer(c, b));
+        }
+    }
+}
+
+/// `flat_upto(m)` is a prefix of `flat_upto(n)`.
+pub proof fn lemma_flat_prefix<E>(b: BatchView<E>, m: int, n: int)
+    requires
+        0 <= m <= n,
+    ensures
+        b.flat_upto(m).len() <= b.flat_upto(n).len(),
+        b.flat_upto(n).subrange(0, b.flat_upto(m).len() as int) == b.flat_upto(m),
+    decreases n,
+{
+    if n > m {
+        lemma_flat_prefix(b, m, n - 1);
+        assert(b.flat_upto(n) == b.flat_upto(n - 1) + b.span_events(n - 1));
+        assert(b.flat_upto(n).subrange(0, b.flat_upto(m).len() as int) =~= b.flat_upto(n - 1).subrange(
+            0,
+            b.flat_upto(m).len() as int,
+        ));
+    } else {
+        assert(b.flat_upto(n).subrange(0, b.flat_upto(m).len() as int) =~= b.flat_upto(m));
+    }
+}
+
+/// Every entry of `ring_ext(r, w, bs)` comes from `r` or `bs`.
+pub proof fn lemma_ring_ext_from(r: Seq<BlockRef>, w: int, bs: Seq<BlockRef>)
+    requires
+        0 < w,
+    ensures
+        forall|j: int|
+            0 <= j < ring_ext(r, w, bs).len() ==> r.contains(#[trigger] ring_ext(r, w, bs)[j])
+                || bs.contains(ring_ext(r, w, bs)[j]),
+    decreases bs.len(),
+{
+    if bs.len() > 0 {
+        let t = bs.drop_last();
+        lemma_ring_ext_from(r, w, t);
+        let pre = ring_ext(r, w, t);
+        assert(ring_ext(r, w, bs) == ring_push(pre, w, bs.last()));
+        assert forall|j: int| 0 <= j < ring_ext(r, w, bs).len() implies r.contains(
+            #[trigger] ring_ext(r, w, bs)[j],
+        ) || bs.contains(ring_ext(r, w, bs)[j]) by {
+            let x = ring_ext(r, w, bs)[j];
+            if j == ring_ext(r, w, bs).len() - 1 {
+                assert(x == bs[bs.len() - 1]);
+            } else {
+                if pre.len() < w {
+                    assert(x == pre[j]);
+                    assert(r.contains(x) || t.contains(x));
+                } else {
+                    assert(x == pre.drop_first()[j]);
+                    assert(x == pre[j + 1]);
+                    assert(r.contains(x) || t.contains(x));
+                }
+                if bs.drop_last().contains(x) {
+                    let u = choose|u: int| 0 <= u < t.len() && t[u] == x;
+                    assert(bs[u] == x);
+                }
+            }
+        }
+    }
+}
+
+/// `ring_ext` over `bs.push(x)`.
+pub proof fn lemma_ring_ext_push(r: Seq<BlockRef>, w: int, bs: Seq<BlockRef>, x: BlockRef)
+    ensures
+        ring_ext(r, w, bs.push(x)) == ring_push(ring_ext(r, w, bs), w, x),
+{
+    assert(bs.push(x).drop_last() =~= bs);
+}
+
+/// `split_at_tip` names one count.
+pub proof fn lemma_split_unique<E>(b: BatchView<E>, c: Option<Position>, i: int, j: int)
+    requires
+        split_at_tip(b, c, i),
+        split_at_tip(b, c, j),
+    ensures
+        i == j,
+{
+    if c is Some {
+        let r = span_refs(b);
+        if i < j {
+            assert(r[i].number <= c.unwrap().block);
+        } else if j < i {
+            assert(r[j].number <= c.unwrap().block);
+        }
+    }
+}
+
+/// Count of the leading blocks at or below `n`; on ascending blocks, a partition point.
+pub open spec fn count_le(bl: Seq<u64>, n: u64) -> int
+    decreases bl.len(),
+{
+    if bl.len() == 0 || bl.last() <= n {
+        bl.len() as int
+    } else {
+        count_le(bl.drop_last(), n)
+    }
+}
+
+pub proof fn lemma_count_le(bl: Seq<u64>, n: u64)
+    requires
+        forall|i: int, j: int| #![trigger bl[i], bl[j]] 0 <= i < j < bl.len() ==> bl[i] < bl[j],
+    ensures
+        0 <= count_le(bl, n) <= bl.len(),
+        forall|k: int| 0 <= k < count_le(bl, n) ==> #[trigger] bl[k] <= n,
+        forall|k: int| count_le(bl, n) <= k < bl.len() ==> #[trigger] bl[k] > n,
+    decreases bl.len(),
+{
+    if bl.len() > 0 {
+        let t = bl.drop_last();
+        if bl.last() <= n {
+            assert forall|k: int| 0 <= k < bl.len() implies #[trigger] bl[k] <= n by {
+                if k < bl.len() - 1 {
+                    assert(bl[k] < bl[bl.len() - 1]);
+                }
+            }
+        } else {
+            assert forall|i: int, j: int| #![trigger t[i], t[j]] 0 <= i < j < t.len() implies t[i] < t[j] by {
+                assert(t[i] == bl[i] && t[j] == bl[j]);
+            }
+            lemma_count_le(t, n);
+            assert forall|k: int| 0 <= k < count_le(bl, n) implies #[trigger] bl[k] <= n by {
+                assert(t[k] == bl[k]);
+            }
+            assert forall|k: int| count_le(bl, n) <= k < bl.len() implies #[trigger] bl[k] > n by {
+                if k < t.len() {
+                    assert(t[k] == bl[k]);
+                }
+            }
+        }
+    }
+}
+
+/// `last_verified` after the boundary check: the boundary once it has passed.
+pub open spec fn checked_freshness<E>(v: EngineView, b: BatchView<E>) -> Option<BlockRef> {
+    if v.status is Active && b.shaped() && v.cursor is Some && b.boundary == Some(v.ring.last()) {
+        b.boundary
+    } else {
+        v.last_verified
+    }
+}
+
+/// T3e ring: the ring gains exactly the blocks of the spans above the old cursor block
+/// and at or below the new one; freshness is the newest gained block, or the checked
+/// boundary when none was gained.
+pub open spec fn ring_after<E>(v: EngineView, post: EngineView, b: BatchView<E>, w: int) -> bool {
+    exists|i0: int, i1: int|
+        #![trigger split_at_tip(b, v.cursor, i0), split_at_tip(b, post.cursor, i1)]
+        {
+            &&& i0 <= i1
+            &&& split_at_tip(b, v.cursor, i0)
+            &&& split_at_tip(b, post.cursor, i1)
+            &&& post.ring == ring_ext(v.ring, w, span_refs(b).subrange(i0, i1))
+            &&& post.last_verified == if i0 < i1 {
+                Some(post.ring.last())
+            } else {
+                checked_freshness(v, b)
+            }
+        }
+}
+
+/// T3d: when no position of `b` is after the cursor, applying `b` calls the fold zero
+/// times; with `lemma_split_unique`, `apply_batch` then keeps fold, cursor and ring.
+pub proof fn lemma_idempotent<F: ?Sized, E, Er>(v: EngineView, b: BatchView<E>)
+    requires
+        newer(v.cursor, b.flat()).len() == 0,
+    ensures
+        calls::<F, E, Er>(v, b).len() == 0,
+        ok_calls::<F, E, Er>(v, b).len() == 0,
+        fold::<F, E, Er>(v.fold, calls::<F, E, Er>(v, b)) == v.fold,
+        cursor_after(v.cursor, ok_calls::<F, E, Er>(v, b)) == v.cursor,
+{
+    lemma_applied_prefix::<F, E, Er>(v.fold, newer(v.cursor, b.flat()));
+}
+
 } // verus!
