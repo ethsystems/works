@@ -20,7 +20,6 @@ use crate::{
     sink::NoSink,
     verus::model::{
         fview,
-        pos_cmp,
         sink_offered,
     },
 };
@@ -46,30 +45,6 @@ pub proof fn axiom_no_sink_offers_nothing(s: NoSink)
     ensures
         sink_offered::<NoSink>(&s) == Set::<Position>::empty(),
 {
-}
-
-// A6: the derived `PartialOrd` on `Position` is `lt` (T1 bridge). Verus ignores derives;
-// the derive compares fields in declaration order, block then log index, as checked by
-// `position_order_is_block_then_log_index`.
-impl vstd::std_specs::cmp::PartialOrdSpecImpl for Position {
-    open spec fn obeys_partial_cmp_spec() -> bool {
-        true
-    }
-
-    open spec fn partial_cmp_spec(&self, other: &Self) -> Option<core::cmp::Ordering> {
-        Some(pos_cmp(*self, *other))
-    }
-}
-
-// A6: the derived `Ord` on `Position` is `lt` (T1 bridge), as for `PartialOrd` above.
-impl vstd::std_specs::cmp::OrdSpecImpl for Position {
-    open spec fn obeys_cmp_spec() -> bool {
-        true
-    }
-
-    open spec fn cmp_spec(&self, other: &Self) -> core::cmp::Ordering {
-        pos_cmp(*self, *other)
-    }
 }
 
 // A6: `into_boxed_slice` keeps the elements in order (std docs; vstd has no spec). Used

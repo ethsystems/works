@@ -147,17 +147,6 @@ pub open spec fn opt_le(a: Option<Position>, b: Option<Position>) -> bool {
     opt_lt(a, b) || a == b
 }
 
-/// Three-way `lt`; the derived `Ord` is trusted to equal it (tcb.rs).
-pub open spec fn pos_cmp(a: Position, b: Position) -> core::cmp::Ordering {
-    if lt(a, b) {
-        core::cmp::Ordering::Less
-    } else if a == b {
-        core::cmp::Ordering::Equal
-    } else {
-        core::cmp::Ordering::Greater
-    }
-}
-
 /// T1: `lt` is irreflexive.
 pub proof fn lemma_lt_irreflexive(a: Position)
     ensures

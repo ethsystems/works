@@ -224,7 +224,9 @@ trusted items are in `src/verus/tcb.rs`.
 #### what Verus proves
 
 - **T1, position.** `lt` is a strict total order: irreflexive, transitive, and
-  trichotomous. `pos_gt` and `Position::new` match their specs.
+  trichotomous. `pos_gt` and `Position::new` match their specs. No proof uses the
+  derived `Ord`; the test `position_order_is_block_then_log_index` checks that it
+  compares block, then log index.
 - **T2, batch.** `validate` returns `Ok` if and only if the batch is well shaped.
   Well shaped means: blocks strictly ascending, no empty span, and log indices
   strictly ascending in each span. `Ok` implies that the flattened positions are strictly ascending. Each `Err`
@@ -296,22 +298,19 @@ exceptions are the fns listed as out of scope or pending in `Cargo.toml`.
 #### trusted items (`src/verus/tcb.rs`)
 
 1. `axiom_clone_preserves_fview`: a clone has the same fold view (A3).
-2. `PartialOrdSpecImpl for Position`: the derived `PartialOrd` compares block, then
-   log index. The test `position_order_is_block_then_log_index` checks it.
-3. `OrdSpecImpl for Position`: the same for the derived `Ord`.
-4. `Vec::into_boxed_slice` keeps the elements in order (std docs).
-5. `<[T]>::sort_unstable_by_key` permutes the slice (std docs). It claims no order,
+2. `Vec::into_boxed_slice` keeps the elements in order (std docs).
+3. `<[T]>::sort_unstable_by_key` permutes the slice (std docs). It claims no order,
    because `Batch::validate` checks the order. `group_into` uses it.
-6. `<[T]>::split_last_chunk`: empty contract, it asserts nothing.
-7. `snapshot::crc32c`: empty contract. Decode never trusts the checksum value.
-8. `wincode::ReadError`: an opaque type, it asserts nothing.
-9. `snapshot::read_envelope`: empty contract. Decode checks every decoded field.
-10. `snapshot::write_payload`: empty contract. Encode checks the output length itself.
-11. `snapshot::trailer_bytes`: empty contract. No proof reads the trailer bytes.
-12. `IteratorSpecImpl for Spans`: asserts nothing. `Spans` opts out of the iterator
+4. `<[T]>::split_last_chunk`: empty contract, it asserts nothing.
+5. `snapshot::crc32c`: empty contract. Decode never trusts the checksum value.
+6. `wincode::ReadError`: an opaque type, it asserts nothing.
+7. `snapshot::read_envelope`: empty contract. Decode checks every decoded field.
+8. `snapshot::write_payload`: empty contract. Encode checks the output length itself.
+9. `snapshot::trailer_bytes`: empty contract. No proof reads the trailer bytes.
+10. `IteratorSpecImpl for Spans`: asserts nothing. `Spans` opts out of the iterator
     laws, so `next` and `size_hint` verify panic-free.
-13. `IteratorSpecImpl for Observed`: asserts nothing, as for `Spans`.
-14. `axiom_no_sink_offers_nothing`: `NoSink` stores nothing, so it holds no offers (A4).
+11. `IteratorSpecImpl for Observed`: asserts nothing, as for `Spans`.
+12. `axiom_no_sink_offers_nothing`: `NoSink` stores nothing, so it holds no offers (A4).
 
 `.github/scripts/verus-gates.py` fails when a trusted construct appears outside
 `tcb.rs`. It also fails on a fn in an in-scope file that has no verifying attribute
