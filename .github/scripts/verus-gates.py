@@ -41,6 +41,8 @@ TRUSTED = [
     "assume_termination",
     "exec_allows_no_decreases_clause",
     "axiom fn",
+    # A hand-written cmp/eq spec impl over a derived (unverified) impl is an assumption.
+    "SpecImpl for",
 ]
 VERIFYING = ("verus_spec", "verus_verify")
 
@@ -186,6 +188,7 @@ def self_test() -> None:
         "clean": ("", "", True),
         "assume": ("fn f() { proof! { assume(false); } }", "", False),
         "commented": ("// assume(false) is fine in a comment\n", "", True),
+        "specimpl": ("verus! { impl OrdSpecImpl for P {} }", "", False),
         "unannotated": ("", "", False),
         "listed": ("", '"src/a.rs::S::g" = "later"', True),
         "stale": ("", '"src/a.rs::S::gone" = "later"', False),
