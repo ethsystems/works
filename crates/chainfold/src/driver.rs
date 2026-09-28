@@ -51,9 +51,11 @@ use {
         confirms,
         down_closed,
         fview,
+        header,
         opt_le,
         prefix_at_or_below,
         qualifies,
+        range_entries,
         ring_chain,
         sink_offered,
         sview_log,
@@ -824,6 +826,40 @@ where
 
     /// Fills `batch` with the blocks strictly after the cursor, plus the cursor block's
     /// header as the source reports it now.
+    // B1: the boundary is read after every window, so its view is the last log entry.
+    #[cfg_attr(verus_keep_ghost, verus_spec(r =>
+        requires
+            old(self).wf(),
+        ensures
+            final(self).wf(),
+            ({
+                let (l0, hist) = (
+                    sview_log::<S>(&old(self).source).len() as int,
+                    sview_log::<S>(&final(self).source),
+                );
+                let cursor = old(self).engine@.cursor;
+                &&& *final(self) == (Driver {
+                    source: final(self).source,
+                    batch: final(self).batch,
+                    scratch: final(self).scratch,
+                    ..*old(self)
+                })
+                &&& l0 < hist.len()
+                &&& hist.subrange(0, l0) == sview_log::<S>(&old(self).source)
+                &&& forall|k: int| l0 <= k < hist.len() ==> a1::<S, S::Event>(#[trigger] hist[k])
+                &&& r is Ok ==> exists|h: u64, w: u64, wins: Seq<(int, int)>|
+                    #[trigger] scanned::<S, S::Event>(
+                        hist,
+                        l0,
+                        scan_first(cursor, old(self).config.start_block),
+                        h,
+                        w,
+                        wins,
+                        cursor,
+                        final(self).batch@,
+                    )
+            }),
+    ))]
     fn scan(&mut self) -> Result<(), S::Error> {
         self.batch.clear();
         let cursor = self.engine.cursor();
@@ -835,13 +871,101 @@ where
         };
 
         let window = self.source.window().max(1);
+        #[cfg(verus_keep_ghost)]
+        proof_decl! {
+            let ghost l0 = sview_log::<S>(&old(self).source).len() as int;
+            let ghost d1 = *self;
+            let ghost mut wins: Seq<(int, int)> = Seq::empty();
+            assert(d1.batch@.triples() == Seq::<(BlockRef, u32, F::Event)>::empty());
+        }
         if let Some(mut from) = first {
+            #[cfg(verus_keep_ghost)]
+            proof_decl! {
+                let ghost f0 = from as int;
+            }
+            #[cfg_attr(verus_keep_ghost, verus_spec(
+                invariant
+                    // Loops do not see the fn's requires: carry wf and d1's link to old.
+                    old(self).wf(),
+                    d1 == (Driver { source: d1.source, batch: d1.batch, ..*old(self) }),
+                    l0 == sview_log::<S>(&old(self).source).len(),
+                    sview_log::<S>(&d1.source).len() == l0 + 1,
+                    sview_log::<S>(&self.source).subrange(0, l0) == sview_log::<S>(&old(self).source),
+                    sview_log::<S>(&d1.source).subrange(0, l0) == sview_log::<S>(&old(self).source),
+                    d1.batch@.triples().len() == 0,
+                    d1.batch@.ends.len() == 0,
+                    *self == (Driver { source: self.source, scratch: self.scratch, batch: self.batch, ..d1 }),
+                    self.batch@.wf(),
+                    self.batch@.boundary is None,
+                    sview_log::<S>(&self.source).len() == l0 + 1 + wins.len(),
+                    sview_log::<S>(&self.source).subrange(0, l0 + 1) == sview_log::<S>(&d1.source),
+                    forall|k: int| l0 <= k < sview_log::<S>(&self.source).len()
+                        ==> a1::<S, S::Event>(#[trigger] sview_log::<S>(&self.source)[k]),
+                    window >= 1,
+                    scan_windows(wins, f0, window, head),
+                invariant_except_break
+                    self.batch == d1.batch,
+                    forall|i: int| 0 <= i < wins.len() ==> range_entries::<S, S::Event>(
+                        sview_log::<S>(&self.source)[l0 + 1 + i],
+                        #[trigger] wins[i].0,
+                        wins[i].1,
+                    ).len() == 0,
+                    from as int == if wins.len() == 0 { f0 } else { wins.last().1 + 1 },
+                ensures
+                    self.batch@.wf(),
+                    self.batch@.boundary is None,
+                    *self == (Driver { source: self.source, scratch: self.scratch, batch: self.batch, ..d1 }),
+                    sview_log::<S>(&self.source).len() == l0 + 1 + wins.len(),
+                    sview_log::<S>(&self.source).subrange(0, l0 + 1) == sview_log::<S>(&d1.source),
+                    forall|k: int| l0 <= k < sview_log::<S>(&self.source).len()
+                        ==> a1::<S, S::Event>(#[trigger] sview_log::<S>(&self.source)[k]),
+                    scan_windows(wins, f0, window, head),
+                    forall|i: int| 0 <= i < wins.len() - 1 ==> range_entries::<S, S::Event>(
+                        sview_log::<S>(&self.source)[l0 + 1 + i],
+                        #[trigger] wins[i].0,
+                        wins[i].1,
+                    ).len() == 0,
+                    self.batch@.triples().len() > 0 ==> wins.len() > 0
+                        && self.batch@.triples().to_multiset() == range_entries::<S, S::Event>(
+                        sview_log::<S>(&self.source)[l0 + wins.len()],
+                        wins.last().0,
+                        wins.last().1,
+                    ).to_multiset(),
+                    self.batch@.triples().len() == 0 ==> if wins.len() == 0 {
+                        f0 > head
+                    } else {
+                        wins.last().1 == head && range_entries::<S, S::Event>(
+                            sview_log::<S>(&self.source)[l0 + wins.len()],
+                            wins.last().0,
+                            wins.last().1,
+                        ).len() == 0
+                    },
+                decreases head as int + 1 - from as int,
+            ))]
             while from <= head {
                 let to = head.min(from.saturating_add(window - 1));
                 self.scratch.clear();
+                #[cfg(verus_keep_ghost)]
+                proof! {
+                    wins = wins.push((from as int, to as int));
+                }
                 self.source.events_in(from, to, &mut self.scratch)?;
+                #[cfg(verus_keep_ghost)]
+                proof! {
+                    assert(self.scratch@ == self.scratch@.subrange(0, self.scratch@.len() as int));
+                    vstd::seq_lib::to_multiset_len(self.scratch@);
+                    vstd::seq_lib::to_multiset_len(range_entries::<S, S::Event>(
+                        sview_log::<S>(&self.source).last(),
+                        from as int,
+                        to as int,
+                    ));
+                }
                 if !self.scratch.is_empty() {
                     group_into(&mut self.batch, &mut self.scratch);
+                    #[cfg(verus_keep_ghost)]
+                    proof! {
+                        vstd::seq_lib::to_multiset_len(self.batch@.triples());
+                    }
                     break;
                 }
                 let Some(next) = to.checked_add(1) else {
@@ -853,10 +977,50 @@ where
 
         // Fetched after the events, so a reorg at or below the cursor that lands during
         // the walk fails the boundary check instead of passing a batch from the new chain.
+        #[cfg(verus_keep_ghost)]
+        proof_decl! {
+            let ghost b2 = self.batch;
+            let ghost h2 = sview_log::<S>(&self.source);
+            let ghost m = wins.len() as int;
+            if m > 0 && self.batch@.triples().len() == 0 {
+                let last = range_entries::<S, S::Event>(h2[l0 + m], wins[m - 1].0, wins[m - 1].1);
+                assert(last =~= self.batch@.triples());
+            }
+            assert(windows_ok::<S, S::Event>(
+                h2,
+                l0,
+                scan_first(cursor, old(self).config.start_block),
+                head,
+                window,
+                wins,
+                b2@.triples(),
+            ));
+        }
         self.batch.boundary = match cursor {
             Some(cursor) => self.source.header_at(cursor.block)?,
             None => None,
         };
+        #[cfg(verus_keep_ghost)]
+        proof! {
+            crate::batch::lemma_batch_view(b2);
+            crate::batch::lemma_batch_view(self.batch);
+            lemma_triples_ignore_boundary(self.batch@, b2@, b2@.ends.len() as int);
+            let h3 = sview_log::<S>(&self.source);
+            assert(h3.subrange(0, h2.len() as int) =~= h2);
+            assert forall|k: int| 0 <= k < h2.len() implies #[trigger] h3[k] == h2[k] by {
+                assert(h3.subrange(0, h2.len() as int)[k] == h3[k]);
+            }
+            assert(scanned::<S, S::Event>(
+                sview_log::<S>(&self.source),
+                l0,
+                scan_first(cursor, old(self).config.start_block),
+                head,
+                window,
+                wins,
+                cursor,
+                self.batch@,
+            ));
+        }
         Ok(())
     }
 
@@ -2451,6 +2615,106 @@ pub open spec fn checkpointed(pre: EngineView) -> EngineView {
         }
     } else {
         pre
+    }
+}
+
+/// `scan`'s first block: one past the cursor (None at `u64::MAX`), else the start block.
+pub open spec fn scan_first(cursor: Option<Position>, start: u64) -> Option<u64> {
+    match cursor {
+        Some(c) => if c.block < u64::MAX {
+            Some((c.block + 1) as u64)
+        } else {
+            None
+        },
+        None => Some(start),
+    }
+}
+
+/// Windows of `w` blocks from `first`, each starting one past the last, the last cut at
+/// head `h`.
+pub open spec fn scan_windows(wins: Seq<(int, int)>, first: int, w: u64, h: u64) -> bool {
+    &&& wins.len() > 0 ==> wins[0].0 == first
+    &&& forall|i: int|
+        0 <= i < wins.len() ==> (#[trigger] wins[i]).0 <= h && wins[i].1 == if wins[i].0 + w - 1 < h {
+            wins[i].0 + w - 1
+        } else {
+            h as int
+        }
+    // Adjacent pairs, so the trigger does not chain (cookbook section 2).
+    &&& forall|i: int, j: int|
+        #![trigger wins[i], wins[j]]
+        0 <= i && j == i + 1 && j < wins.len() ==> wins[j].0 == wins[i].1 + 1
+}
+
+/// `scan`'s Ok result over the source log `hist` from `l0`: the head call's view, one view
+/// per window, then the boundary view last (B1). Windows before the last are empty; the
+/// batch holds the last window's entries, or it is empty and the windows cover `[first, h]`.
+pub open spec fn scanned<S, E>(
+    hist: Seq<ChainView>,
+    l0: int,
+    first: Option<u64>,
+    h: u64,
+    w: u64,
+    wins: Seq<(int, int)>,
+    cursor: Option<Position>,
+    b: BatchView<E>,
+) -> bool {
+    &&& windows_ok::<S, E>(hist, l0, first, h, w, wins, b.triples())
+    &&& hist.len() == l0 + 1 + wins.len() + if cursor is Some {
+        1int
+    } else {
+        0int
+    }
+    &&& b.boundary == match cursor {
+        Some(c) => header(hist[hist.len() - 1], c.block),
+        None => None,
+    }
+}
+
+/// `scan`'s windows over `hist` from `l0` and the entries `t` the batch took from them.
+pub open spec fn windows_ok<S, E>(
+    hist: Seq<ChainView>,
+    l0: int,
+    first: Option<u64>,
+    h: u64,
+    w: u64,
+    wins: Seq<(int, int)>,
+    t: Seq<(BlockRef, u32, E)>,
+) -> bool {
+    let m = wins.len() as int;
+    &&& w >= 1
+    &&& l0 + 1 + m <= hist.len()
+    &&& first is None ==> m == 0
+    &&& first matches Some(f) ==> scan_windows(wins, f as int, w, h)
+    &&& forall|i: int|
+        0 <= i < m - 1 ==> range_entries::<S, E>(hist[l0 + 1 + i], #[trigger] wins[i].0, wins[i].1).len() == 0
+    &&& m > 0 ==> t.to_multiset() == range_entries::<S, E>(
+        hist[l0 + m],
+        wins[m - 1].0,
+        wins[m - 1].1,
+    ).to_multiset()
+    &&& m == 0 ==> t.len() == 0
+    &&& t.len() == 0 ==> match first {
+        None => true,
+        Some(f) => if m == 0 {
+            f > h
+        } else {
+            wins[m - 1].1 == h
+        },
+    }
+}
+
+/// The batch's entries do not read its boundary.
+proof fn lemma_triples_ignore_boundary<E>(a: BatchView<E>, b: BatchView<E>, n: int)
+    requires
+        a == (BatchView { boundary: a.boundary, ..b }),
+    ensures
+        a.triples_upto(n) == b.triples_upto(n),
+    decreases n,
+{
+    if n > 0 {
+        lemma_triples_ignore_boundary(a, b, n - 1);
+        assert(a.span_triples(n - 1) =~= b.span_triples(n - 1));
     }
 }
 

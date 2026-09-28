@@ -104,7 +104,6 @@ in-scope = ["src/ring.rs", "src/position.rs", "src/batch.rs", "src/checkpoint.rs
 "src/driver.rs::DriverConfig::default" = "config constants, no claim"
 "src/driver.rs::DriverConfig::from_block" = "config constants, no claim"
 "src/driver.rs::Driver::next_delay" = "timing, no claim (plan section 5)"
-"src/driver.rs::Driver::scan" = "P8"
 "src/driver.rs::Driver::step" = "P8 T7 (after P5)"
 "src/driver.rs::Driver::poll_apply" = "P8 T7 (after P5)"
 "src/driver.rs::Driver::tick" = "P8 T7 (after P5)"
