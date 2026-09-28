@@ -116,7 +116,7 @@ jobs:
       VERUS_VERSION: 0.2026.09.20.aef82ed
       VERUS_SHA256: 7b870fa12bc589015c2fab60a8b3d9f07c7b1adb3444eb0fadffcbf7f0447b33
       # Raise with each phase that adds proofs (P5, P8), so dropped proofs fail the job.
-      VERUS_MIN_VERIFIED: 216
+      VERUS_MIN_VERIFIED: 264
     steps:
       - uses: actions/checkout@v7
       - name: Static gates
