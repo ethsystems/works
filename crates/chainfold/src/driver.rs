@@ -495,11 +495,6 @@ where
     fn scan(&mut self) -> Result<(), S::Error> {
         self.batch.clear();
         let cursor = self.engine.cursor();
-        self.batch.boundary = match cursor {
-            Some(cursor) => self.source.header_at(cursor.block)?,
-            None => None,
-        };
-
         let head = self.source.head()?;
         // None only for a cursor at u64::MAX, which has no block above it to read.
         let first = match cursor {
@@ -523,6 +518,13 @@ where
                 from = next;
             }
         }
+
+        // Fetched after the events, so a reorg at or below the cursor that lands during
+        // the walk fails the boundary check instead of passing a batch from the new chain.
+        self.batch.boundary = match cursor {
+            Some(cursor) => self.source.header_at(cursor.block)?,
+            None => None,
+        };
         Ok(())
     }
 
@@ -599,7 +601,8 @@ where
     }
 }
 
-/// Drains `entries` into `batch`
+/// Drains `entries` into `batch`, one span per run of equal `BlockRef`s, so two hashes
+/// at one height become two equal-number spans that `Batch::validate` rejects.
 fn group_into<E>(batch: &mut Batch<E>, entries: &mut Vec<(BlockRef, u32, E)>) {
     entries.sort_by_key(|(block, log_index, _)| (block.number, *log_index));
 
@@ -607,7 +610,7 @@ fn group_into<E>(batch: &mut Batch<E>, entries: &mut Vec<(BlockRef, u32, E)>) {
     let mut current: Option<BlockRef> = None;
     for (block, log_index, event) in entries.drain(..) {
         match current {
-            Some(open) if open.number != block.number => {
+            Some(open) if open != block => {
                 batch.push_block(open, span.drain(..));
                 current = Some(block);
             }
@@ -726,6 +729,77 @@ mod tests {
         ) -> Result<(), PollFailure> {
             out.push((self.block, 0, 1));
             Ok(())
+        }
+    }
+
+    /// Replaces the last `depth` blocks with one block per entry of `events`.
+    fn reorg_to(chain: &mut ScriptedChain, depth: usize, events: &[u64]) {
+        let blocks: Vec<[u64; 1]> = events.iter().map(|event| [*event]).collect();
+        let slices: Vec<&[u64]> = blocks.iter().map(|block| block.as_slice()).collect();
+        chain.reorg(depth, &slices);
+    }
+
+    /// Scripted chain that misbehaves once, inside a single scan.
+    struct Adversary {
+        inner: ScriptedChain,
+        /// Reorg run by the next `head` call.
+        on_head: Option<(usize, Vec<u64>)>,
+        /// Reorg run by the first `header_at` call after an `events_in` call.
+        after_events: Option<(usize, Vec<u64>)>,
+        events_served: bool,
+        /// Extra entry served whenever the queried range covers its block.
+        rogue: Option<(BlockRef, u32, u64)>,
+    }
+
+    impl Adversary {
+        fn new(inner: ScriptedChain) -> Self {
+            Self {
+                inner,
+                on_head: None,
+                after_events: None,
+                events_served: false,
+                rogue: None,
+            }
+        }
+    }
+
+    impl Source for Adversary {
+        type Event = u64;
+        type Error = PollFailure;
+
+        fn head(&mut self) -> Result<u64, PollFailure> {
+            if let Some((depth, events)) = self.on_head.take() {
+                reorg_to(&mut self.inner, depth, &events);
+            }
+            self.inner.head()
+        }
+
+        fn header_at(&mut self, number: u64) -> Result<Option<BlockRef>, PollFailure> {
+            if self.events_served
+                && let Some((depth, events)) = self.after_events.take()
+            {
+                reorg_to(&mut self.inner, depth, &events);
+            }
+            self.inner.header_at(number)
+        }
+
+        fn events_in(
+            &mut self,
+            from: u64,
+            to: u64,
+            out: &mut Vec<(BlockRef, u32, u64)>,
+        ) -> Result<(), PollFailure> {
+            self.events_served = true;
+            if let Some(entry) = self.rogue
+                && (from..=to).contains(&entry.0.number)
+            {
+                out.push(entry);
+            }
+            self.inner.events_in(from, to, out)
+        }
+
+        fn window(&self) -> u64 {
+            self.inner.window()
         }
     }
 
@@ -1677,6 +1751,89 @@ mod tests {
             (Position::new(6, 0), 60),
         ];
         assert_eq!(driver.engine().fold().applied, expected);
+    }
+
+    /// Fold a fresh driver computes over `chain`, the reference for a raced driver.
+    fn canonical_fold(chain: ScriptedChain) -> Vec<(Position, u64)> {
+        let mut driver = new_driver(chain, engine_config(2), DriverConfig::from_block(1));
+        run_to_idle(&mut driver);
+        driver.engine().fold().applied.clone()
+    }
+
+    fn adversary_driver(chain: ScriptedChain) -> Driver<RecordingFold, Adversary> {
+        Driver::new(
+            RecordingFold::default(),
+            Adversary::new(chain),
+            engine_config(2),
+            DriverConfig {
+                checkpoint_interval: Some(1),
+                ..DriverConfig::from_block(1)
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn reorg_below_the_cursor_inside_one_scan_is_detected() {
+        // given a driver caught up on five blocks
+        let mut driver = adversary_driver(one_event_chain(5));
+        run_to_idle(&mut driver);
+        // when blocks 3..=5 are replaced after the scan starts but before it reads events
+        driver.source_mut().on_head = Some((3, vec![30, 40, 50, 60, 70]));
+        let outcome = driver.tick();
+        run_to_idle(&mut driver);
+        // then the tick recovers instead of folding the new chain onto the old one
+        assert!(
+            matches!(outcome, Tick::RolledBack { .. } | Tick::Resynced),
+            "got {outcome:?}"
+        );
+        let chain = driver.source_mut().inner.clone();
+        assert_eq!(driver.engine().fold().applied, canonical_fold(chain));
+    }
+
+    #[test]
+    fn reorg_above_the_cursor_after_the_events_read_is_caught_next_tick() {
+        // given a driver caught up on five blocks, and two more blocks on the chain
+        let mut driver = adversary_driver(one_event_chain(5));
+        run_to_idle(&mut driver);
+        driver.source_mut().inner.push_block(&[6]);
+        driver.source_mut().inner.set_window(2);
+        driver.source_mut().inner.push_block(&[7]);
+        // when blocks 6 and 7 are replaced between the events read and the boundary fetch
+        driver.source_mut().events_served = false;
+        driver.source_mut().after_events = Some((2, vec![600, 700]));
+        let stale = driver.tick();
+        let next = driver.tick();
+        run_to_idle(&mut driver);
+        // then the stale blocks fold, the next boundary check catches them, and the
+        // fold converges on the canonical chain
+        assert!(matches!(stale, Tick::Progressed(_)), "got {stale:?}");
+        assert!(
+            matches!(next, Tick::RolledBack { .. } | Tick::Resynced),
+            "got {next:?}"
+        );
+        let chain = driver.source_mut().inner.clone();
+        assert_eq!(driver.engine().fold().applied, canonical_fold(chain));
+    }
+
+    #[test]
+    fn two_hashes_at_one_height_are_a_source_error() {
+        // given a driver caught up on five blocks, and a sixth served under two hashes
+        let mut driver = adversary_driver(one_event_chain(5));
+        run_to_idle(&mut driver);
+        driver.source_mut().inner.push_block(&[6]);
+        let rogue = BlockRef {
+            number: 6,
+            hash: [0xAA; 32],
+        };
+        driver.source_mut().rogue = Some((rogue, 1, 66));
+        let before = driver.engine().fold().clone();
+        // when polled
+        let outcome = driver.tick();
+        // then the batch is refused as a source fault and the fold is untouched
+        assert_eq!(outcome, Tick::SourceError);
+        assert_eq!(driver.engine().fold(), &before);
+        assert_eq!(driver.engine().cursor(), Some(Position::new(5, 0)));
     }
 
     #[test]
