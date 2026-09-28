@@ -308,19 +308,6 @@ impl<F: Fold> Engine<F> {
         &self.ring
     }
 
-    /// Iterates observed blocks at or below a number, oldest first; a checkpoint's window.
-    #[cfg_attr(verus_keep_ghost, verus_spec(r =>
-        requires
-            self.wf(),
-        ensures
-            prefix_at_or_below(self@.ring, number, r@.len() as int),
-            r@ == self@.ring.subrange(0, r@.len() as int),
-    ))]
-    #[cfg(feature = "wincode")]
-    pub(crate) fn observed_at_or_below(&self, number: u64) -> Observed<'_> {
-        self.ring.iter_at_or_below(number)
-    }
-
     /// Applies one poll's batch: total order, dedup, boundary recheck, fork detection.
     pub fn apply_batch(
         &mut self,

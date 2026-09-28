@@ -111,6 +111,23 @@ pub assume_specification[ crate::snapshot::read_envelope ](payload: &[u8]) -> wi
     crate::snapshot::Envelope,
 >;
 
+// A6: empty contract, it asserts nothing, and `out` may hold anything afterwards. The encode
+// path (`write_envelope`, P7b) calls the codec's serializer through the crate's one-line
+// wrapper, as for `read_envelope`. Its only use of the result is a length check it makes
+// itself, so no property of the codec is trusted; the bytes are A5.
+#[cfg(feature = "wincode")]
+pub assume_specification[ crate::snapshot::write_payload ](
+    out: &mut Vec<u8>,
+    envelope: &crate::snapshot::Envelope,
+) -> bool;
+
+// A6: empty contract, it asserts nothing. `write_envelope` (P7b) appends the trailer bytes
+// to a buffer whose content no proof reads, so their value is never trusted. The entry is
+// on a one-line wrapper because `u32::to_le_bytes`'s array length is a const expression
+// that `assume_specification` cannot match.
+#[cfg(feature = "wincode")]
+pub assume_specification[ crate::snapshot::trailer_bytes ](crc: u32) -> [u8; 4];
+
 // A6: asserts nothing. `Spans` opts out of vstd's iterator laws, so verified callers
 // learn nothing from `Spans::next`; this lets `next` and `size_hint` verify panic-free.
 // A lawful spec would need `remaining()` as a sequence of slice references, which spec
@@ -140,7 +157,7 @@ impl<'a, E> vstd::std_specs::iter::IteratorSpecImpl for crate::batch::Spans<'a, 
 }
 
 // A6: asserts nothing, as for `Spans`. `Observed` opts out of vstd's iterator laws; the
-// sequence it yields is `Observed@`, which `BlockRing::iter`/`iter_at_or_below` fix.
+// sequence it yields is `Observed@`, which `BlockRing::iter` fixes.
 impl<'a> vstd::std_specs::iter::IteratorSpecImpl for crate::ring::Observed<'a> {
     open spec fn obeys_prophetic_iter_laws(&self) -> bool {
         false

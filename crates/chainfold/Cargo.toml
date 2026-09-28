@@ -88,13 +88,8 @@ in-scope = ["src/ring.rs", "src/position.rs", "src/batch.rs", "src/checkpoint.rs
 "src/snapshot.rs::crc32c" = "A6"
 "src/snapshot.rs::read_envelope" = "A6"
 "src/snapshot.rs::SnapshotError::fmt" = "Display (plan section 5)"
-# Encode writes bytes only; T6c's content claim is model::lemma_durable_snapshot.
-"src/snapshot.rs::write_envelope" = "encode bytes (T6c content is a model lemma)"
-"src/snapshot.rs::ring_lanes" = "encode bytes (T6c content is a model lemma)"
-"src/snapshot.rs::cursor_fields" = "encode bytes (T6c content is a model lemma)"
-"src/snapshot.rs::encode_envelope" = "encode bytes (T6c content is a model lemma)"
-"src/snapshot.rs::Engine::encode_snapshot" = "encode bytes (T6c content is a model lemma)"
-"src/snapshot.rs::Engine::encode_durable_snapshot" = "P7 follow-up: tie its point to durable_point (lemma_durable_snapshot)"
+"src/snapshot.rs::write_payload" = "A6"
+"src/snapshot.rs::trailer_bytes" = "A6"
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = [

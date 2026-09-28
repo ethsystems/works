@@ -523,23 +523,30 @@ impl BlockRing {
         }
     }
 
-    /// Oldest-first iterator over the entries at or below the argument.
+    /// Number of observed blocks.
     #[cfg_attr(verus_keep_ghost, verus_spec(r =>
         requires
             self.wf(),
         ensures
-            prefix_at_or_below(self@, number, r@.len() as int),
-            r@ == self@.subrange(0, r@.len() as int),
+            r == self@.len(),
+    ))]
+    #[cfg(feature = "wincode")]
+    pub(crate) fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Number of entries at or below the argument; they are the oldest ones.
+    #[cfg_attr(verus_keep_ghost, verus_spec(r =>
+        requires
+            self.wf(),
+        ensures
+            prefix_at_or_below(self@, number, r as int),
     ))]
     #[cfg(any(feature = "wincode", test))]
-    pub(crate) fn iter_at_or_below(&self, number: u64) -> Observed<'_> {
-        Observed {
-            ring: self,
-            next: 0,
-            remaining: match self.index_at_or_below(number) {
-                Some(logical) => logical + 1,
-                None => 0,
-            },
+    pub(crate) fn len_at_or_below(&self, number: u64) -> usize {
+        match self.index_at_or_below(number) {
+            Some(logical) => logical + 1,
+            None => 0,
         }
     }
 
@@ -733,8 +740,8 @@ impl<'a> Observed<'a> {
 
 } // verus!
 
-// The yielded sequence is `Observed@`, fixed by `iter` and `iter_at_or_below`. tcb.rs opts
-// `Observed` out of vstd's iterator laws, so this verifies panic- and overflow-free only.
+// The yielded sequence is `Observed@`, fixed by `iter`. tcb.rs opts `Observed` out of
+// vstd's iterator laws, so this verifies panic- and overflow-free only.
 #[cfg_attr(verus_keep_ghost, cfg_eval, verus_verify)]
 impl<'a> Iterator for Observed<'a> {
     type Item = BlockRef;
@@ -894,17 +901,18 @@ mod tests {
     }
 
     #[test]
-    fn iter_at_or_below_yields_the_matching_prefix() {
+    fn len_at_or_below_counts_the_matching_prefix() {
         // given a gapped ring
         let mut ring = BlockRing::with_capacity(8);
         for number in [2u64, 4, 7, 11] {
             ring.push(block(number));
         }
-        // when iterating at or below a number between entries
-        let prefix: Vec<BlockRef> = ring.iter_at_or_below(9).collect();
-        // then the entries up to and including 7 appear, oldest first
+        // when counting at or below a number between entries
+        let prefix: Vec<BlockRef> = ring.iter().take(ring.len_at_or_below(9)).collect();
+        // then the entries up to and including 7 are counted, oldest first
         assert_eq!(prefix, vec![block(2), block(4), block(7)]);
-        assert_eq!(ring.iter_at_or_below(1).count(), 0);
+        assert_eq!(ring.len_at_or_below(1), 0);
+        assert_eq!(ring.len_at_or_below(11), 4);
     }
 
     #[test]

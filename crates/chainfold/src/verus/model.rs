@@ -466,7 +466,7 @@ pub open spec fn ring_push(r: Seq<BlockRef>, w: int, b: BlockRef) -> Seq<BlockRe
 }
 
 /// `k` is the length of `r`'s prefix numbered at or below `n`; with `ring_ascending(r)`
-/// it is unique (T4a `truncate_above`/`iter_at_or_below`, T5c `ring|<=t.block`).
+/// it is unique (T4a `truncate_above`/`len_at_or_below`, T5c `ring|<=t.block`).
 pub open spec fn prefix_at_or_below(r: Seq<BlockRef>, n: u64, k: int) -> bool {
     &&& 0 <= k <= r.len()
     &&& forall|i: int| 0 <= i < k ==> #[trigger] r[i].number <= n
@@ -720,7 +720,7 @@ impl EngineView {
 
     /// T6c: what `encode_durable_snapshot` writes, as the engine it decodes to: the
     /// oldest live slot's fold and cursor, and the ring prefix of length `k` at or below
-    /// the cursor block (`iter_at_or_below`'s ensures give `k`).
+    /// the cursor block (`len_at_or_below`'s ensures give `k`).
     pub open spec fn durable_snapshot(self, k: int, slots: nat) -> EngineView {
         snapshot_view(self.durable_slot().fold, self.durable_slot().cursor, self.ring.subrange(0, k), slots)
     }
@@ -787,6 +787,36 @@ pub proof fn lemma_durable_snapshot(v: EngineView, k: int, slots: nat)
     }
     assert(snap.ring.last() == v.ring[k - 1]);
     assert(ring_ascending(snap.ring));
+}
+
+/// T6c, encode side, `Inv`: the durable snapshot satisfies `Inv` from the same `init`
+/// over `upto(log, d)`, the log prefix its slot folded (clause 4 at the oldest live slot).
+pub proof fn lemma_durable_snapshot_inv<F: ?Sized, E, Er>(
+    v: EngineView,
+    k: int,
+    slots: nat,
+    init: int,
+    log: Seq<(Position, E)>,
+)
+    requires
+        v.inv::<F, E, Er>(init, log),
+        v.oldest_live_from(0) is Some,
+    ensures
+        v.durable_snapshot(k, slots).cursor == v.durable_point(),
+        v.durable_snapshot(k, slots).inv::<F, E, Er>(init, upto::<E>(log, v.durable_point())),
+{
+    lemma_oldest_live_from(v, 0);
+    let j = v.oldest_live_from(0).unwrap();
+    assert(v.slots[j] is Some);
+    let c = v.durable_point();
+    let u = upto::<E>(log, c);
+    lemma_upto::<E>(log, c);
+    assert forall|a: int, b: int| 0 <= a < b < u.len() implies lt(#[trigger] u[a].0, #[trigger] u[b].0) by {
+        assert(u[a] == log[a] && u[b] == log[b]);
+    }
+    assert forall|i: int| 0 <= i < u.len() implies opt_le(Some(#[trigger] u[i].0), c) by {
+        assert(u[i] == log[i]);
+    }
 }
 
 } // verus!
