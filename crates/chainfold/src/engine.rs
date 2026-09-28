@@ -28,9 +28,24 @@ use crate::{
 };
 #[cfg(verus_keep_ghost)]
 use {
-    crate::verus::model::{
-        EngineView,
-        fview,
+    crate::verus::{
+        model::{
+            EngineView,
+            SlotView,
+            fview,
+            lemma_opt_lt_order,
+            lemma_upto,
+            lemma_upto_upto,
+            live_count,
+            lt,
+            lt_sorted,
+            opt_le,
+            opt_lt,
+            prefix_at_or_below,
+            qualifies,
+            upto,
+        },
+        tcb::axiom_clone_preserves_fview,
     },
     vstd::prelude::*,
 };
@@ -121,31 +136,42 @@ impl<F: Fold> Engine<F> {
     }
 
     /// Returns the coarse engine status.
+    #[cfg_attr(verus_keep_ghost, verus_spec(r => ensures r == self@.status))]
     pub fn status(&self) -> EngineStatus {
         self.status
     }
 
     /// Returns the most recently applied position, if any.
+    #[cfg_attr(verus_keep_ghost, verus_spec(r => ensures r == self@.cursor))]
     pub fn cursor(&self) -> Option<Position> {
         self.cursor
     }
 
     /// Most recent block whose hash the source confirmed; None until first confirmation.
+    #[cfg_attr(verus_keep_ghost, verus_spec(r => ensures r == self@.last_verified))]
     pub fn last_verified(&self) -> Option<BlockRef> {
         self.last_verified
     }
 
     /// Count of events the fold declared not its own.
+    #[cfg_attr(verus_keep_ghost, verus_spec(r => ensures r == self@.skips))]
     pub fn skip_count(&self) -> u64 {
         self.skips
     }
 
     /// Count of resets since construction, wrapping; the driver's reset epoch.
+    #[cfg_attr(verus_keep_ghost, verus_spec(r => ensures r == self@.resets))]
     pub(crate) fn resets(&self) -> u64 {
         self.resets
     }
 
     /// Count of checkpoints the ring can still serve; expired slots are not counted.
+    #[cfg_attr(verus_keep_ghost, verus_spec(r =>
+        requires
+            self.wf(),
+        ensures
+            r == live_count(self@.slots, self@.ring, self@.slots.len() as int),
+    ))]
     pub fn checkpoint_count(&self) -> usize {
         self.checkpoints.count(&self.ring)
     }
@@ -154,24 +180,78 @@ impl<F: Fold> Engine<F> {
     ///
     /// None without checkpoints, when the oldest live slot predates any applied event, or
     /// once every slot's cursor block has left the observed window.
+    #[cfg_attr(verus_keep_ghost, verus_spec(r =>
+        requires
+            self.wf(),
+        ensures
+            r == self@.durable_point(),
+    ))]
     pub fn durable_point(&self) -> Option<Position> {
-        self.checkpoints
-            .oldest(&self.ring)
-            .and_then(|slot| slot.cursor)
+        #[cfg(verus_keep_ghost)]
+        proof! {
+            self.lemma_oldest_bridge();
+        }
+        // `match`, not `and_then`: a closure's result has no spec in attribute mode.
+        match self.checkpoints.oldest(&self.ring) {
+            Some(slot) => {
+                #[cfg(verus_keep_ghost)]
+                proof! {
+                    slot.lemma_view();
+                }
+                slot.cursor
+            }
+            None => None,
+        }
     }
 
     /// The fold as of the durable point, if there is one.
+    #[cfg_attr(verus_keep_ghost, verus_spec(r =>
+        requires
+            self.wf(),
+        ensures
+            match self@.oldest_live_from(0) {
+                Some(k) => r matches Some(f) && fview::<F>(f) == self@.slots[k].unwrap().fold,
+                None => r is None,
+            },
+    ))]
     pub fn durable_fold(&self) -> Option<&F> {
-        self.checkpoints.oldest(&self.ring).map(|slot| &slot.fold)
+        #[cfg(verus_keep_ghost)]
+        proof! {
+            self.lemma_oldest_bridge();
+        }
+        match self.checkpoints.oldest(&self.ring) {
+            Some(slot) => {
+                #[cfg(verus_keep_ghost)]
+                proof! {
+                    slot.lemma_view();
+                }
+                Some(&slot.fold)
+            }
+            None => None,
+        }
     }
 
     /// Oldest live checkpoint slot, for the snapshot codec.
+    #[cfg_attr(verus_keep_ghost, verus_spec(r =>
+        requires
+            self.wf(),
+        ensures
+            match self@.oldest_live_from(0) {
+                Some(k) => r matches Some(s) && self@.slots[k] == Some(s@),
+                None => r is None,
+            },
+    ))]
     #[cfg(feature = "wincode")]
     pub(crate) fn oldest_checkpoint(&self) -> Option<&Slot<F>> {
+        #[cfg(verus_keep_ghost)]
+        proof! {
+            self.lemma_oldest_bridge();
+        }
         self.checkpoints.oldest(&self.ring)
     }
 
     /// Borrows the fold state.
+    #[cfg_attr(verus_keep_ghost, verus_spec(r => ensures fview::<F>(r) == self@.fold))]
     pub fn fold(&self) -> &F {
         &self.fold
     }
@@ -182,15 +262,35 @@ impl<F: Fold> Engine<F> {
     }
 
     /// Iterates observed blocks oldest first.
+    #[cfg_attr(verus_keep_ghost, verus_spec(r =>
+        requires
+            self.wf(),
+        ensures
+            r@ == self@.ring,
+    ))]
     pub fn observed(&self) -> Observed<'_> {
         self.ring.iter()
     }
 
+    #[cfg_attr(verus_keep_ghost, verus_spec(r =>
+        requires
+            self.wf(),
+        ensures
+            r.wf(),
+            r@ == self@.ring,
+    ))]
     pub(crate) fn ring(&self) -> &BlockRing {
         &self.ring
     }
 
     /// Iterates observed blocks at or below a number, oldest first; a checkpoint's window.
+    #[cfg_attr(verus_keep_ghost, verus_spec(r =>
+        requires
+            self.wf(),
+        ensures
+            prefix_at_or_below(self@.ring, number, r@.len() as int),
+            r@ == self@.ring.subrange(0, r@.len() as int),
+    ))]
     #[cfg(feature = "wincode")]
     pub(crate) fn observed_at_or_below(&self, number: u64) -> Observed<'_> {
         self.ring.iter_at_or_below(number)
@@ -262,6 +362,28 @@ impl<F: Fold> Engine<F> {
     ///
     /// A no-op with zero slots or a non-Active status, so every stored slot holds
     /// state the engine still trusts.
+    #[cfg_attr(verus_keep_ghost, verus_spec(
+        requires
+            old(self).wf(),
+        ensures
+            final(self).wf(),
+            final(self)@ == if old(self)@.status is Active && old(self)@.slots.len() > 0 {
+                EngineView {
+                    slots: old(self)@.slots.drop_first().push(
+                        Some(SlotView { fold: old(self)@.fold, cursor: old(self)@.cursor }),
+                    ),
+                    ..old(self)@
+                }
+            } else {
+                old(self)@
+            },
+            forall|init: int, log: Seq<(Position, F::Event)>|
+                #[trigger] old(self)@.inv::<F, F::Event, F::Error>(init, log) ==> final(self)@.inv::<F, F::Event, F::Error>(init, log),
+            forall|a: Seq<Option<BlockRef>>|
+                #[trigger] old(self)@.anchored(a) ==> final(self)@.anchored(
+                    old(self)@.stored_anchors(a),
+                ),
+    ))]
     pub fn checkpoint(&mut self)
     where
         F: Clone,
@@ -269,10 +391,34 @@ impl<F: Fold> Engine<F> {
         if !self.status.is_active() {
             return;
         }
+        #[cfg(verus_keep_ghost)]
+        proof! {
+            // `cloned` is open, so the trigger is the clone call's ensures itself.
+            assert forall|b: F| #[trigger] call_ensures(F::clone, (&self.fold,), b) implies fview::<F>(
+                &b,
+            ) == fview::<F>(&self.fold) by {
+                axiom_clone_preserves_fview::<F>(self.fold, b);
+            }
+        }
         self.checkpoints.store(Slot {
             fold: self.fold.clone(),
             cursor: self.cursor,
         });
+        #[cfg(verus_keep_ghost)]
+        proof! {
+            let pre = old(self)@;
+            if pre.slots.len() > 0 {
+                assert(self@ == EngineView {
+                    slots: pre.slots.drop_first().push(
+                        Some(SlotView { fold: pre.fold, cursor: pre.cursor }),
+                    ),
+                    ..pre
+                });
+                lemma_checkpoint_view::<F>(pre, self@);
+            } else {
+                assert(self@ == pre);
+            }
+        }
     }
 
     /// Restores the newest live checkpoint whose cursor block is at or below the argument,
@@ -283,6 +429,47 @@ impl<F: Fold> Engine<F> {
     /// Freshness resets to None, since the restored cursor is unverified until the
     /// next boundary check confirms it. Slots whose cursor block has left the observed
     /// window are expired, so NoCheckpointAtOrBelow also names an exhausted window.
+    #[cfg_attr(verus_keep_ghost, verus_spec(r =>
+        requires
+            old(self).wf(),
+        ensures
+            final(self).wf(),
+            r is Err ==> *final(self) == *old(self),
+            r matches Err(RollbackError::NoCheckpointAtOrBelow { .. }) ==> forall|j: int|
+                !(#[trigger] old(self)@.live_at(j) && qualifies(old(self)@.slots[j].unwrap(), block)),
+            r matches Err(RollbackError::Unrecoverable { .. }) ==> old(self)@.status is Unrecoverable,
+            // T5b: the target is the newest stored qualifying live slot, whose cursor is the
+            // maximum over them; T5c: the post-state.
+            r matches Ok(t) ==> exists|k: int|
+                #[trigger] old(self)@.rollback_target(block, k) && {
+                    let (pre, post) = (old(self)@, final(self)@);
+                    &&& t == pre.slots[k].unwrap().cursor
+                    &&& post.fold == pre.slots[k].unwrap().fold
+                    &&& post.cursor == t
+                    &&& t is None ==> post.ring.len() == 0
+                    &&& t matches Some(c) ==> prefix_at_or_below(pre.ring, c.block, post.ring.len() as int)
+                        && post.ring == pre.ring.subrange(0, post.ring.len() as int)
+                    &&& post.slots.len() == pre.slots.len()
+                    &&& forall|j: int|
+                        0 <= j < pre.slots.len() ==> #[trigger] post.slots[j] == if pre.slots[j] is Some
+                            && opt_lt(t, pre.slots[j].unwrap().cursor) {
+                            None
+                        } else {
+                            pre.slots[j]
+                        }
+                    &&& post.status is Active
+                    &&& post.last_verified is None
+                    &&& post.skips == pre.skips && post.resets == pre.resets
+                },
+            r matches Ok(t) ==> forall|j: int|
+                #[trigger] old(self)@.live_at(j) && qualifies(old(self)@.slots[j].unwrap(), block)
+                    ==> opt_le(old(self)@.slots[j].unwrap().cursor, t),
+            // T5d: `Inv` holds over the log truncated at the restored cursor.
+            r is Ok ==> forall|init: int, log: Seq<(Position, F::Event)>|
+                #[trigger] old(self)@.inv::<F, F::Event, F::Error>(init, log) ==> final(self)@.inv::<F, F::Event, F::Error>(init, upto::<F::Event>(log, final(self)@.cursor)),
+            forall|a: Seq<Option<BlockRef>>|
+                #[trigger] old(self)@.anchored(a) ==> final(self)@.anchored(a),
+    ))]
     #[cold]
     pub fn rollback_at_or_below(
         &mut self,
@@ -294,10 +481,36 @@ impl<F: Fold> Engine<F> {
         if let EngineStatus::Unrecoverable { cause } = self.status {
             return Err(RollbackError::Unrecoverable { cause });
         }
+        #[cfg(verus_keep_ghost)]
+        proof! {
+            self.lemma_live_bridge();
+        }
         let slot = self
             .checkpoints
             .best_at_or_below(block, &self.ring)
             .ok_or(RollbackError::NoCheckpointAtOrBelow { block })?;
+        #[cfg(verus_keep_ghost)]
+        proof_decl! {
+            let ghost sv = slot@;
+            let ghost k = choose|k: int|
+                0 <= k < self.checkpoints@.len() && self.checkpoints@[k] == Some(sv)
+                    && self.checkpoints.live_view(self.ring@, k) && qualifies(sv, block)
+                    && forall|j: int|
+                    k < j < self.checkpoints@.len() ==> !(#[trigger] self.checkpoints.live_view(
+                        self.ring@,
+                        j,
+                    ) && qualifies(self.checkpoints@[j].unwrap(), block));
+        }
+        #[cfg(verus_keep_ghost)]
+        proof! {
+            slot.lemma_view();
+            // `cloned` is open, so the trigger is the clone call's ensures itself.
+            assert forall|b: F| #[trigger] call_ensures(F::clone, (&slot.fold,), b) implies fview::<F>(
+                &b,
+            ) == fview::<F>(&slot.fold) by {
+                axiom_clone_preserves_fview::<F>(slot.fold, b);
+            }
+        }
         self.fold = slot.fold.clone();
         self.cursor = slot.cursor;
         match self.cursor {
@@ -307,6 +520,13 @@ impl<F: Fold> Engine<F> {
         self.status = EngineStatus::Active;
         self.last_verified = None;
         self.checkpoints.drop_newer(self.cursor);
+        #[cfg(verus_keep_ghost)]
+        proof! {
+            self.ring.lemma_wf();
+            let pre = old(self)@;
+            assert(pre.rollback_target(block, k));
+            lemma_rollback_view::<F>(pre, self@, block, k);
+        }
         Ok(self.cursor)
     }
 
@@ -314,6 +534,24 @@ impl<F: Fold> Engine<F> {
     ///
     /// A driver over this engine resets its sink before the next tick or status read,
     /// so no durable cursor from before the reset is reported.
+    #[cfg_attr(verus_keep_ghost, verus_spec(
+        requires
+            old(self).wf(),
+        ensures
+            final(self).wf(),
+            final(self)@.fold == fview::<F>(&fold),
+            final(self)@.cursor is None,
+            final(self)@.ring.len() == 0,
+            final(self)@.slots.len() == old(self)@.slots.len(),
+            forall|k: int| 0 <= k < final(self)@.slots.len() ==> #[trigger] final(self)@.slots[k] is None,
+            final(self)@.status is Active,
+            final(self)@.last_verified is None,
+            final(self)@.skips == 0,
+            final(self)@.resets == old(self)@.resets.wrapping_add(1),
+            final(self)@.inv::<F, F::Event, F::Error>(fview::<F>(&fold), Seq::empty()),
+            forall|a: Seq<Option<BlockRef>>|
+                a.len() == final(self)@.slots.len() ==> #[trigger] final(self)@.anchored(a),
+    ))]
     pub fn reset(&mut self, fold: F) {
         self.ring.clear();
         self.checkpoints.clear();
@@ -326,6 +564,17 @@ impl<F: Fold> Engine<F> {
     }
 
     /// Terminal for automated paths; only reset leaves this state.
+    #[cfg_attr(verus_keep_ghost, verus_spec(
+        requires
+            old(self).wf(),
+        ensures
+            final(self).wf(),
+            final(self)@ == (EngineView { status: EngineStatus::Unrecoverable { cause }, ..old(self)@ }),
+            forall|init: int, log: Seq<(Position, F::Event)>|
+                #[trigger] old(self)@.inv::<F, F::Event, F::Error>(init, log) ==> final(self)@.inv::<F, F::Event, F::Error>(init, log),
+            forall|a: Seq<Option<BlockRef>>|
+                #[trigger] old(self)@.anchored(a) ==> final(self)@.anchored(a),
+    ))]
     #[cold]
     pub fn mark_unrecoverable(&mut self, cause: DivergenceCause) {
         self.status = EngineStatus::Unrecoverable { cause };
@@ -1498,7 +1747,7 @@ impl<F> View for Engine<F> {
 
 impl<F> Engine<F> {
     /// Plan `wf(Engine)`: ring and slot representation plus the view-level clauses.
-    pub(crate) closed spec fn wf(&self) -> bool {
+    pub closed spec fn wf(&self) -> bool {
         &&& self.ring.wf()
         &&& self.checkpoints.wf()
         &&& self@.wf()
@@ -1513,6 +1762,278 @@ impl<F> Engine<F> {
             self@.ring.len() <= 0x10_0000,
     {
         self.ring.lemma_wf();
+    }
+}
+
+impl<F> Engine<F> {
+    /// `EngineView::live_at` is the checkpoint ring's `live_view` over the engine ring.
+    proof fn lemma_live_bridge(&self)
+        ensures
+            forall|j: int| #[trigger] self@.live_at(j) == self.checkpoints.live_view(self.ring@, j),
+    {
+        assert forall|j: int| #[trigger] self@.live_at(j) == self.checkpoints.live_view(
+            self.ring@,
+            j,
+        ) by {
+            self.checkpoints.lemma_live_view(self.ring@, j);
+        }
+    }
+
+    /// What `CheckpointRing::oldest` finds is `EngineView::oldest_live_from(0)`.
+    proof fn lemma_oldest_bridge(&self)
+        ensures
+            forall|k: int|
+                0 <= k < self.checkpoints@.len() && #[trigger] self.checkpoints.live_view(self.ring@, k)
+                    && (forall|j: int| 0 <= j < k ==> !#[trigger] self.checkpoints.live_view(self.ring@, j))
+                    ==> self@.oldest_live_from(0) == Some(k),
+            (forall|j: int|
+                0 <= j < self.checkpoints@.len() ==> !#[trigger] self.checkpoints.live_view(self.ring@, j))
+                ==> self@.oldest_live_from(0) is None,
+    {
+        self.lemma_live_bridge();
+        assert forall|k: int|
+            0 <= k < self.checkpoints@.len() && #[trigger] self.checkpoints.live_view(self.ring@, k)
+                && (forall|j: int| 0 <= j < k ==> !#[trigger] self.checkpoints.live_view(self.ring@, j))
+                implies self@.oldest_live_from(0) == Some(k) by {
+            assert forall|j: int| 0 <= j < k implies !#[trigger] self@.live_at(j) by {
+                assert(!self.checkpoints.live_view(self.ring@, j));
+            }
+            self@.lemma_oldest_live(0, k);
+        }
+        if forall|j: int|
+            0 <= j < self.checkpoints@.len() ==> !#[trigger] self.checkpoints.live_view(self.ring@, j) {
+            assert forall|j: int| 0 <= j < self@.slots.len() implies !#[trigger] self@.live_at(j) by {
+                assert(!self.checkpoints.live_view(self.ring@, j));
+            }
+            self@.lemma_no_live(0);
+        }
+    }
+}
+
+/// Entry `k` of `slots` after `drop_newer(t)`.
+spec fn dropped(s: Option<SlotView>, t: Option<Position>) -> Option<SlotView> {
+    if s is Some && opt_lt(t, s.unwrap().cursor) {
+        None
+    } else {
+        s
+    }
+}
+
+/// T5a and T5d for `checkpoint`: storing the cursor keeps `wf`, `Inv` over the same log,
+/// and the anchors with the new slot anchored at the ring tip.
+proof fn lemma_checkpoint_view<F: Fold>(pre: EngineView, post: EngineView)
+    requires
+        pre.wf(),
+        pre.status is Active,
+        pre.slots.len() > 0,
+        post == (EngineView {
+            slots: pre.slots.drop_first().push(Some(SlotView { fold: pre.fold, cursor: pre.cursor })),
+            ..pre
+        }),
+    ensures
+        post.wf(),
+        forall|init: int, log: Seq<(Position, F::Event)>|
+            #[trigger] pre.inv::<F, F::Event, F::Error>(init, log) ==> post.inv::<
+                F,
+                F::Event,
+                F::Error,
+            >(init, log),
+        forall|a: Seq<Option<BlockRef>>|
+            #[trigger] pre.anchored(a) ==> post.anchored(pre.stored_anchors(a)),
+{
+    let n = pre.slots.len() as int;
+    assert forall|j: int| 0 <= j < n - 1 implies #[trigger] post.slots[j] == pre.slots[j + 1] by {}
+    assert(post.slots[n - 1] == Some(SlotView { fold: pre.fold, cursor: pre.cursor }));
+    // wf: every stored cursor is at or below the cursor, so the new newest keeps the order.
+    assert forall|i: int, j: int|
+        0 <= i < j < n && post.slots[i] is Some && post.slots[j] is Some implies opt_le(
+        #[trigger] post.slots[i].unwrap().cursor,
+        #[trigger] post.slots[j].unwrap().cursor,
+    ) by {
+        if j < n - 1 {
+            assert(pre.slots[i + 1] == post.slots[i] && pre.slots[j + 1] == post.slots[j]);
+        } else {
+            assert(pre.slots[i + 1] == post.slots[i]);
+        }
+    }
+    assert forall|i: int| 0 <= i < n && #[trigger] post.slots[i] is Some implies opt_le(
+        post.slots[i].unwrap().cursor,
+        post.cursor,
+    ) by {
+        if i < n - 1 {
+            assert(pre.slots[i + 1] == post.slots[i]);
+        }
+    }
+    assert forall|init: int, log: Seq<(Position, F::Event)>|
+        #[trigger] pre.inv::<F, F::Event, F::Error>(init, log) implies post.inv::<
+        F,
+        F::Event,
+        F::Error,
+    >(init, log) by {
+        // All of the log is at or below the cursor, so the new slot folded all of it.
+        if log.len() > 0 {
+            assert(opt_le(Some(log[log.len() - 1].0), pre.cursor));
+        }
+        assert(upto::<F::Event>(log, pre.cursor) == log);
+        assert forall|j: int| 0 <= j < n && #[trigger] post.slots[j] is Some implies crate::verus::model::run::<
+            F,
+            F::Event,
+            F::Error,
+        >((init, false), upto::<F::Event>(log, post.slots[j].unwrap().cursor)) == (
+            post.slots[j].unwrap().fold,
+            false,
+        ) by {
+            if j < n - 1 {
+                assert(pre.slots[j + 1] == post.slots[j]);
+            }
+        }
+    }
+    assert forall|a: Seq<Option<BlockRef>>| #[trigger] pre.anchored(a) implies post.anchored(
+        pre.stored_anchors(a),
+    ) by {
+        let b = pre.stored_anchors(a);
+        assert forall|k: int|
+            #[trigger] post.slots[k] is Some && post.live_at(k) && post.slots[k].unwrap().cursor is Some implies {
+            &&& b[k] is Some
+            &&& b[k].unwrap().number == post.slots[k].unwrap().cursor.unwrap().block
+            &&& post.ring.contains(b[k].unwrap())
+        } by {
+            if k < n - 1 {
+                assert(pre.slots[k + 1] == post.slots[k]);
+                assert(pre.live_at(k + 1));
+                assert(b[k] == a[k + 1]);
+            } else {
+                assert(post.ring[post.ring.len() - 1] == post.ring.last());
+            }
+        }
+    }
+}
+
+/// T5a, T5b and T5d for `rollback_at_or_below`, over the views.
+proof fn lemma_rollback_view<F: Fold>(pre: EngineView, post: EngineView, block: u64, k: int)
+    requires
+        pre.wf(),
+        pre.rollback_target(block, k),
+        ({
+            let t = pre.slots[k].unwrap().cursor;
+            &&& post.fold == pre.slots[k].unwrap().fold
+            &&& post.cursor == t
+            &&& t is None ==> post.ring.len() == 0
+            &&& t matches Some(c) ==> prefix_at_or_below(pre.ring, c.block, post.ring.len() as int)
+                && post.ring == pre.ring.subrange(0, post.ring.len() as int)
+            &&& post.slots.len() == pre.slots.len()
+            &&& forall|j: int|
+                0 <= j < pre.slots.len() ==> #[trigger] post.slots[j] == dropped(pre.slots[j], t)
+            &&& post.status is Active
+            &&& post.last_verified is None
+            &&& post.skips == pre.skips && post.resets == pre.resets
+        }),
+        crate::verus::model::ring_ascending(post.ring),
+    ensures
+        post.wf(),
+        forall|j: int|
+            #[trigger] pre.live_at(j) && qualifies(pre.slots[j].unwrap(), block) ==> opt_le(
+                pre.slots[j].unwrap().cursor,
+                post.cursor,
+            ),
+        forall|init: int, log: Seq<(Position, F::Event)>|
+            #[trigger] pre.inv::<F, F::Event, F::Error>(init, log) ==> post.inv::<
+                F,
+                F::Event,
+                F::Error,
+            >(init, upto::<F::Event>(log, post.cursor)),
+        forall|a: Seq<Option<BlockRef>>| #[trigger] pre.anchored(a) ==> post.anchored(a),
+{
+    let t = post.cursor;
+    let n = pre.slots.len() as int;
+    // Kept slots are at or below t.
+    assert forall|j: int| 0 <= j < n && #[trigger] post.slots[j] is Some implies post.slots[j]
+        == pre.slots[j] && opt_le(post.slots[j].unwrap().cursor, t) by {
+        lemma_opt_lt_order(t, pre.slots[j].unwrap().cursor, None);
+    }
+    // T5b max: newer qualifying slots are excluded, older ones are ordered below slot k.
+    assert forall|j: int| #[trigger] pre.live_at(j) && qualifies(pre.slots[j].unwrap(), block) implies opt_le(
+        pre.slots[j].unwrap().cursor,
+        t,
+    ) by {
+        if j < k {
+            assert(opt_le(pre.slots[j].unwrap().cursor, pre.slots[k].unwrap().cursor));
+        }
+    }
+    // The cursor block is the truncated ring's tip.
+    match t {
+        Some(c) => {
+            let i = choose|i: int| 0 <= i < pre.ring.len() && #[trigger] pre.ring[i].number == c.block;
+            assert(pre.ring[i].number == c.block);
+            let m = post.ring.len() as int;
+            assert(i < m);
+            assert(post.ring[m - 1] == pre.ring[m - 1]);
+            if i < m - 1 {
+                assert(pre.ring[i].number < pre.ring[m - 1].number);
+            }
+            assert(post.ring.last().number == c.block);
+        },
+        None => {},
+    }
+    assert(post.wf()) by {
+        assert forall|i: int, j: int|
+            0 <= i < j < post.slots.len() && post.slots[i] is Some && post.slots[j] is Some implies opt_le(
+            #[trigger] post.slots[i].unwrap().cursor,
+            #[trigger] post.slots[j].unwrap().cursor,
+        ) by {
+            assert(post.slots[i] == pre.slots[i] && post.slots[j] == pre.slots[j]);
+        }
+    }
+    assert forall|init: int, log: Seq<(Position, F::Event)>|
+        #[trigger] pre.inv::<F, F::Event, F::Error>(init, log) implies post.inv::<
+        F,
+        F::Event,
+        F::Error,
+    >(init, upto::<F::Event>(log, t)) by {
+        let l2 = upto::<F::Event>(log, t);
+        lemma_upto::<F::Event>(log, t);
+        assert(lt_sorted(l2)) by {
+            assert forall|i: int, j: int| 0 <= i < j < l2.len() implies lt(
+                #[trigger] l2[i].0,
+                #[trigger] l2[j].0,
+            ) by {
+                assert(l2[i] == log[i] && l2[j] == log[j]);
+            }
+        }
+        assert forall|i: int| 0 <= i < l2.len() implies opt_le(Some(#[trigger] l2[i].0), t) by {
+            assert(l2[i] == log[i]);
+        }
+        assert forall|j: int| 0 <= j < n && #[trigger] post.slots[j] is Some implies crate::verus::model::run::<
+            F,
+            F::Event,
+            F::Error,
+        >((init, false), upto::<F::Event>(l2, post.slots[j].unwrap().cursor)) == (
+            post.slots[j].unwrap().fold,
+            false,
+        ) by {
+            lemma_upto_upto::<F::Event>(log, post.slots[j].unwrap().cursor, t);
+        }
+    }
+    assert forall|a: Seq<Option<BlockRef>>| #[trigger] pre.anchored(a) implies post.anchored(a) by {
+        assert forall|j: int|
+            #[trigger] post.slots[j] is Some && post.live_at(j) && post.slots[j].unwrap().cursor is Some implies {
+            &&& a[j] is Some
+            &&& a[j].unwrap().number == post.slots[j].unwrap().cursor.unwrap().block
+            &&& post.ring.contains(a[j].unwrap())
+        } by {
+            let c = post.slots[j].unwrap().cursor.unwrap();
+            let tc = t.unwrap();
+            let m = post.ring.len() as int;
+            let i = choose|i: int| 0 <= i < m && #[trigger] post.ring[i].number == c.block;
+            assert(pre.ring[i] == post.ring[i]);
+            assert(pre.live_at(j));
+            let i0 = choose|i0: int| 0 <= i0 < pre.ring.len() && pre.ring[i0] == a[j].unwrap();
+            assert(c.block <= tc.block);
+            if i0 >= m {
+                assert(pre.ring[i0].number > tc.block);
+            }
+            assert(post.ring[i0] == a[j].unwrap());
+        }
     }
 }
 } // verus!

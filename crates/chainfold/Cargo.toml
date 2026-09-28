@@ -71,7 +71,7 @@ verify = true
 # Read by .github/scripts/verus-gates.py: every fn in an in-scope file must be
 # verified or listed here with the phase that verifies it.
 [package.metadata.verus-gates]
-in-scope = ["src/ring.rs", "src/position.rs", "src/batch.rs"]
+in-scope = ["src/ring.rs", "src/position.rs", "src/batch.rs", "src/checkpoint.rs", "src/engine.rs"]
 
 [package.metadata.verus-gates.out-of-scope]
 "src/batch.rs::BatchShapeError::fmt" = "Display (plan section 5)"
@@ -79,6 +79,21 @@ in-scope = ["src/ring.rs", "src/position.rs", "src/batch.rs"]
 # trusted. The sequence it yields is `Observed@`, which `iter`/`iter_at_or_below` fix.
 "src/ring.rs::Observed::next" = "std Iterator impl, yields Observed@"
 "src/ring.rs::Observed::size_hint" = "std Iterator impl, yields Observed@"
+"src/checkpoint.rs::CheckpointRing::new" = "P7"
+"src/engine.rs::EngineConfig::default" = "P7"
+"src/engine.rs::EngineConfig::validate" = "P7"
+"src/engine.rs::Engine::new" = "P7"
+"src/engine.rs::Engine::restore_cursor_and_ring" = "P7"
+"src/engine.rs::Engine::fold_mut" = "A3: returns &mut F, edits must keep fview"
+"src/engine.rs::Engine::apply_batch" = "P5"
+"src/engine.rs::Engine::apply_span" = "P5"
+"src/engine.rs::Engine::consumed_through" = "P5"
+"src/engine.rs::Engine::advance" = "P5"
+"src/engine.rs::Engine::halt" = "P5"
+"src/engine.rs::Engine::poison" = "P5"
+"src/engine.rs::span_pos" = "P5"
+"src/engine.rs::count_at_or_below" = "P5"
+"src/engine.rs::fork_suspected" = "P5"
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = [

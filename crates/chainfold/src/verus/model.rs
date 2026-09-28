@@ -495,4 +495,206 @@ pub open spec fn confirmed_prefix(r: Seq<BlockRef>, v: ChainView, k: int) -> boo
 /// call appends `sview` of its post-state (A2 bookkeeping, T4c).
 pub uninterp spec fn sview_log<S: ?Sized>(s: &S) -> Seq<ChainView>;
 
+/// Entries of log `l` at or below cursor `c`: the prefix a checkpoint at `c` folded (T5d).
+/// Drops from the end while the last entry is after `c`.
+pub open spec fn upto<E>(l: Seq<(Position, E)>, c: Option<Position>) -> Seq<(Position, E)>
+    decreases l.len(),
+{
+    if l.len() == 0 || opt_le(Some(l.last().0), c) {
+        l
+    } else {
+        upto::<E>(l.drop_last(), c)
+    }
+}
+
+/// `upto` is a prefix, and on a sorted log it splits at `c`.
+pub proof fn lemma_upto<E>(l: Seq<(Position, E)>, c: Option<Position>)
+    ensures
+        upto::<E>(l, c).len() <= l.len(),
+        upto::<E>(l, c) == l.subrange(0, upto::<E>(l, c).len() as int),
+        lt_sorted(l) ==> forall|i: int|
+            0 <= i < upto::<E>(l, c).len() ==> opt_le(Some(#[trigger] l[i].0), c),
+        forall|i: int| upto::<E>(l, c).len() <= i < l.len() ==> opt_lt(c, Some(#[trigger] l[i].0)),
+    decreases l.len(),
+{
+    if l.len() == 0 {
+        assert(l.subrange(0, 0) =~= l);
+    } else if opt_le(Some(l.last().0), c) {
+        assert(l.subrange(0, l.len() as int) =~= l);
+        if lt_sorted(l) {
+            assert forall|i: int| 0 <= i < l.len() implies opt_le(Some(#[trigger] l[i].0), c) by {
+                if i < l.len() - 1 {
+                    assert(lt(l[i].0, l[l.len() - 1].0));
+                    lemma_opt_lt_order(Some(l[i].0), Some(l.last().0), c);
+                }
+            }
+        }
+    } else {
+        let d = l.drop_last();
+        lemma_upto::<E>(d, c);
+        let u = upto::<E>(d, c);
+        assert(u == d.subrange(0, u.len() as int));
+        assert(l.subrange(0, u.len() as int) =~= d.subrange(0, u.len() as int));
+        if lt_sorted(l) {
+            assert(lt_sorted(d)) by {
+                assert forall|i: int, j: int| 0 <= i < j < d.len() implies lt(
+                    #[trigger] d[i].0,
+                    #[trigger] d[j].0,
+                ) by {
+                    assert(d[i] == l[i] && d[j] == l[j]);
+                }
+            }
+            assert forall|i: int| 0 <= i < u.len() implies opt_le(Some(#[trigger] l[i].0), c) by {
+                assert(d[i] == l[i]);
+            }
+        }
+        assert forall|i: int| u.len() <= i < l.len() implies opt_lt(c, Some(#[trigger] l[i].0)) by {
+            if i < d.len() {
+                assert(d[i] == l[i]);
+            }
+            lemma_opt_lt_order(c, Some(l[i].0), None);
+        }
+    }
+}
+
+/// Truncating at `t` then at `c <= t` is truncating at `c` (rollback keeps older slots).
+pub proof fn lemma_upto_upto<E>(l: Seq<(Position, E)>, c: Option<Position>, t: Option<Position>)
+    requires
+        opt_le(c, t),
+    ensures
+        upto::<E>(upto::<E>(l, t), c) == upto::<E>(l, c),
+    decreases l.len(),
+{
+    if l.len() > 0 && !opt_le(Some(l.last().0), t) {
+        lemma_opt_lt_order(c, t, Some(l.last().0));
+        lemma_opt_lt_order(Some(l.last().0), t, c);
+        lemma_upto_upto::<E>(l.drop_last(), c, t);
+    }
+}
+
+/// Appending entries after `c` leaves `upto(_, c)` alone (P5: apply keeps slot folds).
+pub proof fn lemma_upto_append<E>(l: Seq<(Position, E)>, m: Seq<(Position, E)>, c: Option<Position>)
+    requires
+        forall|i: int| 0 <= i < m.len() ==> opt_lt(c, Some(#[trigger] m[i].0)),
+    ensures
+        upto::<E>(l + m, c) == upto::<E>(l, c),
+    decreases m.len(),
+{
+    if m.len() == 0 {
+        assert(l + m =~= l);
+    } else {
+        let x = m.last();
+        assert(opt_lt(c, Some(m[m.len() - 1].0)));
+        lemma_opt_lt_order(c, Some(x.0), None);
+        assert((l + m).drop_last() =~= l + m.drop_last());
+        assert forall|i: int| 0 <= i < m.drop_last().len() implies opt_lt(
+            c,
+            Some(#[trigger] m.drop_last()[i].0),
+        ) by {
+            assert(m.drop_last()[i] == m[i]);
+        }
+        lemma_upto_append::<E>(l, m.drop_last(), c);
+    }
+}
+
+/// Slot `s` can serve a rollback to block `a` (T5b).
+pub open spec fn qualifies(s: SlotView, a: u64) -> bool {
+    match s.cursor {
+        Some(c) => c.block <= a,
+        None => true,
+    }
+}
+
+/// Live stored slots, counted over the first `n` logical indices.
+pub open spec fn live_count(slots: Seq<Option<SlotView>>, ring: Seq<BlockRef>, n: int) -> int
+    decreases n,
+{
+    if n <= 0 {
+        0
+    } else {
+        live_count(slots, ring, n - 1) + if slots[n - 1] is Some && live(slots[n - 1].unwrap(), ring) {
+            1int
+        } else {
+            0int
+        }
+    }
+}
+
+impl EngineView {
+    /// Plan T5d `Inv`, over ghost `init` (the fold view at the last rewind) and `log` (the
+    /// entries `F::apply` ran on since, in call order). While Active the log is at or
+    /// below the cursor and has not stopped; each stored slot folded `upto(log, cursor)`.
+    pub open spec fn inv<F: ?Sized, E, Er>(self, init: int, log: Seq<(Position, E)>) -> bool {
+        &&& lt_sorted(log)
+        &&& run::<F, E, Er>((init, false), log).0 == self.fold
+        &&& self.status is Active ==> {
+            &&& !run::<F, E, Er>((init, false), log).1
+            &&& forall|i: int| 0 <= i < log.len() ==> opt_le(Some(#[trigger] log[i].0), self.cursor)
+        }
+        &&& forall|k: int|
+            0 <= k < self.slots.len() && #[trigger] self.slots[k] is Some ==> run::<F, E, Er>(
+                (init, false),
+                upto::<E>(log, self.slots[k].unwrap().cursor),
+            ) == (self.slots[k].unwrap().fold, false)
+    }
+
+    /// T5b: slot `k` is the one `rollback_at_or_below(a)` restores: live and qualifying,
+    /// and the newest stored such slot.
+    pub open spec fn rollback_target(self, a: u64, k: int) -> bool {
+        &&& self.live_at(k)
+        &&& qualifies(self.slots[k].unwrap(), a)
+        &&& forall|j: int|
+            k < j < self.slots.len() ==> !(#[trigger] self.live_at(j) && qualifies(
+                self.slots[j].unwrap(),
+                a,
+            ))
+    }
+}
+
+impl EngineView {
+    /// `anchors` after a checkpoint stores the current cursor: the new newest slot is
+    /// anchored at the ring tip (the cursor block), the oldest entry drops.
+    pub open spec fn stored_anchors(self, anchors: Seq<Option<BlockRef>>) -> Seq<Option<BlockRef>> {
+        if self.status is Active && self.slots.len() > 0 {
+            anchors.drop_first().push(
+                match self.cursor {
+                    Some(_) => Some(self.ring.last()),
+                    None => None,
+                },
+            )
+        } else {
+            anchors
+        }
+    }
+
+    /// `oldest_live_from(from)` finds the first live slot at or after `from`.
+    pub proof fn lemma_oldest_live(self, from: int, k: int)
+        requires
+            0 <= from <= k,
+            self.live_at(k),
+            forall|j: int| from <= j < k ==> !#[trigger] self.live_at(j),
+        ensures
+            self.oldest_live_from(from) == Some(k),
+        decreases k - from,
+    {
+        if from < k {
+            self.lemma_oldest_live(from + 1, k);
+        }
+    }
+
+    /// With no live slot at or after `from`, `oldest_live_from(from)` is None.
+    pub proof fn lemma_no_live(self, from: int)
+        requires
+            0 <= from,
+            forall|j: int| from <= j < self.slots.len() ==> !#[trigger] self.live_at(j),
+        ensures
+            self.oldest_live_from(from) is None,
+        decreases self.slots.len() - from,
+    {
+        if from < self.slots.len() {
+            self.lemma_no_live(from + 1);
+        }
+    }
+}
+
 } // verus!

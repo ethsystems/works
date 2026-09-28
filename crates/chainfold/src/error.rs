@@ -64,6 +64,7 @@ pub enum EngineStatus {
 
 impl EngineStatus {
     /// True while the engine still accepts batches.
+    #[cfg_attr(verus_keep_ghost, verus_spec(r => ensures r == (*self is Active)))]
     pub const fn is_active(&self) -> bool {
         matches!(self, Self::Active)
     }
