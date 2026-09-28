@@ -50,7 +50,10 @@ const DEFAULT_CHECKPOINT_INTERVAL: u64 = 64;
 
 /// True when `block` has reached the next interval step past the last marked block.
 fn due(last: Option<u64>, block: u64, interval: u64) -> bool {
-    last.is_none_or(|last| block >= last.saturating_add(interval))
+    match last {
+        Some(last) => block >= last.saturating_add(interval),
+        None => true,
+    }
 }
 
 /// Lowers a cadence mark to a restore point; None when either is None.
@@ -266,13 +269,14 @@ where
         initial: F,
         driver_config: DriverConfig,
     ) -> Result<Self, ConfigError> {
-        if let ReplayHorizon::FromBlock(horizon) = source.horizon()
-            && horizon > driver_config.start_block
-        {
-            return Err(ConfigError::HorizonExceedsStart {
-                start: driver_config.start_block,
-                horizon,
-            });
+        match source.horizon() {
+            ReplayHorizon::FromBlock(horizon) if horizon > driver_config.start_block => {
+                return Err(ConfigError::HorizonExceedsStart {
+                    start: driver_config.start_block,
+                    horizon,
+                });
+            }
+            _ => {}
         }
         if pos_gt(sink.durable_cursor(), engine.cursor()) {
             sink.reset();
