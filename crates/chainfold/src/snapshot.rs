@@ -114,10 +114,12 @@ pub trait Persist: Fold + Sized {
 
 #[cfg_attr(verus_keep_ghost, verus_verify)]
 #[derive(Debug, wincode::SchemaWrite, wincode::SchemaRead)]
-pub(crate) struct Envelope {
+// `T` holds the tag: the fold's static bytes on encode (no allocation), owned on decode.
+// Both serialize as the same length-prefixed bytes.
+pub(crate) struct Envelope<T> {
     magic: [u8; 8],
     version: u16,
-    tag: Vec<u8>,
+    tag: T,
     cursor_set: u8,
     cursor_block: u64,
     cursor_log_index: u64,
@@ -128,13 +130,16 @@ pub(crate) struct Envelope {
 
 /// Decodes an envelope payload (the bytes before the trailer).
 #[inline]
-pub(crate) fn read_envelope(payload: &[u8]) -> wincode::ReadResult<Envelope> {
+pub(crate) fn read_envelope(payload: &[u8]) -> wincode::ReadResult<Envelope<Vec<u8>>> {
     wincode::config::deserialize(payload, ENVELOPE_CONFIG)
 }
 
 /// Serializes an envelope payload onto `out`; false when a field exceeds the limit.
 #[inline]
-pub(crate) fn write_payload(out: &mut Vec<u8>, envelope: &Envelope) -> bool {
+pub(crate) fn write_payload(
+    out: &mut Vec<u8>,
+    envelope: &Envelope<&'static [u8]>,
+) -> bool {
     wincode::config::serialize_into(&mut *out, envelope, ENVELOPE_CONFIG).is_ok()
 }
 
@@ -151,7 +156,7 @@ pub(crate) fn trailer_bytes(crc: u32) -> [u8; 4] {
 // The codec only appends; the length check makes that a checked fact, not a trusted one.
 #[cfg_attr(verus_keep_ghost, verus_verify)]
 fn write_envelope<E>(
-    envelope: &Envelope,
+    envelope: &Envelope<&'static [u8]>,
     out: &mut Vec<u8>,
 ) -> Result<(), SnapshotError<E>> {
     let start = out.len();
@@ -226,29 +231,22 @@ fn cursor_fields(cursor: Option<Position>) -> (u8, u64, u64) {
         ring.wf(),
         len <= ring@.len(),
     ensures
-        encodes::<F>(r, cursor, ring@.subrange(0, len as int)),
+        encodes::<F, _>(r, cursor, ring@.subrange(0, len as int)),
 ))]
 fn envelope<F: Persist>(
     fold: &F,
     cursor: Option<Position>,
     ring: &BlockRing,
     len: usize,
-) -> Envelope {
+) -> Envelope<&'static [u8]> {
     let (ring_numbers, ring_hashes) = ring_lanes(ring, len);
     let (cursor_set, cursor_block, cursor_log_index) = cursor_fields(cursor);
     let mut state = Vec::new();
     fold.encode_state(&mut state);
-    let tag_bytes = F::STATE_TAG.as_bytes();
-    let mut tag = Vec::with_capacity(tag_bytes.len());
-    tag.extend_from_slice(tag_bytes);
-    #[cfg(verus_keep_ghost)]
-    proof! {
-        assert(tag@ =~= tag_bytes@);
-    }
     Envelope {
         magic: SNAPSHOT_MAGIC,
         version: SNAPSHOT_VERSION,
-        tag,
+        tag: F::STATE_TAG.as_bytes(),
         cursor_set,
         cursor_block,
         cursor_log_index,
@@ -410,10 +408,10 @@ impl<F: Persist> Engine<F> {
         ensures
             match r {
                 None => self@.durable_point() is None,
-                Some((e, p)) => self@.durable_point() == Some(p) && durable_encodes::<F>(self@, e),
+                Some((e, p)) => self@.durable_point() == Some(p) && durable_encodes::<F, _>(self@, e),
             },
     ))]
-    fn durable_envelope(&self) -> Option<(Envelope, Position)> {
+    fn durable_envelope(&self) -> Option<(Envelope<&'static [u8]>, Position)> {
         let slot = self.oldest_checkpoint()?;
         #[cfg(verus_keep_ghost)]
         proof! {
@@ -485,10 +483,10 @@ impl<F: Persist> Engine<F> {
             config.valid(),
         ensures
             r matches Ok(e) ==> e.wf() && restored(e@, config) && decoded(e@, envelope),
-            accepted::<F>(envelope, config) ==> r is Ok || r matches Err(SnapshotError::State(_)),
+            accepted::<F, _>(envelope, config) ==> r is Ok || r matches Err(SnapshotError::State(_)),
     ))]
     fn from_envelope(
-        envelope: Envelope,
+        envelope: Envelope<Vec<u8>>,
         config: EngineConfig,
     ) -> Result<Self, SnapshotError<F::PersistError>> {
         if envelope.tag.as_slice() != F::STATE_TAG.as_bytes() {
@@ -660,7 +658,7 @@ spec fn cursor_lanes(cursor: Option<Position>) -> (u8, u64, u64) {
 
 /// `e` is the envelope encode builds for `cursor` and `ring`. Its state bytes are the
 /// fold's own encoding (A5).
-spec fn encodes<F: Persist>(e: Envelope, cursor: Option<Position>, ring: Seq<BlockRef>) -> bool {
+spec fn encodes<F: Persist, T: View<V = Seq<u8>>>(e: Envelope<T>, cursor: Option<Position>, ring: Seq<BlockRef>) -> bool {
     &&& e.magic == SNAPSHOT_MAGIC
     &&& e.version == SNAPSHOT_VERSION
     &&& e.tag@ == F::STATE_TAG.spec_bytes()
@@ -670,15 +668,15 @@ spec fn encodes<F: Persist>(e: Envelope, cursor: Option<Position>, ring: Seq<Blo
 
 /// `e` encodes `v`'s durable snapshot (T6c): the durable point, and the ring prefix at or
 /// below its block, whose length is the lane length.
-spec fn durable_encodes<F: Persist>(v: EngineView, e: Envelope) -> bool {
+spec fn durable_encodes<F: Persist, T: View<V = Seq<u8>>>(v: EngineView, e: Envelope<T>) -> bool {
     let k = e.ring_numbers@.len() as int;
     &&& v.durable_point() is Some
     &&& prefix_at_or_below(v.ring, v.durable_point().unwrap().block, k)
-    &&& encodes::<F>(e, v.durable_snapshot(k, 0).cursor, v.durable_snapshot(k, 0).ring)
+    &&& encodes::<F, _>(e, v.durable_snapshot(k, 0).cursor, v.durable_snapshot(k, 0).ring)
 }
 
 /// The envelope fields `from_envelope` accepts, bar the state bytes.
-spec fn accepted<F: Persist>(e: Envelope, config: EngineConfig) -> bool {
+spec fn accepted<F: Persist, T: View<V = Seq<u8>>>(e: Envelope<T>, config: EngineConfig) -> bool {
     let n = e.ring_numbers@;
     &&& e.tag@ == F::STATE_TAG.spec_bytes()
     &&& n.len() <= config.ring_capacity
@@ -692,21 +690,21 @@ spec fn accepted<F: Persist>(e: Envelope, config: EngineConfig) -> bool {
 }
 
 /// `v`'s cursor and ring are the ones envelope `e` describes.
-spec fn decoded(v: EngineView, e: Envelope) -> bool {
+spec fn decoded<T>(v: EngineView, e: Envelope<T>) -> bool {
     from_lanes(v, e.cursor_set, e.cursor_block, e.cursor_log_index, e.ring_numbers@, e.ring_hashes@)
 }
 
 /// Round trip at the envelope level: the envelope encode builds for an ascending ring
 /// that ends at the cursor block passes `from_envelope`'s checks, and every engine it
 /// decodes to has that cursor and ring.
-proof fn lemma_envelope_round_trip<F: Persist>(
-    e: Envelope,
+proof fn lemma_envelope_round_trip<F: Persist, T: View<V = Seq<u8>>>(
+    e: Envelope<T>,
     cursor: Option<Position>,
     ring: Seq<BlockRef>,
     config: EngineConfig,
 )
     requires
-        encodes::<F>(e, cursor, ring),
+        encodes::<F, _>(e, cursor, ring),
         ring_ascending(ring),
         match cursor {
             Some(c) => ring.len() > 0 && ring.last().number == c.block,
@@ -714,7 +712,7 @@ proof fn lemma_envelope_round_trip<F: Persist>(
         },
         ring.len() <= config.ring_capacity,
     ensures
-        accepted::<F>(e, config),
+        accepted::<F, _>(e, config),
         forall|v: EngineView| #[trigger] decoded(v, e) ==> v.cursor == cursor && v.ring == ring,
 {
     let n = e.ring_numbers@;
@@ -735,13 +733,13 @@ proof fn lemma_envelope_round_trip<F: Persist>(
 
 /// T6c round trip: decoding the envelope `encode_durable_snapshot` builds gives back the
 /// durable snapshot's view, bar the fold (A5), for a config whose window holds the ring.
-proof fn lemma_durable_round_trip<F: Persist>(v: EngineView, e: Envelope, config: EngineConfig)
+proof fn lemma_durable_round_trip<F: Persist, T: View<V = Seq<u8>>>(v: EngineView, e: Envelope<T>, config: EngineConfig)
     requires
         v.wf(),
-        durable_encodes::<F>(v, e),
+        durable_encodes::<F, _>(v, e),
         v.ring.len() <= config.ring_capacity,
     ensures
-        accepted::<F>(e, config),
+        accepted::<F, _>(e, config),
         forall|d: EngineView|
             restored(d, config) && #[trigger] decoded(d, e) ==> d == (EngineView {
                 fold: d.fold,
@@ -751,7 +749,7 @@ proof fn lemma_durable_round_trip<F: Persist>(v: EngineView, e: Envelope, config
     let k = e.ring_numbers@.len() as int;
     lemma_durable_snapshot(v, k, 0);
     let snap = v.durable_snapshot(k, 0);
-    lemma_envelope_round_trip::<F>(e, snap.cursor, snap.ring, config);
+    lemma_envelope_round_trip::<F, _>(e, snap.cursor, snap.ring, config);
     let full = v.durable_snapshot(k, config.checkpoint_slots as nat);
     assert forall|d: EngineView| restored(d, config) && #[trigger] decoded(d, e) implies d == (
     EngineView { fold: d.fold, ..full }) by {
@@ -764,7 +762,7 @@ proof fn lemma_durable_round_trip<F: Persist>(v: EngineView, e: Envelope, config
 /// Hand-builds and frames an envelope with caller-chosen fields, for adversarial tests.
 #[cfg(test)]
 fn encode_custom(
-    tag: &[u8],
+    tag: &'static [u8],
     cursor: Option<Position>,
     ring: &[BlockRef],
     state: Vec<u8>,
@@ -775,7 +773,7 @@ fn encode_custom(
     let envelope = Envelope {
         magic: SNAPSHOT_MAGIC,
         version: SNAPSHOT_VERSION,
-        tag: tag.to_vec(),
+        tag,
         cursor_set,
         cursor_block,
         cursor_log_index,
@@ -963,6 +961,45 @@ mod tests {
         // then bytes 0..8 equal SNAPSHOT_MAGIC and bytes 8..10 equal the version LE
         assert_eq!(magic, SNAPSHOT_MAGIC);
         assert_eq!(version, SNAPSHOT_VERSION);
+    }
+
+    #[test]
+    fn borrowed_and_owned_tags_serialize_to_the_same_bytes() {
+        // given one envelope with the encode side's borrowed tag and one with the decode
+        // side's owned tag, equal in every field
+        let tag = RecordingFold::STATE_TAG.as_bytes();
+        let borrowed = super::Envelope {
+            magic: SNAPSHOT_MAGIC,
+            version: SNAPSHOT_VERSION,
+            tag,
+            cursor_set: 1,
+            cursor_block: 7,
+            cursor_log_index: 3,
+            ring_numbers: vec![6, 7],
+            ring_hashes: vec![9; 64],
+            state: vec![1, 2, 3],
+        };
+        let owned = super::Envelope {
+            magic: SNAPSHOT_MAGIC,
+            version: SNAPSHOT_VERSION,
+            tag: tag.to_vec(),
+            cursor_set: 1,
+            cursor_block: 7,
+            cursor_log_index: 3,
+            ring_numbers: vec![6, 7],
+            ring_hashes: vec![9; 64],
+            state: vec![1, 2, 3],
+        };
+        // when both are serialized with the envelope config
+        let mut from_borrowed = Vec::new();
+        assert!(super::write_payload(&mut from_borrowed, &borrowed));
+        let mut from_owned = Vec::new();
+        wincode::config::serialize_into(&mut from_owned, &owned, super::ENVELOPE_CONFIG)
+            .unwrap();
+        // then the bytes are equal, and they decode to the same tag
+        assert_eq!(from_borrowed, from_owned);
+        let decoded = super::read_envelope(&from_borrowed).unwrap();
+        assert_eq!(decoded.tag, tag);
     }
 
     #[test]

@@ -115,7 +115,7 @@ pub struct ExReadError(wincode::ReadError);
 // the crate's one-line wrapper, so the codec's config types and traits stay out of the proofs.
 #[cfg(feature = "wincode")]
 pub assume_specification[ crate::snapshot::read_envelope ](payload: &[u8]) -> wincode::ReadResult<
-    crate::snapshot::Envelope,
+    crate::snapshot::Envelope<Vec<u8>>,
 >;
 
 // A6: empty contract, it asserts nothing, and `out` may hold anything afterwards. The encode
@@ -125,7 +125,7 @@ pub assume_specification[ crate::snapshot::read_envelope ](payload: &[u8]) -> wi
 #[cfg(feature = "wincode")]
 pub assume_specification[ crate::snapshot::write_payload ](
     out: &mut Vec<u8>,
-    envelope: &crate::snapshot::Envelope,
+    envelope: &crate::snapshot::Envelope<&'static [u8]>,
 ) -> bool;
 
 // A6: empty contract, it asserts nothing. `write_envelope` (P7b) appends the trailer bytes
