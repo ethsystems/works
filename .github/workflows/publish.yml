@@ -152,6 +152,7 @@ jobs:
           set -euo pipefail
           flags=$(python3 .github/scripts/hack-flags.py "crates/$CRATE")
           # unquoted: the translator emits several arguments
+          # shellcheck disable=SC2086
           cargo hack clippy -p "$CRATE" --locked $flags -- -D warnings
 
       - name: Test powerset
@@ -162,6 +163,7 @@ jobs:
           set -euo pipefail
           flags=$(python3 .github/scripts/hack-flags.py "crates/$CRATE")
           # unquoted: the translator emits several arguments
+          # shellcheck disable=SC2086
           cargo hack nextest run -p "$CRATE" --locked $flags --no-tests=pass
 
       - name: Audit dependencies

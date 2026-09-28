@@ -33,7 +33,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          crates=$(ls -d crates/*/ | xargs -n1 basename | sort \
+          crates=$(find crates -mindepth 1 -maxdepth 1 -type d -printf "%f\n" | sort \
             | jq -R -s -c 'split("\n") | map(select(length > 0))')
           echo "crates=$crates" >> "$GITHUB_OUTPUT"
           echo "discovered: $crates"
@@ -64,6 +64,7 @@ jobs:
           flags=$(python3 .github/scripts/hack-flags.py "crates/$CRATE")
           echo "hack flags: $flags"
           # unquoted: the translator emits several arguments
+          # shellcheck disable=SC2086
           cargo hack clippy -p "$CRATE" $flags -- -D warnings
 
   test:
@@ -90,6 +91,7 @@ jobs:
           flags=$(python3 .github/scripts/hack-flags.py "crates/$CRATE")
           echo "hack flags: $flags"
           # unquoted: the translator emits several arguments
+          # shellcheck disable=SC2086
           cargo hack nextest run -p "$CRATE" $flags --no-tests=pass
 
   # hack.toml skips the docs feature, so it is covered here instead.
@@ -113,6 +115,8 @@ jobs:
     env:
       VERUS_VERSION: 0.2026.09.20.aef82ed
       VERUS_SHA256: 7b870fa12bc589015c2fab60a8b3d9f07c7b1adb3444eb0fadffcbf7f0447b33
+      # Raise with each phase that adds proofs (P5, P8), so dropped proofs fail the job.
+      VERUS_MIN_VERIFIED: 172
     steps:
       - uses: actions/checkout@v7
       - name: Static gates
@@ -136,9 +140,21 @@ jobs:
           echo "RUSTUP_TOOLCHAIN=$toolchain" >> "$GITHUB_ENV"
           echo "$dir" >> "$GITHUB_PATH"
       - name: Verify
-        run: >-
-          cargo verus verify -p chainfold --features verus,wincode
-          --check-toolchain --fwd-verus-args-to roots
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo verus verify -p chainfold --features verus,wincode \
+            --check-toolchain --fwd-verus-args-to roots 2>&1 | tee "$RUNNER_TEMP/verus.log"
+          # A cached or skipped run prints no results line and proves nothing, so require
+          # exactly one "N verified, 0 errors" line with N at or above the floor.
+          n=$(sed -nE 's/^verification results:: ([0-9]+) verified, 0 errors$/\1/p' "$RUNNER_TEMP/verus.log")
+          case "$n" in
+            '' | *[!0-9]*) echo "::error::no single 'N verified, 0 errors' line"; exit 1 ;;
+          esac
+          if [ "$n" -lt "$VERUS_MIN_VERIFIED" ]; then
+            echo "::error::$n verified, below the floor of $VERUS_MIN_VERIFIED"
+            exit 1
+          fi
 
   gate:
     name: CI Gate
