@@ -111,6 +111,18 @@ impl<E> Batch<E> {
         self.ends.push(self.events.len());
     }
 
+    /// Span `i`, oldest first, whose events begin at `start`: the previous span's end, or
+    /// 0 for the first. `i` must be below `span_count`.
+    pub(crate) fn span(&self, i: usize, start: usize) -> SpanView<'_, E> {
+        let end = self.ends[i];
+        SpanView {
+            number: self.blocks[i],
+            hash: &self.hashes[i],
+            log_indices: &self.log_indices[start..end],
+            events: &self.events[start..end],
+        }
+    }
+
     /// Iterates spans oldest first with their event slices.
     pub fn spans(&self) -> Spans<'_, E> {
         Spans {

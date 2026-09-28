@@ -224,15 +224,25 @@ impl<F: Fold> Engine<F> {
         }
 
         let mut summary = ApplySummary::default();
-        for span in batch.spans() {
-            let redelivered = self
-                .cursor
-                .is_some_and(|cursor| span.number <= cursor.block);
-            if redelivered
-                && let Some(observed_hash) = self.ring.hash_at(span.number)
-                && &observed_hash != span.hash
-            {
-                return Err(fork_suspected(span.number, observed_hash, span.block()));
+        let mut start = 0usize;
+        for i in 0..batch.span_count() {
+            let span = batch.span(i, start);
+            start += span.events.len();
+            let redelivered = match self.cursor {
+                Some(cursor) => span.number <= cursor.block,
+                None => false,
+            };
+            if redelivered {
+                match self.ring.hash_at(span.number) {
+                    Some(observed_hash) if &observed_hash != span.hash => {
+                        return Err(fork_suspected(
+                            span.number,
+                            observed_hash,
+                            span.block(),
+                        ));
+                    }
+                    _ => {}
+                }
             }
             self.apply_span(&span, &mut summary)?;
         }
@@ -335,29 +345,38 @@ impl<F: Fold> Engine<F> {
         summary: &mut ApplySummary,
     ) -> Result<(), ApplyError<F::Error>> {
         let number = span.number;
-        let pos = |log_index: u32| Position::new(number, u64::from(log_index));
         let deduped = match self.cursor {
             Some(cursor) if number > cursor.block => 0,
             Some(cursor) if number < cursor.block => span.log_indices.len(),
-            Some(cursor) => span
-                .log_indices
-                .partition_point(|index| u64::from(*index) <= cursor.log_index),
+            Some(cursor) => count_at_or_below(span.log_indices, cursor.log_index),
             None => 0,
         };
         summary.deduped += deduped as u64;
-        // lanes are equal length by construction, so the paired walk drops no event
-        let indices = &span.log_indices[deduped..];
-        let events = &span.events[deduped..];
-        let Some(last) = indices.last() else {
+        let (indices, events) = if deduped == 0 {
+            (span.log_indices, span.events)
+        } else {
+            (
+                span.log_indices.split_at(deduped).1,
+                span.events.split_at(deduped).1,
+            )
+        };
+        let len = indices.len();
+        if len == 0 {
             return Ok(());
+        }
+        // lanes are equal length by construction, so the paired walk drops no event
+        let paired = if len < events.len() {
+            len
+        } else {
+            events.len()
         };
 
-        for (offset, (log_index, event)) in indices.iter().zip(events).enumerate() {
-            let at = pos(*log_index);
-            match self.fold.apply(at, event) {
+        for offset in 0..paired {
+            let at = span_pos(number, indices[offset]);
+            match self.fold.apply(at, &events[offset]) {
                 Ok(()) => summary.applied += 1,
                 Err(FoldError::Skip(_)) => {
-                    self.skips += 1;
+                    self.skips = self.skips.saturating_add(1);
                     summary.skipped += 1;
                 }
                 Err(FoldError::Halt(error)) => {
@@ -370,7 +389,7 @@ impl<F: Fold> Engine<F> {
                 }
             }
         }
-        self.advance(span.number, span.hash, pos(*last));
+        self.advance(span.number, span.hash, span_pos(number, indices[len - 1]));
         Ok(())
     }
 
@@ -394,11 +413,11 @@ impl<F: Fold> Engine<F> {
     /// Ring and cursor move together, so the ring's newest entry is the cursor block
     /// at every point a batch can return from.
     fn advance(&mut self, number: u64, hash: &[u8; 32], pos: Position) {
-        if self
-            .ring
-            .newest_number()
-            .is_none_or(|newest| newest < number)
-        {
+        let entered = match self.ring.newest_number() {
+            Some(newest) => newest < number,
+            None => true,
+        };
+        if entered {
             let block = BlockRef {
                 number,
                 hash: *hash,
@@ -419,6 +438,34 @@ impl<F: Fold> Engine<F> {
     fn poison(&mut self, at: Position, error: F::Error) -> ApplyError<F::Error> {
         self.status = EngineStatus::Poisoned { at };
         ApplyError::Poisoned { at, error }
+    }
+}
+
+/// Position of a span event.
+fn span_pos(number: u64, log_index: u32) -> Position {
+    Position::new(number, u64::from(log_index))
+}
+
+/// Count of the leading log indices at or below `bound`; the lane is strictly ascending.
+fn count_at_or_below(log_indices: &[u32], bound: u64) -> usize {
+    let mut base = 0usize;
+    let mut rest = log_indices;
+    while rest.len() > 1 {
+        // both candidate windows keep len - half entries, as in std's binary search
+        let half = rest.len() / 2;
+        let high = rest.split_at(half).1;
+        let low = rest.split_at(high.len()).0;
+        if u64::from(rest[half]) <= bound {
+            base += half;
+            rest = high;
+        } else {
+            rest = low;
+        }
+    }
+    if rest.len() == 1 && u64::from(rest[0]) <= bound {
+        base + 1
+    } else {
+        base
     }
 }
 
@@ -1281,6 +1328,24 @@ mod tests {
         engine.rollback_at_or_below(3).unwrap();
         // then durable_point is the block 2 cursor
         assert_eq!(engine.durable_point(), Some(Position::new(2, 0)));
+    }
+
+    #[test]
+    fn count_at_or_below_matches_partition_point() {
+        // given strictly ascending lanes of every length up to 9
+        for len in 0u32..=9 {
+            let lane: Vec<u32> = (0..len).map(|i| 2 * i + 1).collect();
+            // when counting at every bound from below the first to past the last
+            for bound in 0..=u64::from(2 * len + 1) {
+                // then the count agrees with std's partition point
+                let expected = lane.partition_point(|index| u64::from(*index) <= bound);
+                assert_eq!(
+                    count_at_or_below(&lane, bound),
+                    expected,
+                    "{lane:?} {bound}"
+                );
+            }
+        }
     }
 
     #[test]
