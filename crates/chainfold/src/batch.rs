@@ -94,9 +94,19 @@ impl<E> Batch<E> {
     ) {
         self.blocks.push(block.number);
         self.hashes.push(block.hash);
-        for (log_index, event) in events {
-            self.log_indices.push(log_index);
-            self.events.push(event);
+        let mut events = events.into_iter();
+        #[expect(
+            clippy::while_let_loop,
+            reason = "loop and match is the form Verus verifies"
+        )]
+        loop {
+            match events.next() {
+                Some((log_index, event)) => {
+                    self.log_indices.push(log_index);
+                    self.events.push(event);
+                }
+                None => break,
+            }
         }
         self.ends.push(self.events.len());
     }
@@ -116,7 +126,8 @@ impl<E> Batch<E> {
             return Err(BatchShapeError::BlocksNotAscending { span });
         }
         let mut start = 0usize;
-        for (span, end) in self.ends.iter().copied().enumerate() {
+        for span in 0..self.ends.len() {
+            let end = self.ends[span];
             if end <= start {
                 return Err(BatchShapeError::SpanEmpty { span });
             }
@@ -136,11 +147,10 @@ impl<E> Batch<E> {
 ///
 /// The sweep is branchless so it vectorizes; the cold locate pass runs only on failure.
 pub(crate) fn first_descent<T: Ord>(values: &[T]) -> Option<usize> {
-    let tail = values.get(1..).unwrap_or_default();
-    let ascending = values
-        .iter()
-        .zip(tail)
-        .fold(true, |acc, (a, b)| acc & (a < b));
+    let mut ascending = true;
+    for i in 1..values.len() {
+        ascending &= values[i - 1] < values[i];
+    }
     if ascending {
         return None;
     }
@@ -148,11 +158,14 @@ pub(crate) fn first_descent<T: Ord>(values: &[T]) -> Option<usize> {
 }
 
 #[cold]
+#[expect(clippy::manual_find, reason = "Verus has no spec for Iterator::find")]
 fn locate_descent<T: Ord>(values: &[T]) -> Option<usize> {
-    values
-        .windows(2)
-        .position(|pair| pair[1] <= pair[0])
-        .map(|offset| offset + 1)
+    for i in 1..values.len() {
+        if values[i] <= values[i - 1] {
+            return Some(i);
+        }
+    }
+    None
 }
 
 /// Oldest-first iterator over a batch's spans.
