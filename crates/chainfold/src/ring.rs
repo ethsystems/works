@@ -20,7 +20,10 @@ use vstd::{
     prelude::*,
 };
 
-use crate::position::BlockRef;
+use crate::{
+    position::BlockRef,
+    source::Source,
+};
 
 /// True when `n` is a power of two; spelled out rather than std's so the verifier can state it.
 pub(crate) const fn is_power_of_two(n: usize) -> bool {
@@ -310,6 +313,31 @@ impl BlockRing {
     pub(crate) fn observes(&self, number: u64) -> bool {
         self.index_of(number).is_some()
     }
+
+    /// Bisects for the length of the oldest-first prefix the source still confirms, so
+    /// entry `lo - 1` is the deepest canonical block and 0 means none is. At most
+    /// `floor(log2 len) + 1` `header_at` calls; a source error is returned as is.
+    pub(crate) fn canonical_prefix<S: Source>(
+        &self,
+        source: &mut S,
+    ) -> Result<usize, S::Error> {
+        let mut lo = 0usize;
+        let mut hi = self.len;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let physical = self.physical(mid);
+            let confirmed = match source.header_at(self.numbers[physical])? {
+                Some(header) => header.hash == self.hashes[physical],
+                None => false,
+            };
+            if confirmed {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        Ok(lo)
+    }
 }
 
 /// Oldest-first iterator over observed blocks.
@@ -342,7 +370,10 @@ impl ExactSizeIterator for Observed<'_> {}
 #[cfg(test)]
 mod tests {
     use super::BlockRing;
-    use crate::position::BlockRef;
+    use crate::{
+        position::BlockRef,
+        source::Source,
+    };
     #[cfg(not(feature = "std"))]
     use alloc::{
         vec,
@@ -492,6 +523,139 @@ mod tests {
         // then only the retained one is observed
         assert!(retained);
         assert!(!evicted);
+    }
+
+    /// Answers `header_at` from a fixed view, counting calls and failing the numbered one.
+    struct View {
+        canonical: Vec<BlockRef>,
+        calls: u32,
+        fail_on: Option<u32>,
+    }
+
+    impl View {
+        /// A view that confirms entry `i` of `ring` exactly when bit `i` of `mask` is set.
+        /// Unconfirmed entries alternate between a forked hash and a missing header.
+        fn of(ring: &BlockRing, mask: u32) -> Self {
+            let canonical = ring
+                .iter()
+                .enumerate()
+                .filter_map(|(i, block)| match ((mask >> i) & 1, i % 2) {
+                    (1, _) => Some(block),
+                    (_, 0) => Some(BlockRef {
+                        hash: [0xff; 32],
+                        ..block
+                    }),
+                    _ => None,
+                })
+                .collect();
+            Self {
+                canonical,
+                calls: 0,
+                fail_on: None,
+            }
+        }
+    }
+
+    impl Source for View {
+        type Error = u32;
+        type Event = ();
+
+        fn head(&mut self) -> Result<u64, u32> {
+            Ok(0)
+        }
+
+        fn header_at(&mut self, number: u64) -> Result<Option<BlockRef>, u32> {
+            self.calls += 1;
+            if self.fail_on == Some(self.calls) {
+                return Err(self.calls);
+            }
+            Ok(self.canonical.iter().copied().find(|b| b.number == number))
+        }
+
+        fn events_in(
+            &mut self,
+            _from: u64,
+            _to: u64,
+            _out: &mut Vec<(BlockRef, u32, ())>,
+        ) -> Result<(), u32> {
+            Ok(())
+        }
+    }
+
+    /// Rings of every length up to `capacity`, wrapped first so logical and physical
+    /// indices differ, and gapped so numbers and indices differ.
+    fn rings(capacity: usize) -> impl Iterator<Item = BlockRing> {
+        (0..=capacity).map(move |len| {
+            let mut ring = BlockRing::with_capacity(capacity);
+            for number in 0..(capacity + len) as u64 {
+                ring.push(block(3 * number + 1));
+            }
+            ring.truncate_above(len.checked_sub(1).map_or(0, |i| ring.get(i).number));
+            ring
+        })
+    }
+
+    #[test]
+    fn canonical_prefix_probes_at_most_log2_len_plus_one_times() {
+        for ring in rings(16) {
+            let len = ring.iter().len();
+            let bound = if len == 0 { 0 } else { len.ilog2() + 1 };
+            for mask in 0..1u32 << len {
+                // given any confirmation pattern over the ring, not only a prefix
+                let mut view = View::of(&ring, mask);
+                // when bisecting
+                let lo = ring.canonical_prefix(&mut view).unwrap();
+                // then the probe count stays within the bound, and lo sits on a
+                // confirmed-to-unconfirmed boundary
+                assert!(
+                    view.calls <= bound,
+                    "len {len} mask {mask:b}: {} calls",
+                    view.calls
+                );
+                assert!(
+                    lo == 0 || (mask >> (lo - 1)) & 1 == 1,
+                    "len {len} mask {mask:b}"
+                );
+                assert!(
+                    lo == len || (mask >> lo) & 1 == 0,
+                    "len {len} mask {mask:b}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn canonical_prefix_is_the_deepest_canonical_entry_of_one_view() {
+        for ring in rings(8) {
+            let len = ring.iter().len();
+            for k in 0..=len {
+                // given one view in which exactly the oldest k entries are canonical
+                let mut view = View::of(&ring, (1u32 << k) - 1);
+                // when bisecting
+                let lo = ring.canonical_prefix(&mut view).unwrap();
+                // then the prefix is exactly k long, so entry k - 1 is the deepest match
+                assert_eq!(lo, k, "len {len}");
+            }
+        }
+    }
+
+    #[test]
+    fn canonical_prefix_passes_a_source_error_through_unchanged() {
+        let ring = rings(8).nth(8).unwrap();
+        let mut clean = View::of(&ring, 0b0111);
+        ring.canonical_prefix(&mut clean).unwrap();
+        for fail_on in 1..=clean.calls {
+            // given a source that fails on its nth probe
+            let before = ring.clone();
+            let mut view = View::of(&ring, 0b0111);
+            view.fail_on = Some(fail_on);
+            // when bisecting
+            let result = ring.canonical_prefix(&mut view);
+            // then that error comes back, no probe follows it, and the ring is unchanged
+            assert_eq!(result, Err(fail_on));
+            assert_eq!(view.calls, fail_on);
+            assert_eq!(ring, before);
+        }
     }
 
     #[test]

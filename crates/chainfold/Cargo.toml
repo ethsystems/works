@@ -86,6 +86,7 @@ in-scope = ["src/ring.rs"]
 "src/ring.rs::BlockRing::iter" = "P4"
 "src/ring.rs::BlockRing::iter_at_or_below" = "P4"
 "src/ring.rs::BlockRing::observes" = "P4"
+"src/ring.rs::BlockRing::canonical_prefix" = "P4"
 "src/ring.rs::Observed::next" = "P4"
 "src/ring.rs::Observed::size_hint" = "P4"
 

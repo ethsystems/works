@@ -186,6 +186,10 @@ impl<F: Fold> Engine<F> {
         self.ring.iter()
     }
 
+    pub(crate) fn ring(&self) -> &BlockRing {
+        &self.ring
+    }
+
     /// Iterates observed blocks at or below a number, oldest first; a checkpoint's window.
     #[cfg(feature = "wincode")]
     pub(crate) fn observed_at_or_below(&self, number: u64) -> Observed<'_> {

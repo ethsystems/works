@@ -537,24 +537,18 @@ where
     /// Bisects the observed ring for the deepest still-canonical block, then rolls back.
     #[cold]
     fn recover_via_bisection(&mut self) -> Tick {
-        let observed: Vec<BlockRef> = self.engine.observed().collect();
-        let mut lo = 0usize;
-        let mut hi = observed.len();
-        while lo < hi {
-            let mid = lo + (hi - lo) / 2;
-            match self.source.header_at(observed[mid].number) {
-                Ok(Some(header)) if header.hash == observed[mid].hash => lo = mid + 1,
-                Ok(_) => hi = mid,
-                Err(_) => {
-                    self.consecutive_errors = self.consecutive_errors.saturating_add(1);
-                    return Tick::SourceError;
-                }
+        let ring = self.engine.ring();
+        match ring.canonical_prefix(&mut self.source) {
+            Ok(0) => self.resync_or_terminal(),
+            Ok(lo) => {
+                let ancestor = ring.get(lo - 1).number;
+                self.roll_back_to(ancestor)
+            }
+            Err(_) => {
+                self.consecutive_errors = self.consecutive_errors.saturating_add(1);
+                Tick::SourceError
             }
         }
-        if lo == 0 {
-            return self.resync_or_terminal();
-        }
-        self.roll_back_to(observed[lo - 1].number)
     }
 
     /// Advances the loop by one poll, apply, and recovery step.
