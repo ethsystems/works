@@ -471,4 +471,26 @@ pub open spec fn prefix_at_or_below(r: Seq<BlockRef>, n: u64, k: int) -> bool {
     &&& forall|i: int| k <= i < r.len() ==> #[trigger] r[i].number > n
 }
 
+/// View `v` holds block `b` at its height (T4c: a probe confirms a ring entry).
+pub open spec fn confirms(v: ChainView, b: BlockRef) -> bool {
+    header(v, b.number) == Some(b)
+}
+
+/// `v` holds every height below each height it holds, as a chain from genesis does
+/// (T4c hypothesis; `chain` alone does not force it).
+pub open spec fn down_closed(v: ChainView) -> bool {
+    forall|n: u64, m: u64| #[trigger] v.contains_key(n) && m <= n ==> #[trigger] v.contains_key(m)
+}
+
+/// `k` is the longest prefix of `r` that `v` confirms entry by entry (T4c optimality).
+pub open spec fn confirmed_prefix(r: Seq<BlockRef>, v: ChainView, k: int) -> bool {
+    &&& 0 <= k <= r.len()
+    &&& forall|i: int| 0 <= i < k ==> confirms(v, #[trigger] r[i])
+    &&& k < r.len() ==> !confirms(v, r[k])
+}
+
+/// The views that answered each call on source `S` so far, oldest first; every `Source`
+/// call appends `sview` of its post-state (A2 bookkeeping, T4c).
+pub uninterp spec fn sview_log<S: ?Sized>(s: &S) -> Seq<ChainView>;
+
 } // verus!

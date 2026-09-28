@@ -12,9 +12,17 @@ use std::{
 #[cfg(verus_keep_ghost)]
 use {
     crate::verus::model::{
+        ChainView,
+        a1,
+        confirmed_prefix,
+        confirms,
+        down_closed,
         observes,
         prefix_at_or_below,
+        ring_chain,
         ring_push,
+        sview,
+        sview_log,
     },
     vstd::{
         arithmetic::{
@@ -549,11 +557,47 @@ impl BlockRing {
     /// Bisects for the length of the oldest-first prefix the source still confirms, so
     /// entry `lo - 1` is the deepest canonical block and 0 means none is. At most
     /// `floor(log2 len) + 1` `header_at` calls; a source error is returned as is.
+    // T4c. This bisection's probes are the calls it appends to `sview_log`: `hist[k]` for
+    // `k` from `old(source)`'s log length on, each one the view that answered that probe.
     #[cfg_attr(verus_keep_ghost, verus_spec(r =>
         requires
             self.wf(),
         ensures
-            r matches Ok(lo) ==> lo <= self@.len(),
+            ({
+                let (from, hist) = (
+                    sview_log::<S>(old(source)).len() as int,
+                    sview_log::<S>(final(source)),
+                );
+                &&& from <= hist.len()
+                &&& hist.subrange(0, from) == sview_log::<S>(old(source))
+                // Probe bound, unconditional: at most floor(log2 len) + 1 calls.
+                &&& hist.len() - from <= log(2, self@.len() as int) + 1
+                &&& forall|k: int| from <= k < hist.len() ==> a1::<S, S::Event>(#[trigger] hist[k])
+                &&& r matches Ok(lo) ==> {
+                    &&& lo <= self@.len()
+                    // Safety (A1): a probe's view held `ring[lo - 1]`, so by `ring_chain` it
+                    // holds `ring[..lo]` at every height it has.
+                    &&& lo > 0 ==> exists|k: int|
+                        from <= k < hist.len() && #[trigger] confirms(hist[k], self@[lo - 1])
+                            && (ring_chain(self@) ==> forall|i: int|
+                            0 <= i < lo && hist[k].contains_key(#[trigger] self@[i].number)
+                                ==> hist[k][self@[i].number] == self@[i]) && (ring_chain(self@)
+                            && down_closed(hist[k]) ==> forall|i: int|
+                            0 <= i < lo ==> confirms(hist[k], #[trigger] self@[i]))
+                    // A probe's view did not hold `ring[lo]`.
+                    &&& lo < self@.len() ==> exists|k: int|
+                        from <= k < hist.len() && !#[trigger] confirms(hist[k], self@[lo as int])
+                    // Optimality (A1 + A2'): with one view for every probe, `lo` is the
+                    // longest prefix that view confirms.
+                    &&& forall|v: ChainView|
+                        (forall|k: int| from <= k < hist.len() ==> #[trigger] hist[k] == v)
+                            && down_closed(v) && ring_chain(self@) ==> confirmed_prefix(
+                            self@,
+                            v,
+                            lo as int,
+                        )
+                }
+            }),
     ))]
     pub(crate) fn canonical_prefix<S: Source>(
         &self,
@@ -561,24 +605,97 @@ impl BlockRing {
     ) -> Result<usize, S::Error> {
         let mut lo = 0usize;
         let mut hi = self.len;
+        #[cfg(verus_keep_ghost)]
+        proof_decl! {
+            let ghost log0 = sview_log::<S>(source);
+            let ghost from = log0.len() as int;
+            // The probes that set `lo` (confirmed `lo - 1`) and `hi` (did not confirm `hi`).
+            let ghost mut lo_k: int = 0;
+            let ghost mut hi_k: int = 0;
+            lemma2_to64();
+            assert(pow2(0) * self.len == self.len);
+            assert(sview_log::<S>(source).subrange(0, from) =~= log0);
+        }
         #[cfg_attr(verus_keep_ghost, verus_spec(
             invariant
                 self.wf(),
                 lo <= hi <= self.len,
+                log0 == sview_log::<S>(old(source)),
+                from == log0.len(),
+                from <= sview_log::<S>(source).len(),
+                sview_log::<S>(source).subrange(0, from) == log0,
+                forall|k: int|
+                    from <= k < sview_log::<S>(source).len() ==> a1::<S, S::Event>(
+                        #[trigger] sview_log::<S>(source)[k],
+                    ),
+                lo > 0 ==> from <= lo_k < sview_log::<S>(source).len() && confirms(
+                    sview_log::<S>(source)[lo_k],
+                    self@[lo - 1],
+                ),
+                hi < self.len ==> from <= hi_k < sview_log::<S>(source).len() && !confirms(
+                    sview_log::<S>(source)[hi_k],
+                    self@[hi as int],
+                ),
+                pow2((sview_log::<S>(source).len() - from) as nat) * (hi - lo) <= self.len,
+                sview_log::<S>(source).len() > from ==> pow2(
+                    (sview_log::<S>(source).len() - from - 1) as nat,
+                ) <= self.len,
             decreases hi - lo,
         ))]
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
             let physical = self.physical(mid);
+            #[cfg(verus_keep_ghost)]
+            proof_decl! {
+                let ghost pre = sview_log::<S>(source);
+                let ghost p = (pre.len() - from) as nat;
+                let ghost gap = hi - lo;
+                lemma_pow2_pos(p);
+                lemma_pow2_unfold(p + 1);
+                assert(pow2(p) <= self.len) by (nonlinear_arith)
+                    requires
+                        hi - lo >= 1,
+                        pow2(p) * (hi - lo) <= self.len,
+                ;
+                // Counts this probe, so it also bounds a `?` exit.
+                lemma_probe_bound(p + 1, self.len as int);
+            }
             let confirmed = match source.header_at(self.numbers[physical])? {
                 Some(header) => header.hash == self.hashes[physical],
                 None => false,
             };
+            #[cfg(verus_keep_ghost)]
+            proof! {
+                broadcast use vstd::array::group_array_axioms;
+                let post = sview_log::<S>(source);
+                let v = post.last();
+                assert(post.subrange(0, from) =~= pre.subrange(0, from));
+                if confirmed {
+                    assert(v[self@[mid as int].number].hash =~= self@[mid as int].hash);
+                    assert(confirms(v, self@[mid as int]));
+                    lo_k = pre.len() as int;
+                } else {
+                    hi_k = pre.len() as int;
+                }
+            }
             if confirmed {
                 lo = mid + 1;
             } else {
                 hi = mid;
             }
+            #[cfg(verus_keep_ghost)]
+            proof! {
+                assert(pow2(p + 1) * (hi - lo) <= self.len) by (nonlinear_arith)
+                    requires
+                        pow2(p + 1) == 2 * pow2(p),
+                        2 * (hi - lo) <= gap,
+                        pow2(p) * gap <= self.len,
+                ;
+            }
+        }
+        #[cfg(verus_keep_ghost)]
+        proof! {
+            lemma_probe_bound((sview_log::<S>(source).len() - from) as nat, self.len as int);
         }
         Ok(lo)
     }

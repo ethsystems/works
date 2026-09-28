@@ -11,6 +11,7 @@ use {
         header,
         range_entries,
         sview,
+        sview_log,
     },
     vstd::prelude::*,
 };
@@ -31,7 +32,8 @@ pub enum ReplayHorizon {
 
 /// Random-access event supply over one chain.
 // A1/A2: each call answers from one view, `sview` of the source after the call, and every
-// view satisfies `a1`. Implementations are trusted to meet this spec.
+// view satisfies `a1`. `sview_log` records those views in call order. Implementations are
+// trusted to meet this spec.
 #[cfg_attr(verus_keep_ghost, verus_verify)]
 pub trait Source {
     /// Consumer event the source decodes its wire format into.
@@ -43,6 +45,9 @@ pub trait Source {
     #[cfg_attr(verus_keep_ghost, verus_spec(r =>
         ensures
             a1::<Self, Self::Event>(sview::<Self>(final(self))),
+            sview_log::<Self>(final(self)) == sview_log::<Self>(old(self)).push(
+                sview::<Self>(final(self)),
+            ),
     ))]
     fn head(&mut self) -> Result<u64, Self::Error>;
 
@@ -50,6 +55,9 @@ pub trait Source {
     #[cfg_attr(verus_keep_ghost, verus_spec(r =>
         ensures
             a1::<Self, Self::Event>(sview::<Self>(final(self))),
+            sview_log::<Self>(final(self)) == sview_log::<Self>(old(self)).push(
+                sview::<Self>(final(self)),
+            ),
             r matches Ok(h) ==> h == header(sview::<Self>(final(self)), number),
     ))]
     fn header_at(&mut self, number: u64) -> Result<Option<BlockRef>, Self::Error>;
@@ -58,6 +66,9 @@ pub trait Source {
     #[cfg_attr(verus_keep_ghost, verus_spec(r =>
         ensures
             a1::<Self, Self::Event>(sview::<Self>(final(self))),
+            sview_log::<Self>(final(self)) == sview_log::<Self>(old(self)).push(
+                sview::<Self>(final(self)),
+            ),
             r is Ok ==> {
                 let (pre, post) = (old(out)@, final(out)@);
                 &&& pre.len() <= post.len()
