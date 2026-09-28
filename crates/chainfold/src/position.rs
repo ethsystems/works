@@ -1,3 +1,6 @@
+#[cfg(verus_keep_ghost)]
+use vstd::prelude::*;
+
 /// Total order over chain events: block number, then log index within the block.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -28,6 +31,7 @@ pub(crate) fn pos_gt(a: Option<Position>, b: Option<Position>) -> bool {
 }
 
 /// A block identified by number and hash; the hash commits to the full ancestry.
+#[cfg_attr(verus_keep_ghost, verus_verify)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct BlockRef {

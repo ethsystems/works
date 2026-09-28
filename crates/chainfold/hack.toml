@@ -1,3 +1,3 @@
 depth = 2
-skip = ["docs", "test-helpers"]
+skip = ["docs", "test-helpers", "verus"]
 group = [["serde", "wincode"]]

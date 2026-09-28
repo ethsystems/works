@@ -9,9 +9,26 @@ use std::{
     vec,
 };
 
+#[cfg(verus_keep_ghost)]
+use vstd::{
+    arithmetic::power2::{
+        lemma_pow2_pos,
+        lemma_pow2_unfold,
+        lemma2_to64,
+        pow2,
+    },
+    prelude::*,
+};
+
 use crate::position::BlockRef;
 
 /// Bounded history of observed blocks, structure of arrays, power-of-two capacity.
+// Clone gets its spec with the ring proofs (P4); until then clones are unconstrained.
+#[cfg_attr(
+    verus_keep_ghost,
+    verus_verify,
+    verifier::allow(autoderive_clone_without_spec)
+)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BlockRing {
     numbers: Box<[u64]>,
@@ -19,6 +36,58 @@ pub(crate) struct BlockRing {
     head: usize,
     len: usize,
 }
+
+#[cfg(verus_keep_ghost)]
+verus! {
+
+/// Masking with `w - 1` is reduction modulo `w` when `w` is a power of two.
+proof fn lemma_mask_is_mod(x: usize, w: usize)
+    by (bit_vector)
+    requires
+        w != 0,
+        w & ((w - 1) as usize) == 0,
+    ensures
+        x & ((w - 1) as usize) == x % w,
+        x % w < w,
+{
+}
+
+impl BlockRing {
+    pub(crate) closed spec fn cap(&self) -> int {
+        self.numbers@.len() as int
+    }
+
+    /// Physical slot of a logical (oldest-first) index.
+    spec fn slot(&self, logical: int) -> int {
+        (self.head + logical) % self.cap()
+    }
+
+    /// Well-formedness: power-of-two capacity within the engine's bounds, and
+    /// numbers strictly ascending oldest-first.
+    pub(crate) closed spec fn wf(&self) -> bool {
+        &&& self.hashes@.len() == self.cap()
+        &&& 2 <= self.cap() <= 0x10_0000
+        &&& (self.cap() as usize) & ((self.cap() - 1) as usize) == 0
+        &&& self.head < self.cap()
+        &&& self.len <= self.cap()
+        &&& forall|i: int, j: int|
+            #![trigger self@[i], self@[j]]
+            0 <= i < j < self.len ==> self@[i].number < self@[j].number
+    }
+}
+
+impl View for BlockRing {
+    type V = Seq<BlockRef>;
+
+    closed spec fn view(&self) -> Seq<BlockRef> {
+        Seq::new(
+            self.len as nat,
+            |i: int| BlockRef { number: self.numbers@[self.slot(i)], hash: self.hashes@[self.slot(i)] },
+        )
+    }
+}
+
+} // verus!
 
 impl BlockRing {
     /// Capacity must be a power of two; enforced by EngineConfig validation.
@@ -35,13 +104,26 @@ impl BlockRing {
         }
     }
 
+    #[cfg_attr(verus_keep_ghost, verus_spec(r => ensures r == self.cap()))]
     #[inline]
     pub(crate) fn capacity(&self) -> usize {
         self.numbers.len()
     }
 
+    #[cfg_attr(verus_keep_ghost, verus_spec(r =>
+        requires
+            self.wf(),
+            logical < self.cap(),
+        ensures
+            r == self.slot(logical as int),
+            r < self.cap(),
+    ))]
     #[inline]
     fn physical(&self, logical: usize) -> usize {
+        #[cfg(verus_keep_ghost)]
+        proof! {
+            lemma_mask_is_mod((self.head + logical) as usize, self.cap() as usize);
+        }
         (self.head + logical) & (self.capacity() - 1)
     }
 
@@ -115,6 +197,16 @@ impl BlockRing {
     }
 
     /// Logical index of the newest entry at or below the argument.
+    #[cfg_attr(verus_keep_ghost, verus_spec(r =>
+        requires
+            self.wf(),
+        ensures
+            match r {
+                None => forall|i: int| 0 <= i < self.len ==> #[trigger] self@[i].number > number,
+                Some(i) => i < self.len && self@[i as int].number <= number
+                    && forall|j: int| i < j < self.len ==> #[trigger] self@[j].number > number,
+            },
+    ))]
     fn index_at_or_below(&self, number: u64) -> Option<usize> {
         let newest = self.len.checked_sub(1)?;
         if self.numbers[self.physical(newest)] <= number {
@@ -122,15 +214,60 @@ impl BlockRing {
         }
         let mut low = 0usize;
         let mut high = newest;
+        // Ghost probe count: the loop runs at most floor(log2 newest) + 1 times.
+        #[cfg(verus_keep_ghost)]
+        proof_decl! {
+            let ghost mut probes: nat = 0;
+            lemma2_to64();
+        }
+        #[cfg_attr(verus_keep_ghost, verus_spec(
+            invariant
+                self.wf(),
+                newest + 1 == self.len,
+                low <= high <= newest,
+                low > 0 ==> self@[low as int].number <= number,
+                forall|j: int| high < j < self.len ==> #[trigger] self@[j].number > number,
+                pow2(probes) * (high - low) <= newest,
+                probes > 0 ==> pow2((probes - 1) as nat) <= newest,
+            decreases high - low,
+        ))]
         while low < high {
-            let mid = low + (high - low).div_ceil(2);
+            // `div_ceil` has no vstd spec; this is its definition.
+            let gap = high - low;
+            let mid = low + (gap / 2 + gap % 2);
             if self.numbers[self.physical(mid)] <= number {
                 low = mid;
             } else {
+                #[cfg(verus_keep_ghost)]
+                proof! {
+                    assert(self@[mid as int].number > number);
+                }
                 high = mid - 1;
             }
+            #[cfg(verus_keep_ghost)]
+            proof! {
+                lemma_pow2_unfold(probes + 1);
+                lemma_pow2_pos(probes);
+                assert(pow2(probes + 1) * (high - low) <= newest) by (nonlinear_arith)
+                    requires
+                        pow2(probes + 1) == 2 * pow2(probes),
+                        2 * (high - low) <= gap,
+                        pow2(probes) * gap <= newest,
+                ;
+                assert(pow2(probes) <= newest) by (nonlinear_arith)
+                    requires
+                        gap >= 1,
+                        pow2(probes) > 0,
+                        pow2(probes) * gap <= newest,
+                ;
+                probes = probes + 1;
+            }
         }
-        (self.numbers[self.physical(low)] <= number).then_some(low)
+        if self.numbers[self.physical(low)] <= number {
+            Some(low)
+        } else {
+            None
+        }
     }
 
     /// Empties the ring, keeping the allocation; stale slots stay unreachable below len.

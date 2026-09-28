@@ -3,6 +3,7 @@
 #![cfg_attr(feature = "docs", doc = include_utils::include_md!("README.md:usage"))]
 #![cfg_attr(not(test), deny(clippy::cast_possible_truncation))]
 #![cfg_attr(docsrs, feature(doc_cfg))]
+#![cfg_attr(verus_keep_ghost, feature(proc_macro_hygiene, cfg_eval))]
 #![deny(unused_crate_dependencies)]
 #![deny(warnings)]
 #![cfg_attr(not(feature = "std"), no_std)]
@@ -27,6 +28,14 @@ use crc as _;
 #[cfg(all(feature = "std", not(feature = "wincode")))]
 use crc_fast as _;
 
+// Plain rustc erases every annotation, so vstd is linked but unused.
+#[cfg(all(feature = "verus", not(verus_keep_ghost)))]
+use vstd as _;
+// Verus requires the builtin crates imported at the crate root.
+#[cfg(verus_keep_ghost)]
+#[allow(unused_imports)]
+use vstd::prelude::*;
+
 mod batch;
 mod checkpoint;
 mod driver;
@@ -37,6 +46,8 @@ mod position;
 mod ring;
 mod sink;
 mod source;
+#[cfg(verus_keep_ghost)]
+mod verus;
 
 #[cfg(feature = "wincode")]
 mod snapshot;

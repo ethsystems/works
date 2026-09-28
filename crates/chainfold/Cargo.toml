@@ -24,6 +24,8 @@ include-utils = { workspace = true, optional = true }
 serde = { workspace = true, features = ["derive", "alloc"], optional = true }
 tokio = { version = "1", default-features = false, features = ["sync", "rt"], optional = true }
 wincode = { workspace = true, features = ["alloc", "derive"], optional = true }
+# Pinned to the Verus release in CI; bump both together.
+vstd = { version = "=0.0.0-2026-09-20-0158", default-features = false, features = ["alloc"], optional = true }
 
 [dev-dependencies]
 chainfold = { path = ".", features = ["test-helpers"] }
@@ -41,6 +43,8 @@ storage = ["std", "wincode"]
 tokio = ["std", "dep:tokio"]
 test-helpers = []
 docs = ["dep:include-utils"]
+# Pulls in the Verus spec library; proofs only exist under `cargo verus`.
+verus = ["dep:vstd"]
 
 [[bench]]
 name = "apply"
@@ -60,6 +64,36 @@ required-features = ["std", "test-helpers"]
 [[example]]
 name = "replay"
 required-features = ["tokio", "storage", "test-helpers"]
+
+[package.metadata.verus]
+verify = true
+
+# Read by .github/scripts/verus-gates.py: every fn in an in-scope file must be
+# verified or listed here with the phase that verifies it.
+[package.metadata.verus-gates]
+in-scope = ["src/ring.rs"]
+
+[package.metadata.verus-gates.out-of-scope]
+"src/ring.rs::BlockRing::with_capacity" = "P4"
+"src/ring.rs::BlockRing::push" = "P4"
+"src/ring.rs::BlockRing::newest_number" = "P4"
+"src/ring.rs::BlockRing::get" = "P4"
+"src/ring.rs::BlockRing::hash_at" = "P4"
+"src/ring.rs::BlockRing::index_of" = "P4"
+"src/ring.rs::BlockRing::truncate_above" = "P4"
+"src/ring.rs::BlockRing::clear" = "P4"
+"src/ring.rs::BlockRing::iter" = "P4"
+"src/ring.rs::BlockRing::iter_at_or_below" = "P4"
+"src/ring.rs::BlockRing::observes" = "P4"
+"src/ring.rs::Observed::next" = "P4"
+"src/ring.rs::Observed::size_hint" = "P4"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = [
+    "cfg(verus_keep_ghost)",
+    "cfg(verus_keep_ghost_body)",
+    "cfg(verus_only)",
+] }
 
 [package.metadata.docs.rs]
 all-features = true
