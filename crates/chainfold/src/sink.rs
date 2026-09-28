@@ -10,8 +10,13 @@ use crate::{
 pub trait SnapshotSink<F> {
     /// Offers the engine's durable point for persistence; must not fsync.
     fn offer(&mut self, engine: &Engine<F>) -> Result<(), DurabilityLost>;
-    /// Cursor a restart would recover; falls when a resync persists older state.
+    /// Durable point of the newest offer committed since the last `reset`, which is
+    /// what a restart recovers; None until one commits.
     fn durable_cursor(&self) -> Option<Position>;
+    /// Forgets every earlier offer: `durable_cursor` is None when this returns, and
+    /// stays None until an offer made after this call commits. The driver calls it
+    /// whenever the engine resets, so the durable cursor never leads the new cursor.
+    fn reset(&mut self);
 }
 
 /// Sink that persists nothing; the default for drivers without durability.
@@ -26,6 +31,8 @@ impl<F> SnapshotSink<F> for NoSink {
     fn durable_cursor(&self) -> Option<Position> {
         None
     }
+
+    fn reset(&mut self) {}
 }
 
 #[cfg(test)]

@@ -77,10 +77,13 @@ and recovery), and the adapters (`std`: tokio harness, snapshot store, flusher).
 - the durable cursor rides the manifest as a watermark. Commit writes a temp file, fsyncs
   it, renames, then fsyncs the directory; the manifest is dual-slot, and a commit
   overwrites the older slot so a torn write only damages the copy already superseded.
-- the watermark names the snapshot the manifest points at, so a resync that persists
-  state from genesis lowers it. Reporting the old height would promise a restart point
-  the store no longer holds, and holding the pre-resync snapshot would recover state
-  folded on a chain that no longer exists.
+- the watermark names the snapshot the manifest points at, and counts only offers made
+  since the last engine reset. A resync resets the sink, so the watermark drops to none
+  at once and rises again only when a snapshot of the new chain commits; a job queued
+  before the reset still reaches disk but never raises it. Reporting the old height would
+  promise a durable point on a chain that no longer exists. `SnapshotStore::durable_cursor`
+  still names what a reopen recovers, which may be the pre-reset snapshot; restarting from
+  it is safe, because the ring inside it detects the reorg.
 - the observed ring is structure-of-arrays with power-of-two capacity, so bisection binary
   searches the number lane alone and touches one hash at the end. W = 1024 is 40 KiB.
 - `Batch` is flat: one contiguous event array plus a span array indexing into it. Two

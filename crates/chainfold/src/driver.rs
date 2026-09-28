@@ -24,6 +24,7 @@ use crate::{
     position::{
         BlockRef,
         Position,
+        pos_gt,
     },
     sink::{
         NoSink,
@@ -84,8 +85,9 @@ pub struct DriverStatus {
     pub caught_up: bool,
     /// Events the fold declared not its own.
     pub skips: u64,
-    /// Cursor the sink reports a restart would recover; None without a sink or a
-    /// flush. A resync lowers it, so it holds for the instant it was read.
+    /// Cursor the sink reports a restart would recover; None without a sink, before
+    /// a flush, and from an engine reset until an offer made after it commits. It
+    /// never leads `cursor`.
     pub durable_cursor: Option<Position>,
     /// True once the sink refused an offer; folding continues unpersisted.
     pub durability_lost: bool,
@@ -164,6 +166,7 @@ where
     last_snapshot_block: Option<u64>,
     durability_lost: bool,
     advanced: bool,
+    seen_resets: u64,
 }
 
 impl<F, S> Driver<F, S>
@@ -243,10 +246,13 @@ where
     }
 
     /// Wraps an engine, checking the source horizon against the configured start block.
+    ///
+    /// A sink whose durable cursor leads the engine, such as a store holding a snapshot
+    /// under a fresh engine, is reset so it never reports that stale point.
     fn around(
         engine: Engine<F>,
         source: S,
-        sink: K,
+        mut sink: K,
         initial: F,
         driver_config: DriverConfig,
     ) -> Result<Self, ConfigError> {
@@ -258,6 +264,10 @@ where
                 horizon,
             });
         }
+        if pos_gt(sink.durable_cursor(), engine.cursor()) {
+            sink.reset();
+        }
+        let seen_resets = engine.resets();
         Ok(Self {
             engine,
             source,
@@ -274,6 +284,7 @@ where
             last_snapshot_block: None,
             durability_lost: false,
             advanced: false,
+            seen_resets,
         })
     }
 
@@ -403,13 +414,30 @@ where
         self.caught_up = false;
         self.consecutive_errors = 0;
         self.scanned_to = None;
+        self.reconcile_reset();
+        Tick::Resynced
+    }
+
+    /// Catches up with an engine reset this driver has not seen: resets the sink so
+    /// its durable cursor drops to None, and clears the cadence marks.
+    fn reconcile_reset(&mut self) {
+        let resets = self.engine.resets();
+        if resets != self.seen_resets {
+            self.reconcile_reset_slow(resets);
+        }
+    }
+
+    #[cold]
+    fn reconcile_reset_slow(&mut self, resets: u64) {
+        self.seen_resets = resets;
+        self.sink.reset();
         self.last_checkpoint_block = None;
         self.last_snapshot_block = None;
-        Tick::Resynced
     }
 
     /// Runs one poll-apply step, then records whether the cursor moved forward.
     fn step(&mut self) -> Tick {
+        self.reconcile_reset();
         let tick = self.poll_apply();
         // Only forward cursor movement earns an immediate re-poll; a batch the
         // engine fully deduped leaves the loop on its poll interval.
@@ -540,7 +568,13 @@ where
             engine: self.engine.status(),
             caught_up: self.caught_up,
             skips: self.engine.skip_count(),
-            durable_cursor: self.sink.durable_cursor(),
+            // An unseen reset leaves the sink's pre-reset point in place until the
+            // next tick reconciles it.
+            durable_cursor: if self.seen_resets == self.engine.resets() {
+                self.sink.durable_cursor()
+            } else {
+                None
+            },
             durability_lost: self.durability_lost,
             generation: self.generation,
         }
@@ -916,6 +950,49 @@ mod tests {
         assert_eq!(outcome, Tick::Resynced);
         let after = driver.status().durable_cursor.expect("offers resumed");
         assert!(after < before);
+    }
+
+    #[test]
+    fn resync_drops_the_durable_cursor_on_the_resynced_tick() {
+        // given eight blocks driven to a durable cursor at block 5
+        let mut driver = sink_driver(8, 4, cadence_config(1, 1));
+        run_to_idle(&mut driver);
+        assert_eq!(driver.status().durable_cursor, Some(Position::new(5, 0)));
+        // when a reorg below the ring forces a resync
+        driver.source_mut().reorg(8, &[&[10], &[20], &[30], &[40]]);
+        let outcome = driver.tick();
+        // then the Resynced tick already reports no durable cursor, never one above
+        // the applied cursor
+        let status = driver.status();
+        assert_eq!(outcome, Tick::Resynced);
+        assert_eq!(status.cursor, None);
+        assert_eq!(status.durable_cursor, None);
+        assert_eq!(
+            SnapshotSink::<RecordingFold>::durable_cursor(driver.sink()),
+            None
+        );
+    }
+
+    #[test]
+    fn manual_engine_reset_drops_the_durable_cursor() {
+        // given eight blocks driven to a durable cursor at block 5
+        let mut driver = sink_driver(8, 4, cadence_config(1, 1));
+        run_to_idle(&mut driver);
+        assert_eq!(driver.status().durable_cursor, Some(Position::new(5, 0)));
+        // when the engine is reset by hand through engine_mut
+        driver.engine_mut().reset(RecordingFold::default());
+        let before_tick = driver.status();
+        let outcome = driver.tick();
+        let after_tick = driver.status();
+        // then status reports no durable cursor before the next tick, and after it the
+        // durable cursor trails the refolded cursor
+        assert_eq!(before_tick.durable_cursor, None);
+        assert!(matches!(outcome, Tick::Progressed(_)));
+        assert!(after_tick.durable_cursor <= after_tick.cursor);
+        assert_eq!(
+            after_tick.durable_cursor,
+            SnapshotSink::<RecordingFold>::durable_cursor(driver.sink())
+        );
     }
 
     #[test]

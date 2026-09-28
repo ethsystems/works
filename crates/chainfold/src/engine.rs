@@ -89,6 +89,7 @@ pub struct Engine<F> {
     status: EngineStatus,
     last_verified: Option<BlockRef>,
     skips: u64,
+    resets: u64,
 }
 
 impl<F: Fold> Engine<F> {
@@ -103,6 +104,7 @@ impl<F: Fold> Engine<F> {
             status: EngineStatus::Active,
             last_verified: None,
             skips: 0,
+            resets: 0,
         })
     }
 
@@ -124,6 +126,11 @@ impl<F: Fold> Engine<F> {
     /// Count of events the fold declared not its own.
     pub fn skip_count(&self) -> u64 {
         self.skips
+    }
+
+    /// Count of resets since construction, wrapping; the driver's reset epoch.
+    pub(crate) fn resets(&self) -> u64 {
+        self.resets
     }
 
     /// Count of checkpoints the ring can still serve; expired slots are not counted.
@@ -278,6 +285,9 @@ impl<F: Fold> Engine<F> {
     }
 
     /// Full restart with a fresh fold: clears cursor, ring, checkpoints, counters.
+    ///
+    /// A driver over this engine resets its sink before the next tick or status read,
+    /// so no durable cursor from before the reset is reported.
     pub fn reset(&mut self, fold: F) {
         self.ring.clear();
         self.checkpoints.clear();
@@ -286,6 +296,7 @@ impl<F: Fold> Engine<F> {
         self.status = EngineStatus::Active;
         self.last_verified = None;
         self.skips = 0;
+        self.resets = self.resets.wrapping_add(1);
     }
 
     /// Terminal for automated paths; only reset leaves this state.

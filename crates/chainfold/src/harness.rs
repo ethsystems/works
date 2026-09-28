@@ -131,8 +131,10 @@ impl<T> Handle<T> {
 
     /// Returns when the durable cursor reaches `pos` or the driver is terminal.
     ///
-    /// A later resync lowers the durable cursor, so the answer holds for the
-    /// instant it resolves.
+    /// The durable cursor counts only offers made since the last engine reset, so this
+    /// resolves once state folded on the chain the driver now follows is durable at or
+    /// past `pos`. A later reset drops it to None, so the answer holds for the instant
+    /// it resolves.
     pub async fn wait_durable(&mut self, pos: Position) -> DriverStatus {
         self.settled(|s| s.is_terminal() || s.durable_cursor.is_some_and(|c| c >= pos))
             .await

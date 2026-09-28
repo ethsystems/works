@@ -128,7 +128,7 @@ impl Fold for NoopFold {
 /// Sink recording each accepted offer's durable point; fails scripted offers.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct WatermarkSink {
-    /// Durable point of every accepted offer, in offer order.
+    /// Durable point of every offer accepted since the last reset, in offer order.
     pub offered: Vec<Position>,
     /// Offers still scripted to fail before the sink accepts again.
     pub fail_next_offers: u32,
@@ -148,6 +148,10 @@ impl<F: Fold> SnapshotSink<F> for WatermarkSink {
 
     fn durable_cursor(&self) -> Option<Position> {
         self.offered.last().copied()
+    }
+
+    fn reset(&mut self) {
+        self.offered.clear();
     }
 }
 
