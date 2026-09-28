@@ -21,9 +21,15 @@ use std::{
 use chainfold::{
     Batch,
     BlockRef,
+    Driver,
+    DriverConfig,
     Engine,
     EngineConfig,
-    test_util::NoopFold,
+    Tick,
+    test_util::{
+        NoopFold,
+        ScriptedChain,
+    },
 };
 
 static ALLOCATIONS: AtomicU64 = AtomicU64::new(0);
@@ -90,6 +96,80 @@ fn steady_state_apply_allocates_zero() {
 
     // then the allocation count delta is zero
     assert_eq!(after, before);
+}
+
+/// Blocks per poll, and events per block: 128 entries a poll, enough that a sort needing
+/// scratch space would take it from the heap.
+const WINDOW: u64 = 32;
+const EVENTS_PER_BLOCK: u64 = 4;
+
+/// Driver over `blocks` scripted blocks, checkpointing every window.
+fn scripted_driver(blocks: u64) -> Driver<NoopFold, ScriptedChain> {
+    let mut chain = ScriptedChain::new(1);
+    for block in 1..=blocks {
+        let events: Vec<u64> = (0..EVENTS_PER_BLOCK).map(|i| block * 8 + i).collect();
+        chain.push_block(&events);
+    }
+    chain.set_window(WINDOW);
+    Driver::new(
+        NoopFold,
+        chain,
+        EngineConfig {
+            ring_capacity: 256,
+            checkpoint_slots: 4,
+        },
+        DriverConfig {
+            checkpoint_interval: Some(WINDOW),
+            snapshot_interval: None,
+            ..DriverConfig::from_block(1)
+        },
+    )
+    .unwrap()
+}
+
+/// Allocations made by one tick, with the tick it returned.
+fn counted_tick(driver: &mut Driver<NoopFold, ScriptedChain>) -> (u64, Tick) {
+    let before = ALLOCATIONS.load(Relaxed);
+    let tick = driver.tick();
+    (ALLOCATIONS.load(Relaxed) - before, tick)
+}
+
+#[test]
+fn steady_state_catch_up_tick_allocates_zero() {
+    // given a driver two full-window ticks into a long chain, its buffers warmed
+    let _measuring = MEASURING
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let mut driver = scripted_driver(8 * WINDOW);
+    driver.tick();
+    driver.tick();
+
+    // when the next catch-up tick scans, groups and applies another full window
+    let (allocations, tick) = counted_tick(&mut driver);
+
+    // then it progressed without allocating
+    assert!(matches!(tick, Tick::Progressed(_)), "{tick:?}");
+    assert_eq!(allocations, 0);
+}
+
+#[test]
+fn fork_recovery_tick_allocates_zero() {
+    // given a driver caught up on a chain whose ring is full, then a one-block reorg
+    let _measuring = MEASURING
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let mut driver = scripted_driver(8 * WINDOW + 3);
+    while driver.tick() != Tick::Idle {}
+    driver
+        .source_mut()
+        .reorg(1, &[&[1, 2, 3, 4], &[5, 6, 7, 8]]);
+
+    // when the next tick detects the fork, bisects the ring and rolls back
+    let (allocations, tick) = counted_tick(&mut driver);
+
+    // then it rolled back without allocating
+    assert!(matches!(tick, Tick::RolledBack { .. }), "{tick:?}");
+    assert_eq!(allocations, 0);
 }
 
 /// Bytes the allocator hands out while a decode of `bytes` fails.
