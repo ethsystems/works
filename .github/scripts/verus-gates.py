@@ -27,22 +27,16 @@ import tomllib
 from pathlib import Path
 
 TCB = Path("src/verus/tcb.rs")
+# Regexes, whitespace-tolerant: Verus accepts `assume (x)`, `vstd::prelude::assume_(x)`,
+# `admit ()` and the old `#[verifier(external)]` form, and each proves `false` unchecked.
 TRUSTED = [
-    "assume(",
-    "admit(",
-    "external_body",
-    "assume_specification",
-    "external_fn_specification",
-    "external_type_specification",
-    "external_trait_specification",
-    "external_trait_extension",
-    "verifier::external",
-    "verus_verify(external",
-    "assume_termination",
-    "exec_allows_no_decreases_clause",
-    "axiom fn",
+    r"\bassume\w*",  # assume(, assume_(, assume_new, assume_specification, assume_termination
+    r"\badmit\w*",
+    r"\bexternal\w*",  # external_body, verifier::external, verifier(external), external_*_specification
+    r"\bexec_allows_no_decreases_clause\b",
+    r"\baxiom\s+fn\b",
     # A hand-written cmp/eq spec impl over a derived (unverified) impl is an assumption.
-    "SpecImpl for",
+    r"SpecImpl\s+for\b",
 ]
 VERIFYING = ("verus_spec", "verus_verify")
 
@@ -164,8 +158,8 @@ def check(crate: Path) -> list[str]:
             continue
         src = strip(path.read_text())
         for construct in TRUSTED:
-            for m in re.finditer(re.escape(construct), src):
-                errors.append(f"{rel}:{line_of(src, m.start())}: trusted `{construct}` outside {TCB}")
+            for m in re.finditer(construct, src):
+                errors.append(f"{rel}:{line_of(src, m.start())}: trusted `{m.group(0)}` outside {TCB}")
 
     out_of_scope = dict(config.get("out-of-scope", {}))
     used = set()
@@ -192,6 +186,12 @@ def self_test() -> None:
         "assume": ("fn f() { proof! { assume(false); } }", "", False),
         "commented": ("// assume(false) is fine in a comment\n", "", True),
         "specimpl": ("verus! { impl OrdSpecImpl for P {} }", "", False),
+        "specimpl_newline": ("verus! { impl OrdSpecImpl\nfor P {} }", "", False),
+        "assume_space": ("verus! { proof fn f() ensures false { assume (false); } }", "", False),
+        "assume_builtin": ("verus! { proof fn f() ensures false { vstd::prelude::assume_(false); } }", "", False),
+        "admit_space": ("verus! { proof fn f() ensures false { admit (); } }", "", False),
+        "external_paren": ("verus! { #[verifier(external)] fn f() {} }", "", False),
+        "undeclared_trait_lint_ok": ("#[allow(undeclared_external_trait)]\nfn g() {}", '"src/a.rs::g" = "x"', True),
         "unannotated": ("", "", False),
         "listed": ("", '"src/a.rs::S::g" = "later"', True),
         "stale": ("", '"src/a.rs::S::gone" = "later"', False),
