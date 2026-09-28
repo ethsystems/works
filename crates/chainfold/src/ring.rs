@@ -438,9 +438,9 @@ impl BlockRing {
             decreases high - low,
         ))]
         while low < high {
-            // `div_ceil` has no vstd spec; this is its definition.
+            // Upper midpoint, `low + gap.div_ceil(2)`, in one subtraction.
             let gap = high - low;
-            let mid = low + (gap / 2 + gap % 2);
+            let mid = high - gap / 2;
             if self.numbers[self.physical(mid)] <= number {
                 low = mid;
             } else {
