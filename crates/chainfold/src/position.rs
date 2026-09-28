@@ -1,6 +1,9 @@
 #[cfg(verus_keep_ghost)]
 use vstd::prelude::*;
 
+#[cfg(verus_keep_ghost)]
+use crate::verus::model::opt_lt;
+
 /// Total order over chain events: block number, then log index within the block.
 #[cfg_attr(verus_keep_ghost, verus_verify, derive(StructuralEq))]
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
@@ -12,8 +15,10 @@ pub struct Position {
     pub log_index: u64,
 }
 
+#[cfg_attr(verus_keep_ghost, cfg_eval, verus_verify)]
 impl Position {
     /// Builds a position from a block number and its log index.
+    #[cfg_attr(verus_keep_ghost, verus_spec(r => ensures r == (Position { block, log_index })))]
     pub const fn new(block: u64, log_index: u64) -> Self {
         Self { block, log_index }
     }
@@ -21,6 +26,7 @@ impl Position {
 
 /// True when `a` is strictly after `b` in the position order, with None before every
 /// position. Spelled out rather than derived so the verifier can state it.
+#[cfg_attr(verus_keep_ghost, verus_spec(r => ensures r == opt_lt(b, a)))]
 pub(crate) fn pos_gt(a: Option<Position>, b: Option<Position>) -> bool {
     match (a, b) {
         (Some(a), Some(b)) => {

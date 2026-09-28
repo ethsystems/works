@@ -367,8 +367,10 @@ impl EngineView {
     }
 }
 
-/// `Batch` lanes; `Batch::boundary` is a public field and is read directly.
+/// `Batch` lanes and boundary. `Batch` has private fields, so Verus treats it as opaque
+/// outside `batch.rs`, and even its public `boundary` is read through the view.
 pub struct BatchView<E> {
+    pub boundary: Option<BlockRef>,
     pub blocks: Seq<u64>,
     pub hashes: Seq<[u8; 32]>,
     pub ends: Seq<usize>,

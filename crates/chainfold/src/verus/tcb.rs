@@ -116,4 +116,32 @@ pub assume_specification<'de, T, C: wincode::config::Config>[ wincode::config::d
         T: wincode::SchemaRead<'de, C, Dst = T>,
 ;
 
+// A6: asserts nothing. `Spans` opts out of vstd's iterator laws, so verified callers
+// learn nothing from `Spans::next`; this lets `next` and `size_hint` verify panic-free.
+// A lawful spec would need `remaining()` as a sequence of slice references, which spec
+// code cannot build. No verified code iterates `Spans`; the engine uses `Batch::span`.
+impl<'a, E> vstd::std_specs::iter::IteratorSpecImpl for crate::batch::Spans<'a, E> {
+    open spec fn obeys_prophetic_iter_laws(&self) -> bool {
+        false
+    }
+
+    #[verifier::prophetic]
+    open spec fn remaining(&self) -> Seq<Self::Item> {
+        Seq::empty()
+    }
+
+    #[verifier::prophetic]
+    open spec fn will_return_none(&self) -> bool {
+        false
+    }
+
+    open spec fn decrease(&self) -> Option<nat> {
+        None
+    }
+
+    open spec fn peek(&self, index: int) -> Option<Self::Item> {
+        None
+    }
+}
+
 } // verus!
