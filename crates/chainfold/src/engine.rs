@@ -1331,6 +1331,29 @@ mod tests {
     }
 
     #[test]
+    fn checkpoint_scans_follow_store_order_across_the_wrap() {
+        // given 3 slots checkpointed at blocks 1, 2, 3, and 4, so block 4 overwrote
+        // block 1 and the oldest slot sits after the write position
+        let mut engine = engine_with_checkpoints(3);
+        let mut boundary = None;
+        for number in 1u64..=4 {
+            engine
+                .apply_batch(&batch_of(boundary, vec![(block(number, 0), vec![0])]))
+                .unwrap();
+            engine.checkpoint();
+            boundary = Some(block(number, 0));
+        }
+        // when reading the slot scans
+        // then count, oldest, and newest-at-or-below all follow store order
+        assert_eq!(engine.checkpoint_count(), 3);
+        assert_eq!(engine.durable_point(), Some(Position::new(2, 0)));
+        assert_eq!(
+            engine.rollback_at_or_below(3),
+            Ok(Some(Position::new(3, 0)))
+        );
+    }
+
+    #[test]
     fn count_at_or_below_matches_partition_point() {
         // given strictly ascending lanes of every length up to 9
         for len in 0u32..=9 {

@@ -36,7 +36,10 @@ pub(crate) struct Slot<F> {
 
 /// True when the engine's ring can still serve the slot's window.
 fn live<F>(slot: &Slot<F>, ring: &BlockRing) -> bool {
-    slot.cursor.is_none_or(|cursor| ring.observes(cursor.block))
+    match slot.cursor {
+        Some(cursor) => ring.observes(cursor.block),
+        None => true,
+    }
 }
 
 impl<F> CheckpointRing<F> {
@@ -47,21 +50,29 @@ impl<F> CheckpointRing<F> {
         }
     }
 
-    /// Live slots oldest first, since the next write position holds the oldest.
-    fn oldest_first<'a>(
-        &'a self,
-        ring: &'a BlockRing,
-    ) -> impl DoubleEndedIterator<Item = &'a Slot<F>> {
+    /// The `k`th stored slot oldest first, if it is live; the next write position holds
+    /// the oldest. `k` must be below the slot count.
+    fn live_at<'a>(&'a self, k: usize, ring: &BlockRing) -> Option<&'a Slot<F>> {
         let (newest, oldest) = self.slots.split_at(self.next);
-        oldest
-            .iter()
-            .chain(newest)
-            .flatten()
-            .filter(move |slot| live(slot, ring))
+        let entry = if k < oldest.len() {
+            &oldest[k]
+        } else {
+            &newest[k - oldest.len()]
+        };
+        match entry {
+            Some(slot) if live(slot, ring) => Some(slot),
+            _ => None,
+        }
     }
 
     pub(crate) fn count(&self, ring: &BlockRing) -> usize {
-        self.oldest_first(ring).count()
+        let mut live = 0;
+        for k in 0..self.slots.len() {
+            if self.live_at(k, ring).is_some() {
+                live += 1;
+            }
+        }
+        live
     }
 
     /// Stores a slot at the next write position; overwrites the oldest when full.
@@ -75,8 +86,13 @@ impl<F> CheckpointRing<F> {
     }
 
     /// Oldest live slot; the mirror of best_at_or_below's newest-first scan.
-    pub(crate) fn oldest<'a>(&'a self, ring: &'a BlockRing) -> Option<&'a Slot<F>> {
-        self.oldest_first(ring).next()
+    pub(crate) fn oldest<'a>(&'a self, ring: &BlockRing) -> Option<&'a Slot<F>> {
+        for k in 0..self.slots.len() {
+            if let Some(slot) = self.live_at(k, ring) {
+                return Some(slot);
+            }
+        }
+        None
     }
 
     /// Newest live slot with cursor block at or below the argument; empty-cursor slots
@@ -85,11 +101,22 @@ impl<F> CheckpointRing<F> {
     pub(crate) fn best_at_or_below<'a>(
         &'a self,
         block: u64,
-        ring: &'a BlockRing,
+        ring: &BlockRing,
     ) -> Option<&'a Slot<F>> {
-        self.oldest_first(ring)
-            .rev()
-            .find(|slot| slot.cursor.is_none_or(|cursor| cursor.block <= block))
+        let mut k = self.slots.len();
+        while k > 0 {
+            k -= 1;
+            if let Some(slot) = self.live_at(k, ring) {
+                let qualifies = match slot.cursor {
+                    Some(cursor) => cursor.block <= block,
+                    None => true,
+                };
+                if qualifies {
+                    return Some(slot);
+                }
+            }
+        }
+        None
     }
 
     /// Drops every slot whose cursor is after the argument, expired slots included, so
@@ -108,7 +135,9 @@ impl<F> CheckpointRing<F> {
     }
 
     pub(crate) fn clear(&mut self) {
-        self.slots.fill_with(|| None);
+        for i in 0..self.slots.len() {
+            self.slots[i] = None;
+        }
     }
 }
 
