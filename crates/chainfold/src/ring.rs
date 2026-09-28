@@ -22,6 +22,11 @@ use vstd::{
 
 use crate::position::BlockRef;
 
+/// True when `n` is a power of two; spelled out rather than std's so the verifier can state it.
+pub(crate) const fn is_power_of_two(n: usize) -> bool {
+    n != 0 && n & (n - 1) == 0
+}
+
 /// Bounded history of observed blocks, structure of arrays, power-of-two capacity.
 // Clone gets its spec with the ring proofs (P4); until then clones are unconstrained.
 #[cfg_attr(
@@ -93,7 +98,7 @@ impl BlockRing {
     /// Capacity must be a power of two; enforced by EngineConfig validation.
     pub(crate) fn with_capacity(capacity: usize) -> Self {
         debug_assert!(
-            capacity.is_power_of_two(),
+            is_power_of_two(capacity),
             "BlockRing capacity must be a power of two"
         );
         Self {
@@ -173,15 +178,19 @@ impl BlockRing {
     fn index_of(&self, number: u64) -> Option<usize> {
         let newest = self.len.checked_sub(1)?;
         let behind = self.numbers[self.physical(newest)].checked_sub(number)?;
-        let guess = usize::try_from(behind)
-            .ok()
-            .and_then(|behind| newest.checked_sub(behind))
-            .unwrap_or(0);
+        let guess = match usize::try_from(behind) {
+            Ok(behind) if behind <= newest => newest - behind,
+            _ => 0,
+        };
         if self.numbers[self.physical(guess)] == number {
             return Some(guess);
         }
         let logical = self.index_at_or_below(number)?;
-        (self.numbers[self.physical(logical)] == number).then_some(logical)
+        if self.numbers[self.physical(logical)] == number {
+            Some(logical)
+        } else {
+            None
+        }
     }
 
     /// Drops entries with a number strictly above the argument.
@@ -290,9 +299,10 @@ impl BlockRing {
         Observed {
             ring: self,
             next: 0,
-            remaining: self
-                .index_at_or_below(number)
-                .map_or(0, |logical| logical + 1),
+            remaining: match self.index_at_or_below(number) {
+                Some(logical) => logical + 1,
+                None => 0,
+            },
         }
     }
 

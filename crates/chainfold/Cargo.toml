@@ -74,6 +74,7 @@ verify = true
 in-scope = ["src/ring.rs"]
 
 [package.metadata.verus-gates.out-of-scope]
+"src/ring.rs::is_power_of_two" = "P4"
 "src/ring.rs::BlockRing::with_capacity" = "P4"
 "src/ring.rs::BlockRing::push" = "P4"
 "src/ring.rs::BlockRing::newest_number" = "P4"

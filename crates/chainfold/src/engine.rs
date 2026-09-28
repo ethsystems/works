@@ -23,6 +23,7 @@ use crate::{
     ring::{
         BlockRing,
         Observed,
+        is_power_of_two,
     },
 };
 #[cfg(verus_keep_ghost)]
@@ -61,7 +62,7 @@ impl Default for EngineConfig {
 impl EngineConfig {
     /// Accepts a power-of-two ring capacity within the allowed range.
     pub(crate) fn validate(&self) -> Result<(), ConfigError> {
-        if !self.ring_capacity.is_power_of_two() {
+        if !is_power_of_two(self.ring_capacity) {
             return Err(ConfigError::RingCapacityNotPowerOfTwo {
                 got: self.ring_capacity,
             });
