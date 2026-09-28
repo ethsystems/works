@@ -309,6 +309,7 @@ exceptions are the fns listed as out of scope or pending in `Cargo.toml`.
 12. `IteratorSpecImpl for Spans`: asserts nothing. `Spans` opts out of the iterator
     laws, so `next` and `size_hint` verify panic-free.
 13. `IteratorSpecImpl for Observed`: asserts nothing, as for `Spans`.
+14. `axiom_no_sink_offers_nothing`: `NoSink` stores nothing, so it holds no offers (A4).
 
 `.github/scripts/verus-gates.py` fails when a trusted construct appears outside
 `tcb.rs`. It also fails on a fn in an in-scope file that has no verifying attribute
