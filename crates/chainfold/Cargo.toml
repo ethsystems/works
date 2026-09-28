@@ -71,7 +71,7 @@ verify = true
 # Read by .github/scripts/verus-gates.py: every fn in an in-scope file must be
 # verified or listed here with the phase that verifies it.
 [package.metadata.verus-gates]
-in-scope = ["src/ring.rs", "src/position.rs", "src/batch.rs", "src/checkpoint.rs", "src/engine.rs"]
+in-scope = ["src/ring.rs", "src/position.rs", "src/batch.rs", "src/checkpoint.rs", "src/engine.rs", "src/snapshot.rs"]
 
 [package.metadata.verus-gates.out-of-scope]
 "src/batch.rs::BatchShapeError::fmt" = "Display (plan section 5)"
@@ -79,11 +79,6 @@ in-scope = ["src/ring.rs", "src/position.rs", "src/batch.rs", "src/checkpoint.rs
 # trusted. The sequence it yields is `Observed@`, which `iter`/`iter_at_or_below` fix.
 "src/ring.rs::Observed::next" = "std Iterator impl, yields Observed@"
 "src/ring.rs::Observed::size_hint" = "std Iterator impl, yields Observed@"
-"src/checkpoint.rs::CheckpointRing::new" = "P7"
-"src/engine.rs::EngineConfig::default" = "P7"
-"src/engine.rs::EngineConfig::validate" = "P7"
-"src/engine.rs::Engine::new" = "P7"
-"src/engine.rs::Engine::restore_cursor_and_ring" = "P7"
 "src/engine.rs::Engine::fold_mut" = "A3: returns &mut F, edits must keep fview"
 "src/engine.rs::Engine::apply_batch" = "P5"
 "src/engine.rs::Engine::apply_span" = "P5"
@@ -94,6 +89,16 @@ in-scope = ["src/ring.rs", "src/position.rs", "src/batch.rs", "src/checkpoint.rs
 "src/engine.rs::span_pos" = "P5"
 "src/engine.rs::count_at_or_below" = "P5"
 "src/engine.rs::fork_suspected" = "P5"
+"src/snapshot.rs::crc32c" = "A6"
+"src/snapshot.rs::read_envelope" = "A6"
+"src/snapshot.rs::SnapshotError::fmt" = "Display (plan section 5)"
+# Encode writes bytes only; T6c's content claim is model::lemma_durable_snapshot.
+"src/snapshot.rs::write_envelope" = "encode bytes (T6c content is a model lemma)"
+"src/snapshot.rs::ring_lanes" = "encode bytes (T6c content is a model lemma)"
+"src/snapshot.rs::cursor_fields" = "encode bytes (T6c content is a model lemma)"
+"src/snapshot.rs::encode_envelope" = "encode bytes (T6c content is a model lemma)"
+"src/snapshot.rs::Engine::encode_snapshot" = "encode bytes (T6c content is a model lemma)"
+"src/snapshot.rs::Engine::encode_durable_snapshot" = "P7 follow-up: tie its point to durable_point (lemma_durable_snapshot)"
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = [

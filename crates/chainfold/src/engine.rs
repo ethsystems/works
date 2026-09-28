@@ -51,8 +51,10 @@ use {
 };
 
 /// Smallest allowed observed-block ring capacity.
+#[cfg_attr(verus_keep_ghost, verus_verify)]
 const MIN_RING_CAPACITY: usize = 2;
 /// Largest allowed observed-block ring capacity.
+#[cfg_attr(verus_keep_ghost, verus_verify)]
 const MAX_RING_CAPACITY: usize = 1 << 20;
 
 /// Fixed engine construction parameters.
@@ -65,6 +67,7 @@ pub struct EngineConfig {
     pub checkpoint_slots: usize,
 }
 
+#[cfg_attr(verus_keep_ghost, verus_verify)]
 impl Default for EngineConfig {
     fn default() -> Self {
         Self {
@@ -76,7 +79,16 @@ impl Default for EngineConfig {
 
 impl EngineConfig {
     /// Accepts a power-of-two ring capacity within the allowed range.
+    #[cfg_attr(verus_keep_ghost, verus_spec(r =>
+        ensures
+            r is Ok <==> self.valid(),
+    ))]
     pub(crate) fn validate(&self) -> Result<(), ConfigError> {
+        #[cfg(verus_keep_ghost)]
+        proof! {
+            assert(MIN_RING_CAPACITY == 2);
+            assert(MAX_RING_CAPACITY == 0x10_0000) by (compute);
+        }
         if !is_power_of_two(self.ring_capacity) {
             return Err(ConfigError::RingCapacityNotPowerOfTwo {
                 got: self.ring_capacity,
@@ -119,11 +131,17 @@ pub struct Engine<F> {
     resets: u64,
 }
 
+#[cfg_attr(verus_keep_ghost, cfg_eval, verus_verify)]
 impl<F: Fold> Engine<F> {
     /// Builds an engine with an empty ring and no retained checkpoints.
+    #[cfg_attr(verus_keep_ghost, verus_spec(r =>
+        ensures
+            r is Ok <==> config.valid(),
+            r matches Ok(e) ==> e.wf() && e@ == Self::fresh(fview::<F>(&fold), config),
+    ))]
     pub fn new(fold: F, config: EngineConfig) -> Result<Self, ConfigError> {
         config.validate()?;
-        Ok(Self {
+        let engine = Self {
             ring: BlockRing::with_capacity(config.ring_capacity),
             checkpoints: CheckpointRing::new(config.checkpoint_slots),
             fold,
@@ -132,9 +150,16 @@ impl<F: Fold> Engine<F> {
             last_verified: None,
             skips: 0,
             resets: 0,
-        })
+        };
+        #[cfg(verus_keep_ghost)]
+        proof! {
+            assert(engine@.ring =~= Seq::empty());
+        }
+        Ok(engine)
     }
+}
 
+impl<F: Fold> Engine<F> {
     /// Returns the coarse engine status.
     #[cfg_attr(verus_keep_ghost, verus_spec(r => ensures r == self@.status))]
     pub fn status(&self) -> EngineStatus {
@@ -582,6 +607,15 @@ impl<F: Fold> Engine<F> {
 
     /// Overwrites cursor and ring with decoded snapshot data; used by snapshot decode.
     #[cfg(any(feature = "wincode", test))]
+    #[cfg_attr(verus_keep_ghost, verus_spec(
+        requires
+            old(self).wf(),
+            ring.wf(),
+            (EngineView { cursor, ring: ring@, ..old(self)@ }).wf(),
+        ensures
+            final(self).wf(),
+            final(self)@ == (EngineView { cursor, ring: ring@, ..old(self)@ }),
+    ))]
     pub(crate) fn restore_cursor_and_ring(
         &mut self,
         cursor: Option<Position>,
@@ -1745,7 +1779,30 @@ impl<F> View for Engine<F> {
     }
 }
 
+impl EngineConfig {
+    /// What `validate` accepts: a power-of-two ring capacity in `[2, 2^20]`.
+    pub open spec fn valid(self) -> bool {
+        &&& 2 <= self.ring_capacity <= 0x10_0000
+        &&& self.ring_capacity & ((self.ring_capacity - 1) as usize) == 0
+    }
+}
+
 impl<F> Engine<F> {
+    /// The view of `Engine::new(fold, config)`: fold view `fold`, nothing applied, K
+    /// empty slots.
+    pub open spec fn fresh(fold: int, config: EngineConfig) -> EngineView {
+        EngineView {
+            fold,
+            cursor: None,
+            ring: Seq::empty(),
+            slots: Seq::new(config.checkpoint_slots as nat, |_i: int| None::<SlotView>),
+            status: EngineStatus::Active,
+            last_verified: None,
+            skips: 0,
+            resets: 0,
+        }
+    }
+
     /// Plan `wf(Engine)`: ring and slot representation plus the view-level clauses.
     pub closed spec fn wf(&self) -> bool {
         &&& self.ring.wf()
@@ -1762,6 +1819,16 @@ impl<F> Engine<F> {
             self@.ring.len() <= 0x10_0000,
     {
         self.ring.lemma_wf();
+    }
+
+    /// T6a: in a `wf` engine the durable point never passes the cursor.
+    pub(crate) proof fn lemma_durable_point_le_cursor(&self)
+        requires
+            self.wf(),
+        ensures
+            opt_le(self@.durable_point(), self@.cursor),
+    {
+        crate::verus::model::lemma_durable_point_le_cursor(self@);
     }
 }
 

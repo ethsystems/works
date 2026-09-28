@@ -620,6 +620,21 @@ pub open spec fn live_count(slots: Seq<Option<SlotView>>, ring: Seq<BlockRef>, n
     }
 }
 
+/// The engine a snapshot of `(fold, cursor, ring)` decodes to with `slots` empty slots:
+/// `Engine::decode_snapshot`'s `restored` shape (T6c).
+pub open spec fn snapshot_view(fold: int, cursor: Option<Position>, ring: Seq<BlockRef>, slots: nat) -> EngineView {
+    EngineView {
+        fold,
+        cursor,
+        ring,
+        slots: Seq::new(slots, |_i: int| None::<SlotView>),
+        status: EngineStatus::Active,
+        last_verified: None,
+        skips: 0,
+        resets: 0,
+    }
+}
+
 impl EngineView {
     /// Plan T5d `Inv`, over ghost `init` (the fold view at the last rewind) and `log` (the
     /// entries `F::apply` ran on since, in call order). While Active the log is at or
@@ -695,6 +710,83 @@ impl EngineView {
             self.lemma_no_live(from + 1);
         }
     }
+}
+
+impl EngineView {
+    /// The oldest live slot, the one `durable_point` reads.
+    pub open spec fn durable_slot(self) -> SlotView {
+        self.slots[self.oldest_live_from(0).unwrap()].unwrap()
+    }
+
+    /// T6c: what `encode_durable_snapshot` writes, as the engine it decodes to: the
+    /// oldest live slot's fold and cursor, and the ring prefix of length `k` at or below
+    /// the cursor block (`iter_at_or_below`'s ensures give `k`).
+    pub open spec fn durable_snapshot(self, k: int, slots: nat) -> EngineView {
+        snapshot_view(self.durable_slot().fold, self.durable_slot().cursor, self.ring.subrange(0, k), slots)
+    }
+}
+
+/// `oldest_live_from(j)` is the least live index at or after `j`.
+pub proof fn lemma_oldest_live_from(v: EngineView, j: int)
+    requires
+        0 <= j,
+    ensures
+        match v.oldest_live_from(j) {
+            Some(k) => j <= k < v.slots.len() && v.live_at(k) && forall|i: int|
+                j <= i < k ==> !#[trigger] v.live_at(i),
+            None => forall|i: int| j <= i ==> !#[trigger] v.live_at(i),
+        },
+    decreases v.slots.len() - j,
+{
+    if j < v.slots.len() && !v.live_at(j) {
+        lemma_oldest_live_from(v, j + 1);
+    }
+}
+
+/// T6a: the durable point never passes the cursor.
+pub proof fn lemma_durable_point_le_cursor(v: EngineView)
+    requires
+        v.wf(),
+    ensures
+        opt_le(v.durable_point(), v.cursor),
+{
+    lemma_oldest_live_from(v, 0);
+    if let Some(k) = v.oldest_live_from(0) {
+        assert(v.slots[k] is Some);
+    }
+}
+
+/// T6c, encode side: the durable snapshot of a `wf` engine is `wf`, its cursor is the
+/// durable point, and its ring is a prefix of the engine's (so it fits the window).
+pub proof fn lemma_durable_snapshot(v: EngineView, k: int, slots: nat)
+    requires
+        v.wf(),
+        v.durable_point() is Some,
+        prefix_at_or_below(v.ring, v.durable_point().unwrap().block, k),
+    ensures
+        v.durable_snapshot(k, slots).cursor == v.durable_point(),
+        v.durable_snapshot(k, slots).wf(),
+        v.durable_snapshot(k, slots).ring.len() <= v.ring.len(),
+{
+    lemma_oldest_live_from(v, 0);
+    let s = v.durable_slot();
+    let d = s.cursor.unwrap();
+    let snap = v.durable_snapshot(k, slots);
+    // Live with a cursor: the cursor block is in the ring, so the prefix ends on it.
+    assert(observes(v.ring, d.block));
+    let w = choose|i: int| 0 <= i < v.ring.len() && #[trigger] v.ring[i].number == d.block;
+    assert(w < k) by {
+        if w >= k {
+            assert(v.ring[w].number > d.block);
+        }
+    }
+    assert(k - 1 <= w) by {
+        if k - 1 > w {
+            assert(v.ring[w].number < v.ring[k - 1].number);
+        }
+    }
+    assert(snap.ring.last() == v.ring[k - 1]);
+    assert(ring_ascending(snap.ring));
 }
 
 } // verus!

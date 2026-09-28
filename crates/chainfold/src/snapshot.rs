@@ -21,6 +21,19 @@ use crate::{
     },
     ring::BlockRing,
 };
+#[cfg(verus_keep_ghost)]
+use {
+    crate::{
+        batch::lemma_ascending_pairwise,
+        error::EngineStatus,
+        verus::model::{
+            EngineView,
+            SlotView,
+            ring_ascending,
+        },
+    },
+    vstd::prelude::*,
+};
 
 /// CRC32C over a slice-by-16 table; the envelope trailer and manifest slots share it.
 #[cfg(not(feature = "std"))]
@@ -46,6 +59,7 @@ pub(crate) fn crc32c(bytes: &[u8]) -> u32 {
 /// Engine-owned ceiling replacing the codec's own default: it admits the widest ring
 /// the engine configuration allows plus consumer state well past it, and it caps the
 /// allocation a length prefix can drive on the decode path.
+#[cfg_attr(verus_keep_ghost, verus_verify)]
 const MAX_ENVELOPE_FIELD_LEN: usize = 1 << 30;
 
 /// Codec settings of record: fixint little-endian with the engine-owned length ceiling.
@@ -55,22 +69,32 @@ type EnvelopeConfig = wincode::config::Configuration<true, MAX_ENVELOPE_FIELD_LE
 const ENVELOPE_CONFIG: EnvelopeConfig = EnvelopeConfig::new();
 
 /// Byte length of a `BlockRef` hash.
+#[cfg_attr(verus_keep_ghost, verus_verify)]
 const HASH_LEN: usize = 32;
 /// Byte length of the magic prefix.
+#[cfg_attr(verus_keep_ghost, verus_verify)]
 const MAGIC_LEN: usize = 8;
 /// Byte length of the version field.
+#[cfg_attr(verus_keep_ghost, verus_verify)]
 const VERSION_LEN: usize = 2;
 /// Byte length of the CRC32C trailer.
+#[cfg_attr(verus_keep_ghost, verus_verify)]
 const CRC_LEN: usize = 4;
 /// Smallest possible encoded snapshot: magic, version, and trailer with an empty payload.
+#[cfg_attr(verus_keep_ghost, verus_verify)]
 const MIN_ENVELOPE_LEN: usize = MAGIC_LEN + VERSION_LEN + CRC_LEN;
 
 /// Fixed 8-byte prefix identifying a chainfold snapshot.
+#[cfg_attr(verus_keep_ghost, verus_verify)]
 pub const SNAPSHOT_MAGIC: [u8; 8] = *b"CHNFOLD1";
 /// Snapshot envelope wire format version.
+#[cfg_attr(verus_keep_ghost, verus_verify)]
 pub const SNAPSHOT_VERSION: u16 = 1;
 
 /// Fold state with a canonical byte encoding and an identity tag.
+// No spec: decode checks the bytes it gets from `decode_state`'s caller, and treats the
+// decoded fold as opaque (its view is whatever `decode_state` returns; A5).
+#[cfg_attr(verus_keep_ghost, verus_verify)]
 pub trait Persist: Fold + Sized {
     /// Identifies the fold type and its state format; mismatch refuses to load.
     const STATE_TAG: &'static str;
@@ -83,8 +107,9 @@ pub trait Persist: Fold + Sized {
     fn decode_state(bytes: &[u8]) -> Result<Self, Self::PersistError>;
 }
 
+#[cfg_attr(verus_keep_ghost, verus_verify)]
 #[derive(Debug, wincode::SchemaWrite, wincode::SchemaRead)]
-struct Envelope {
+pub(crate) struct Envelope {
     magic: [u8; 8],
     version: u16,
     tag: Vec<u8>,
@@ -94,6 +119,12 @@ struct Envelope {
     ring_numbers: Vec<u64>,
     ring_hashes: Vec<u8>,
     state: Vec<u8>,
+}
+
+/// Decodes an envelope payload (the bytes before the trailer).
+#[inline]
+pub(crate) fn read_envelope(payload: &[u8]) -> wincode::ReadResult<Envelope> {
+    wincode::config::deserialize(payload, ENVELOPE_CONFIG)
 }
 
 /// Serializes an envelope and appends its CRC32C trailer.
@@ -161,6 +192,7 @@ fn encode_envelope<F: Persist>(
 }
 
 /// Errors from encoding or decoding a snapshot envelope.
+#[cfg_attr(verus_keep_ghost, verus_verify)]
 #[derive(Debug, PartialEq, Eq)]
 pub enum SnapshotError<E> {
     /// Input is shorter than magic, version, and trailer together.
@@ -290,20 +322,33 @@ impl<F: Persist> Engine<F> {
         encode_envelope(&slot.fold, slot.cursor, window, out)?;
         Ok(Some(point))
     }
+}
 
+#[cfg_attr(docsrs, doc(cfg(feature = "wincode")))]
+#[cfg_attr(verus_keep_ghost, cfg_eval, verus_verify)]
+impl<F: Persist> Engine<F> {
     /// Rebuilds an engine from an envelope; checkpoints, skips, freshness start empty.
+    // T6c: any bytes that decode give a `wf` engine, with no trust in the codec or the
+    // checksum (both have empty contracts in tcb.rs). Every `Err` path is panic-free.
+    #[cfg_attr(verus_keep_ghost, verus_spec(r =>
+        ensures
+            r matches Ok(e) ==> e.wf() && restored(e@, config),
+    ))]
     pub fn decode_snapshot(
         bytes: &[u8],
         config: EngineConfig,
     ) -> Result<Self, SnapshotError<F::PersistError>> {
-        config.validate().map_err(SnapshotError::Config)?;
+        if let Err(error) = config.validate() {
+            return Err(SnapshotError::Config(error));
+        }
         if bytes.len() < MIN_ENVELOPE_LEN {
             return Err(SnapshotError::TooShort);
         }
         if bytes[..MAGIC_LEN] != SNAPSHOT_MAGIC {
             return Err(SnapshotError::BadMagic);
         }
-        let version = u16::from_le_bytes([bytes[MAGIC_LEN], bytes[MAGIC_LEN + 1]]);
+        let version =
+            u16::from(bytes[MAGIC_LEN]) | (u16::from(bytes[MAGIC_LEN + 1]) << 8);
         if version != SNAPSHOT_VERSION {
             return Err(SnapshotError::BadVersion { got: version });
         }
@@ -311,7 +356,10 @@ impl<F: Persist> Engine<F> {
         let Some((payload, trailer)) = bytes.split_last_chunk::<CRC_LEN>() else {
             return Err(SnapshotError::TooShort);
         };
-        let expected_crc = u32::from_le_bytes(*trailer);
+        let expected_crc = u32::from(trailer[0])
+            | (u32::from(trailer[1]) << 8)
+            | (u32::from(trailer[2]) << 16)
+            | (u32::from(trailer[3]) << 24);
         let computed_crc = crc32c(payload);
         if computed_crc != expected_crc {
             return Err(SnapshotError::Crc {
@@ -320,8 +368,10 @@ impl<F: Persist> Engine<F> {
             });
         }
 
-        let envelope: Envelope = wincode::config::deserialize(payload, ENVELOPE_CONFIG)
-            .map_err(|_| SnapshotError::Envelope)?;
+        let envelope = match read_envelope(payload) {
+            Ok(envelope) => envelope,
+            Err(_error) => return Err(SnapshotError::Envelope),
+        };
         if envelope.tag.as_slice() != F::STATE_TAG.as_bytes() {
             return Err(SnapshotError::BadTag);
         }
@@ -342,29 +392,137 @@ impl<F: Persist> Engine<F> {
         {
             return Err(SnapshotError::RingHashLenMismatch);
         }
-        let cursor = (envelope.cursor_set != 0)
-            .then(|| Position::new(envelope.cursor_block, envelope.cursor_log_index));
+        let cursor = if envelope.cursor_set != 0 {
+            Some(Position::new(
+                envelope.cursor_block,
+                envelope.cursor_log_index,
+            ))
+        } else {
+            None
+        };
         // A cursorless engine has an empty ring, so None must pair with no entries.
-        if envelope.ring_numbers.last().copied() != cursor.map(|pos| pos.block) {
+        let tip_matches = match (envelope.ring_numbers.last(), cursor) {
+            (Some(&tip), Some(pos)) => tip == pos.block,
+            (None, None) => true,
+            _ => false,
+        };
+        if !tip_matches {
             return Err(SnapshotError::RingCursorMismatch);
         }
 
-        let fold = F::decode_state(&envelope.state).map_err(SnapshotError::State)?;
+        let fold = match F::decode_state(&envelope.state) {
+            Ok(fold) => fold,
+            Err(error) => return Err(SnapshotError::State(error)),
+        };
 
+        #[cfg(verus_keep_ghost)]
+        proof_decl! {
+            let ghost numbers = envelope.ring_numbers@;
+            let ghost hashes = envelope.ring_hashes@;
+            broadcast use vstd::laws_cmp::group_laws_cmp;
+            lemma_ascending_pairwise(numbers);
+            assert(hashes.len() == numbers.len() * HASH_LEN);
+        }
         let mut ring = BlockRing::with_capacity(config.ring_capacity);
-        let hashes = envelope.ring_hashes.chunks_exact(HASH_LEN);
-        for (&number, hash) in envelope.ring_numbers.iter().zip(hashes) {
-            let hash = hash
-                .try_into()
-                .map_err(|_| SnapshotError::RingHashLenMismatch)?;
-            ring.push(BlockRef { number, hash });
+        #[cfg_attr(verus_keep_ghost, verus_spec(
+            invariant
+                ring.wf(),
+                ring.cap() == config.ring_capacity,
+                numbers == envelope.ring_numbers@,
+                hashes == envelope.ring_hashes@,
+                numbers.len() <= config.ring_capacity <= 0x10_0000,
+                hashes.len() == numbers.len() * HASH_LEN,
+                forall|a: int, b: int|
+                    #![trigger numbers[a], numbers[b]]
+                    0 <= a < b < numbers.len() ==> numbers[a] < numbers[b],
+                ring_from_lanes(ring@, numbers, hashes, i as int),
+        ))]
+        for i in 0..envelope.ring_numbers.len() {
+            let mut hash = [0u8; HASH_LEN];
+            hash.copy_from_slice(&envelope.ring_hashes[i * HASH_LEN..(i + 1) * HASH_LEN]);
+            #[cfg(verus_keep_ghost)]
+            proof! {
+                if i > 0 {
+                    assert(ring@.last().number == numbers[i - 1]);
+                    assert(numbers[i - 1] < numbers[i as int]);
+                }
+            }
+            ring.push(BlockRef {
+                number: envelope.ring_numbers[i],
+                hash,
+            });
+        }
+        #[cfg(verus_keep_ghost)]
+        proof! {
+            assert(ring_ascending(ring@));
         }
 
-        let mut engine = Engine::new(fold, config).map_err(SnapshotError::Config)?;
+        let mut engine = match Engine::new(fold, config) {
+            Ok(engine) => engine,
+            Err(error) => return Err(SnapshotError::Config(error)),
+        };
         engine.restore_cursor_and_ring(cursor, ring);
+        #[cfg(verus_keep_ghost)]
+        proof! {
+            assert(from_lanes(
+                engine@,
+                envelope.cursor_set,
+                envelope.cursor_block,
+                envelope.cursor_log_index,
+                numbers,
+                hashes,
+            ));
+        }
         Ok(engine)
     }
 }
+
+#[cfg(verus_keep_ghost)]
+verus! {
+
+/// Ring entries `0..len` are the envelope lanes: `numbers[k]` with hash bytes
+/// `hashes[32k..32k + 32]`.
+pub open spec fn ring_from_lanes(ring: Seq<BlockRef>, numbers: Seq<u64>, hashes: Seq<u8>, len: int) -> bool {
+    &&& ring.len() == len
+    &&& forall|k: int|
+        #![trigger ring[k]]
+        0 <= k < len ==> ring[k].number == numbers[k]
+            && ring[k].hash@ == hashes.subrange(32 * k, 32 * k + 32)
+}
+
+/// `v`'s cursor and ring are the ones an envelope with these fields describes.
+pub open spec fn from_lanes(
+    v: EngineView,
+    cursor_set: u8,
+    cursor_block: u64,
+    cursor_log_index: u64,
+    numbers: Seq<u64>,
+    hashes: Seq<u8>,
+) -> bool {
+    &&& v.cursor == if cursor_set != 0 {
+        Some(Position { block: cursor_block, log_index: cursor_log_index })
+    } else {
+        None
+    }
+    &&& hashes.len() == 32 * numbers.len()
+    &&& ring_from_lanes(v.ring, numbers, hashes, numbers.len() as int)
+}
+
+/// T6c, decode side: what `decode_snapshot` returns. Nothing but the fold, cursor and
+/// ring comes from the bytes; the cursor and ring are some envelope's fields, and the
+/// ring fits the configured window.
+pub open spec fn restored(v: EngineView, config: EngineConfig) -> bool {
+    &&& v.status == EngineStatus::Active
+    &&& v.last_verified is None
+    &&& v.skips == 0
+    &&& v.resets == 0
+    &&& v.slots == Seq::new(config.checkpoint_slots as nat, |_i: int| None::<SlotView>)
+    &&& v.ring.len() <= config.ring_capacity
+    &&& exists|cursor_set: u8, cursor_block: u64, cursor_log_index: u64, numbers: Seq<u64>, hashes: Seq<u8>|
+        from_lanes(v, cursor_set, cursor_block, cursor_log_index, numbers, hashes)
+}
+
+} // verus!
 
 /// Hand-builds and frames an envelope with caller-chosen fields, for adversarial tests.
 #[cfg(test)]

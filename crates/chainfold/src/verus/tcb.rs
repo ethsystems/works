@@ -104,17 +104,12 @@ pub assume_specification[ crate::snapshot::crc32c ](bytes: &[u8]) -> u32;
 pub struct ExReadError(wincode::ReadError);
 
 // A6: empty contract, it asserts nothing. `decode_snapshot` (P7) checks every field of the
-// decoded envelope itself, so no property of the codec is trusted (plan T6c). The codec's
-// traits are bounds only; no spec of theirs is used.
+// decoded envelope itself, so no property of the codec is trusted (plan T6c). The entry is on
+// the crate's one-line wrapper, so the codec's config types and traits stay out of the proofs.
 #[cfg(feature = "wincode")]
-#[verifier::allow(undeclared_external_trait)]
-pub assume_specification<'de, T, C: wincode::config::Config>[ wincode::config::deserialize::<T, C> ](
-    src: &'de [u8],
-    config: C,
-) -> wincode::ReadResult<T>
-    where
-        T: wincode::SchemaRead<'de, C, Dst = T>,
-;
+pub assume_specification[ crate::snapshot::read_envelope ](payload: &[u8]) -> wincode::ReadResult<
+    crate::snapshot::Envelope,
+>;
 
 // A6: asserts nothing. `Spans` opts out of vstd's iterator laws, so verified callers
 // learn nothing from `Spans::next`; this lets `next` and `size_hint` verify panic-free.

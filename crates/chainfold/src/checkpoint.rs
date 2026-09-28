@@ -54,14 +54,35 @@ fn live<F>(slot: &Slot<F>, ring: &BlockRing) -> bool {
     }
 }
 
-impl<F> CheckpointRing<F> {
-    pub(crate) fn new(slots: usize) -> Self {
-        Self {
-            slots: (0..slots).map(|_| None).collect(),
-            next: 0,
-        }
-    }
+/// An empty slot; a fn item rather than a closure, because Verus loses `map`'s
+/// postcondition for a closure inside a generic fn.
+#[cfg_attr(verus_keep_ghost, verus_spec(r => ensures r is None))]
+fn empty_slot<F>(_index: usize) -> Option<Slot<F>> {
+    None
+}
 
+#[cfg_attr(verus_keep_ghost, cfg_eval, verus_verify)]
+impl<F> CheckpointRing<F> {
+    #[cfg_attr(verus_keep_ghost, verus_spec(r =>
+        ensures
+            r.wf(),
+            r@ == Seq::new(slots as nat, |_i: int| None::<SlotView>),
+    ))]
+    pub(crate) fn new(slots: usize) -> Self {
+        let ring = Self {
+            slots: (0..slots).map(empty_slot).collect(),
+            next: 0,
+        };
+        #[cfg(verus_keep_ghost)]
+        proof! {
+            broadcast use vstd::std_specs::iter::group_iter_axioms;
+            assert(ring@ =~= Seq::new(slots as nat, |_i: int| None::<SlotView>));
+        }
+        ring
+    }
+}
+
+impl<F> CheckpointRing<F> {
     /// The `k`th stored slot oldest first, if it is live; the next write position holds
     /// the oldest. `k` must be below the slot count.
     #[cfg_attr(verus_keep_ghost, verus_spec(r =>
