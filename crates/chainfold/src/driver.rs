@@ -3,7 +3,10 @@ use alloc::vec::Vec;
 #[cfg(feature = "std")]
 use std::vec::Vec;
 
-use core::time::Duration;
+use core::{
+    cmp::Reverse,
+    time::Duration,
+};
 
 use crate::{
     batch::Batch,
@@ -601,26 +604,17 @@ where
     }
 }
 
-/// Drains `entries` into `batch`, one span per run of equal `BlockRef`s, so two hashes
+/// Moves `entries` into `batch`, one span per run of equal `BlockRef`s, so two hashes
 /// at one height become two equal-number spans that `Batch::validate` rejects.
+///
+/// Sorted by descending position and popped from the tail, the entries leave in
+/// ascending order with no intermediate buffer; the sort is in place.
 fn group_into<E>(batch: &mut Batch<E>, entries: &mut Vec<(BlockRef, u32, E)>) {
-    entries.sort_by_key(|(block, log_index, _)| (block.number, *log_index));
-
-    let mut span: Vec<(u32, E)> = Vec::new();
-    let mut current: Option<BlockRef> = None;
-    for (block, log_index, event) in entries.drain(..) {
-        match current {
-            Some(open) if open != block => {
-                batch.push_block(open, span.drain(..));
-                current = Some(block);
-            }
-            None => current = Some(block),
-            _ => {}
-        }
-        span.push((log_index, event));
-    }
-    if let Some(open) = current {
-        batch.push_block(open, span);
+    entries.sort_unstable_by_key(|(block, log_index, _)| {
+        Reverse((block.number, *log_index))
+    });
+    while let Some(&(block, _, _)) = entries.last() {
+        batch.push_block_from_tail(block, entries);
     }
 }
 

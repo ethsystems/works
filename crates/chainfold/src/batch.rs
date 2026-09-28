@@ -153,6 +153,29 @@ impl<E> Batch<E> {
         }
         Ok(())
     }
+
+    /// Appends one block's span by popping the tail of `entries` while it belongs to
+    /// `block`, so entries sorted by descending log index come out in log order.
+    pub(crate) fn push_block_from_tail(
+        &mut self,
+        block: BlockRef,
+        entries: &mut Vec<(BlockRef, u32, E)>,
+    ) {
+        self.blocks.push(block.number);
+        self.hashes.push(block.hash);
+        loop {
+            match entries.last() {
+                Some((tail, _, _)) if *tail == block => {}
+                _ => break,
+            }
+            let Some((_, log_index, event)) = entries.pop() else {
+                break;
+            };
+            self.log_indices.push(log_index);
+            self.events.push(event);
+        }
+        self.ends.push(self.events.len());
+    }
 }
 
 /// Index of the first element that does not exceed its predecessor.
