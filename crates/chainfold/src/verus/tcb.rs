@@ -78,18 +78,12 @@ pub assume_specification<T, K: Ord, F: FnMut(&T) -> K>[ <[T]>::sort_unstable_by_
         final(v)@.to_multiset() == old(v)@.to_multiset(),
 ;
 
-// A6: `split_last_chunk` splits off the last `N` elements (std docs; vstd has no spec).
-// Used by `decode_snapshot` (P7).
-pub assume_specification<T, const N: usize>[ <[T]>::split_last_chunk::<N> ](s: &[T]) -> (r: Option<
+// A6: empty contract, it asserts nothing. `decode_snapshot` (P7) splits off the checksum
+// trailer; its safety comes from the checks after it, so the split is never trusted (a
+// mutation test showed no proof reads a stronger spec).
+pub assume_specification<T, const N: usize>[ <[T]>::split_last_chunk::<N> ](s: &[T]) -> Option<
     (&[T], &[T; N]),
->)
-    ensures
-        s@.len() < N ==> r is None,
-        s@.len() >= N ==> (r matches Some((init, last)) && init@ == s@.subrange(
-            0,
-            s@.len() - N,
-        ) && last@ == s@.subrange(s@.len() - N, s@.len() as int)),
-;
+>;
 
 // A6: empty contract, it asserts nothing. `decode_snapshot` (P7) calls the checksum; its
 // safety comes from the checks after it, so the checksum's value is never trusted.
