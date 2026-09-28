@@ -25,6 +25,14 @@ use crate::{
         Observed,
     },
 };
+#[cfg(verus_keep_ghost)]
+use {
+    crate::verus::model::{
+        EngineView,
+        fview,
+    },
+    vstd::prelude::*,
+};
 
 /// Smallest allowed observed-block ring capacity.
 const MIN_RING_CAPACITY: usize = 2;
@@ -32,6 +40,7 @@ const MIN_RING_CAPACITY: usize = 2;
 const MAX_RING_CAPACITY: usize = 1 << 20;
 
 /// Fixed engine construction parameters.
+#[cfg_attr(verus_keep_ghost, verus_verify)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EngineConfig {
     /// Observed-block window W; power of two between 2 and 1 << 20.
@@ -67,6 +76,7 @@ impl EngineConfig {
 }
 
 /// Per-batch counts of applied, deduped, and skipped events.
+#[cfg_attr(verus_keep_ghost, verus_verify)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ApplySummary {
     /// Events the fold accepted.
@@ -80,6 +90,7 @@ pub struct ApplySummary {
 /// Single-writer fold engine: ordering, dedup, fork detection, rollback, snapshots.
 ///
 /// When the cursor is set, the ring's newest entry is the cursor block.
+#[cfg_attr(verus_keep_ghost, verus_verify)]
 #[derive(Debug)]
 pub struct Engine<F> {
     fold: F,
@@ -1372,3 +1383,43 @@ mod tests {
         assert_eq!(engine.cursor(), Some(Position::new(5, 3)));
     }
 }
+
+#[cfg(verus_keep_ghost)]
+verus! {
+impl<F> View for Engine<F> {
+    type V = EngineView;
+
+    closed spec fn view(&self) -> EngineView {
+        EngineView {
+            fold: fview::<F>(&self.fold),
+            cursor: self.cursor,
+            ring: self.ring@,
+            slots: self.checkpoints@,
+            status: self.status,
+            last_verified: self.last_verified,
+            skips: self.skips,
+            resets: self.resets,
+        }
+    }
+}
+
+impl<F> Engine<F> {
+    /// Plan `wf(Engine)`: ring and slot representation plus the view-level clauses.
+    pub(crate) closed spec fn wf(&self) -> bool {
+        &&& self.ring.wf()
+        &&& self.checkpoints.wf()
+        &&& self@.wf()
+    }
+
+    /// The view-level clauses of `wf`, for modules that cannot see its body.
+    pub(crate) proof fn lemma_wf(&self)
+        requires
+            self.wf(),
+        ensures
+            self@.wf(),
+            self@.ring.len() <= 0x10_0000,
+    {
+        self.ring.lemma_wf();
+    }
+}
+} // verus!

@@ -4,11 +4,23 @@ use alloc::vec::Vec;
 use std::vec::Vec;
 
 use crate::position::BlockRef;
+#[cfg(verus_keep_ghost)]
+use {
+    crate::verus::model::{
+        a1,
+        header,
+        range_entries,
+        sview,
+    },
+    vstd::prelude::*,
+};
 
 /// Blocks per range query. 500 clears the common `eth_getLogs` limits.
+#[cfg_attr(verus_keep_ghost, verus_verify)]
 pub const DEFAULT_WINDOW: u64 = 500;
 
 /// Oldest position a source can replay from.
+#[cfg_attr(verus_keep_ghost, verus_verify)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReplayHorizon {
     /// Source replays the whole chain.
@@ -18,6 +30,9 @@ pub enum ReplayHorizon {
 }
 
 /// Random-access event supply over one chain.
+// A1/A2: each call answers from one view, `sview` of the source after the call, and every
+// view satisfies `a1`. Implementations are trusted to meet this spec.
+#[cfg_attr(verus_keep_ghost, verus_verify)]
 pub trait Source {
     /// Consumer event the source decodes its wire format into.
     type Event;
@@ -25,12 +40,36 @@ pub trait Source {
     type Error;
 
     /// Highest block this source will serve.
+    #[cfg_attr(verus_keep_ghost, verus_spec(r =>
+        ensures
+            a1::<Self, Self::Event>(sview::<Self>(final(self))),
+    ))]
     fn head(&mut self) -> Result<u64, Self::Error>;
 
     /// Header of one block, or None when it is not on the current chain.
+    #[cfg_attr(verus_keep_ghost, verus_spec(r =>
+        ensures
+            a1::<Self, Self::Event>(sview::<Self>(final(self))),
+            r matches Ok(h) ==> h == header(sview::<Self>(final(self)), number),
+    ))]
     fn header_at(&mut self, number: u64) -> Result<Option<BlockRef>, Self::Error>;
 
     /// Appends every event in `from..=to`. Any order; the driver sorts and groups.
+    #[cfg_attr(verus_keep_ghost, verus_spec(r =>
+        ensures
+            a1::<Self, Self::Event>(sview::<Self>(final(self))),
+            r is Ok ==> {
+                let (pre, post) = (old(out)@, final(out)@);
+                &&& pre.len() <= post.len()
+                &&& post.subrange(0, pre.len() as int) == pre
+                &&& post.subrange(pre.len() as int, post.len() as int).to_multiset()
+                    == range_entries::<Self, Self::Event>(
+                        sview::<Self>(final(self)),
+                        from as int,
+                        to as int,
+                    ).to_multiset()
+            },
+    ))]
     fn events_in(
         &mut self,
         from: u64,

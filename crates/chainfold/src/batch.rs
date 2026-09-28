@@ -5,9 +5,15 @@ use std::vec::Vec;
 
 use core::fmt;
 
+#[cfg(verus_keep_ghost)]
+use vstd::prelude::*;
+
 use crate::position::BlockRef;
+#[cfg(verus_keep_ghost)]
+use crate::verus::model::BatchView;
 
 /// One block's events within a batch.
+#[cfg_attr(verus_keep_ghost, verus_verify)]
 #[derive(Debug)]
 pub struct SpanView<'a, E> {
     /// Number of the block the events belong to.
@@ -31,6 +37,11 @@ impl<E> SpanView<'_, E> {
 }
 
 /// One poll's worth of events
+#[cfg_attr(
+    verus_keep_ghost,
+    verus_verify,
+    verifier::allow(autoderive_clone_without_spec)
+)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Batch<E> {
     /// Refetched header of the cursor block; None means the source could not produce it.
@@ -185,6 +196,7 @@ impl<E> Default for Batch<E> {
 }
 
 /// Batch layout violation found before any event reaches the fold.
+#[cfg_attr(verus_keep_ghost, verus_verify)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BatchShapeError {
     /// Span carries no events; a block with none is left out of the batch.
@@ -339,3 +351,20 @@ mod tests {
         assert_eq!(batch.events.capacity(), events_capacity);
     }
 }
+
+#[cfg(verus_keep_ghost)]
+verus! {
+impl<E> View for Batch<E> {
+    type V = BatchView<E>;
+
+    closed spec fn view(&self) -> BatchView<E> {
+        BatchView {
+            blocks: self.blocks@,
+            hashes: self.hashes@,
+            ends: self.ends@,
+            log_indices: self.log_indices@,
+            events: self.events@,
+        }
+    }
+}
+} // verus!

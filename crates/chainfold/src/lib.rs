@@ -3,7 +3,7 @@
 #![cfg_attr(feature = "docs", doc = include_utils::include_md!("README.md:usage"))]
 #![cfg_attr(not(test), deny(clippy::cast_possible_truncation))]
 #![cfg_attr(docsrs, feature(doc_cfg))]
-#![cfg_attr(verus_keep_ghost, feature(proc_macro_hygiene, cfg_eval))]
+#![cfg_attr(verus_keep_ghost, feature(proc_macro_hygiene, cfg_eval, allocator_api))]
 #![deny(unused_crate_dependencies)]
 #![deny(warnings)]
 #![cfg_attr(not(feature = "std"), no_std)]

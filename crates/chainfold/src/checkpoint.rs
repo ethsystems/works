@@ -10,14 +10,24 @@ use crate::{
     },
     ring::BlockRing,
 };
+#[cfg(verus_keep_ghost)]
+use {
+    crate::verus::model::{
+        SlotView,
+        fview,
+    },
+    vstd::prelude::*,
+};
 
 /// Fixed K-slot ring of engine restore points.
+#[cfg_attr(verus_keep_ghost, verus_verify)]
 #[derive(Debug)]
 pub(crate) struct CheckpointRing<F> {
     slots: Vec<Option<Slot<F>>>,
     next: usize,
 }
 
+#[cfg_attr(verus_keep_ghost, verus_verify)]
 #[derive(Debug)]
 pub(crate) struct Slot<F> {
     pub(crate) fold: F,
@@ -101,3 +111,38 @@ impl<F> CheckpointRing<F> {
         self.slots.fill_with(|| None);
     }
 }
+
+#[cfg(verus_keep_ghost)]
+verus! {
+impl<F> View for Slot<F> {
+    type V = SlotView;
+
+    closed spec fn view(&self) -> SlotView {
+        SlotView { fold: fview::<F>(&self.fold), cursor: self.cursor }
+    }
+}
+
+impl<F> CheckpointRing<F> {
+    /// The write position is a slot, or 0 with no slots (K = 0).
+    pub(crate) closed spec fn wf(&self) -> bool {
+        self.next < self.slots@.len() || (self.next == 0 && self.slots@.len() == 0)
+    }
+}
+
+impl<F> View for CheckpointRing<F> {
+    /// One entry per slot, oldest stored first: logical `k` is physical `(next + k) % K`.
+    type V = Seq<Option<SlotView>>;
+
+    closed spec fn view(&self) -> Seq<Option<SlotView>> {
+        let k = self.slots@.len() as int;
+        Seq::new(
+            k as nat,
+            |i: int|
+                match self.slots@[(self.next + i) % k] {
+                    Some(slot) => Some(slot@),
+                    None => None,
+                },
+        )
+    }
+}
+} // verus!

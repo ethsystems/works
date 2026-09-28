@@ -1,2 +1,119 @@
 //! Trusted base (plan A6). Every item here is assumed, not proved, and carries its
 //! justification. `verus-gates.py` rejects trusted constructs anywhere else.
+
+#[cfg(not(feature = "std"))]
+use alloc::{
+    boxed::Box,
+    vec::Vec,
+};
+#[cfg(feature = "std")]
+use std::{
+    boxed::Box,
+    vec::Vec,
+};
+
+use vstd::prelude::*;
+
+use crate::{
+    position::Position,
+    verus::model::{
+        fview,
+        pos_cmp,
+    },
+};
+
+verus! {
+
+// A6: Clone preserves the fold view (A3 clone fidelity). Verus knows only that a clone of
+// a generic `F` satisfies `F::clone`'s unknown ensures; the `Fold` contract adds this.
+#[verifier::external_body]
+pub proof fn axiom_clone_preserves_fview<F: Clone>(a: F, b: F)
+    requires
+        cloned(a, b),
+    ensures
+        fview::<F>(&a) == fview::<F>(&b),
+{
+}
+
+// A6: the derived `PartialOrd` on `Position` is `lt` (T1 bridge). Verus ignores derives;
+// the derive compares fields in declaration order, block then log index, as checked by
+// `position_order_is_block_then_log_index`.
+impl vstd::std_specs::cmp::PartialOrdSpecImpl for Position {
+    open spec fn obeys_partial_cmp_spec() -> bool {
+        true
+    }
+
+    open spec fn partial_cmp_spec(&self, other: &Self) -> Option<core::cmp::Ordering> {
+        Some(pos_cmp(*self, *other))
+    }
+}
+
+// A6: the derived `Ord` on `Position` is `lt` (T1 bridge), as for `PartialOrd` above.
+impl vstd::std_specs::cmp::OrdSpecImpl for Position {
+    open spec fn obeys_cmp_spec() -> bool {
+        true
+    }
+
+    open spec fn cmp_spec(&self, other: &Self) -> core::cmp::Ordering {
+        pos_cmp(*self, *other)
+    }
+}
+
+// A6: `into_boxed_slice` keeps the elements in order (std docs; vstd has no spec). Used
+// by `BlockRing::with_capacity` (P4).
+pub assume_specification<T, A: core::alloc::Allocator>[ Vec::<T, A>::into_boxed_slice ](
+    v: Vec<T, A>,
+) -> (b: Box<[T], A>)
+    ensures
+        b@ == v@,
+;
+
+// A6: `sort_by_key` permutes the slice (std docs; vstd has no spec). Claims nothing about
+// order, because `Batch::validate` checks it. Used by `group_into` (P8).
+pub assume_specification<T, K: Ord, F: FnMut(&T) -> K>[ <[T]>::sort_by_key::<K, F> ](
+    v: &mut [T],
+    f: F,
+)
+    ensures
+        final(v)@.to_multiset() == old(v)@.to_multiset(),
+;
+
+// A6: `split_last_chunk` splits off the last `N` elements (std docs; vstd has no spec).
+// Used by `decode_snapshot` (P7).
+pub assume_specification<T, const N: usize>[ <[T]>::split_last_chunk::<N> ](s: &[T]) -> (r: Option<
+    (&[T], &[T; N]),
+>)
+    ensures
+        s@.len() < N ==> r is None,
+        s@.len() >= N ==> (r matches Some((init, last)) && init@ == s@.subrange(
+            0,
+            s@.len() - N,
+        ) && last@ == s@.subrange(s@.len() - N, s@.len() as int)),
+;
+
+// A6: empty contract, it asserts nothing. `decode_snapshot` (P7) calls the checksum; its
+// safety comes from the checks after it, so the checksum's value is never trusted.
+#[cfg(feature = "wincode")]
+pub assume_specification[ crate::snapshot::crc32c ](bytes: &[u8]) -> u32;
+
+// A6: an opaque type, it asserts nothing. The codec's error type, named by `deserialize`
+// below; decode maps every error to `SnapshotError::Envelope` without reading it.
+#[cfg(feature = "wincode")]
+#[verifier::external_type_specification]
+#[verifier::external_body]
+pub struct ExReadError(wincode::ReadError);
+
+// A6: empty contract, it asserts nothing. `decode_snapshot` (P7) checks every field of the
+// decoded envelope itself, so no property of the codec is trusted (plan T6c). The codec's
+// traits are bounds only; no spec of theirs is used.
+#[cfg(feature = "wincode")]
+#[verifier::allow(undeclared_external_trait)]
+pub assume_specification<'de, T, C: wincode::config::Config>[ wincode::config::deserialize::<T, C> ](
+    src: &'de [u8],
+    config: C,
+) -> wincode::ReadResult<T>
+    where
+        T: wincode::SchemaRead<'de, C, Dst = T>,
+;
+
+} // verus!

@@ -1,5 +1,8 @@
 use core::fmt;
 
+#[cfg(verus_keep_ghost)]
+use vstd::prelude::*;
+
 use crate::{
     batch::BatchShapeError,
     position::{
@@ -9,6 +12,11 @@ use crate::{
 };
 
 /// Classified fold failure; the variant fixes the engine's recovery obligation.
+#[cfg_attr(
+    verus_keep_ghost,
+    verus_verify,
+    verifier::allow(autoderive_clone_without_spec)
+)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FoldError<E> {
     /// Event is not mine; engine counts it and advances the cursor.
@@ -32,6 +40,7 @@ impl<E: fmt::Display> fmt::Display for FoldError<E> {
 impl<E: fmt::Debug + fmt::Display> core::error::Error for FoldError<E> {}
 
 /// Coarse-grained state of the fold engine.
+#[cfg_attr(verus_keep_ghost, verus_verify)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EngineStatus {
     /// Applying batches and advancing the cursor.
@@ -82,6 +91,7 @@ impl fmt::Display for EngineStatus {
 impl core::error::Error for EngineStatus {}
 
 /// Terminal divergence reason the engine cannot recover from automatically.
+#[cfg_attr(verus_keep_ghost, verus_verify)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DivergenceCause {
     /// Fork deeper than the oldest observed block in the ring.
@@ -112,6 +122,7 @@ impl fmt::Display for DivergenceCause {
 impl core::error::Error for DivergenceCause {}
 
 /// Durability sink refused a snapshot offer; persistence has stopped.
+#[cfg_attr(verus_keep_ghost, verus_verify)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DurabilityLost;
 
@@ -127,6 +138,7 @@ impl fmt::Display for DurabilityLost {
 impl core::error::Error for DurabilityLost {}
 
 /// Rejected engine construction configuration.
+#[cfg_attr(verus_keep_ghost, verus_verify)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfigError {
     /// Ring capacity is not a power of two.
@@ -167,6 +179,7 @@ impl fmt::Display for ConfigError {
 impl core::error::Error for ConfigError {}
 
 /// Rejected or failed batch application.
+#[cfg_attr(verus_keep_ghost, verus_verify)]
 #[derive(Debug, PartialEq, Eq)]
 pub enum ApplyError<E> {
     /// Engine is halted, poisoned, or unrecoverable.
@@ -263,6 +276,7 @@ impl<E: fmt::Display> fmt::Display for ApplyError<E> {
 impl<E: fmt::Debug + fmt::Display> core::error::Error for ApplyError<E> {}
 
 /// Rejected rollback request.
+#[cfg_attr(verus_keep_ghost, verus_verify)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RollbackError {
     /// No retained checkpoint sits at or below the requested block.

@@ -497,3 +497,20 @@ mod tests {
         assert_eq!(ring.iter().last(), Some(block(2)));
     }
 }
+
+#[cfg(verus_keep_ghost)]
+verus! {
+impl BlockRing {
+    /// The view-level facts of `wf`, for modules that cannot see its body.
+    pub(crate) proof fn lemma_wf(&self)
+        requires
+            self.wf(),
+        ensures
+            self@.len() <= self.cap(),
+            2 <= self.cap() <= 0x10_0000,
+            (self.cap() as usize) & ((self.cap() - 1) as usize) == 0,
+            crate::verus::model::ring_ascending(self@),
+    {
+    }
+}
+} // verus!
