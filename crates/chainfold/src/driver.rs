@@ -157,7 +157,6 @@ where
     config: DriverConfig,
     batch: Batch<F::Event>,
     scratch: Vec<(BlockRef, u32, F::Event)>,
-    scanned_to: Option<u64>,
     initial: F,
     consecutive_errors: u32,
     caught_up: bool,
@@ -275,7 +274,6 @@ where
             config: driver_config,
             batch: Batch::new(),
             scratch: Vec::new(),
-            scanned_to: None,
             initial,
             consecutive_errors: 0,
             caught_up: false,
@@ -413,7 +411,6 @@ where
         self.engine.reset(self.initial.clone());
         self.caught_up = false;
         self.consecutive_errors = 0;
-        self.scanned_to = None;
         self.reconcile_reset();
         Tick::Resynced
     }
@@ -505,10 +502,7 @@ where
 
         let head = self.source.head()?;
         let mut from = match cursor {
-            Some(cursor) => self
-                .scanned_to
-                .map_or(cursor.block + 1, |to| to.saturating_add(1))
-                .min(cursor.block + 1),
+            Some(cursor) => cursor.block + 1,
             None => self.config.start_block,
         };
 
@@ -517,7 +511,6 @@ where
             let to = head.min(from.saturating_add(window - 1));
             self.scratch.clear();
             self.source.events_in(from, to, &mut self.scratch)?;
-            self.scanned_to = Some(to);
             from = to.saturating_add(1);
             if !self.scratch.is_empty() {
                 group_into(&mut self.batch, &mut self.scratch);
