@@ -210,6 +210,144 @@ dependency stack that a guest or wasm build has no use for.
   `SnapshotError::TooLarge`.
 <!-- ANCHOR_END: usage -->
 
+## verification
+
+<!-- ANCHOR: verification -->
+### verification
+
+[Verus](https://github.com/verus-lang/verus) proves the core invariants in place, in
+attribute mode (ethsystems/pm#423). The proofs cover the
+`no_std + alloc + wincode` build. Normal builds do not need Verus: every annotation
+is behind `cfg(verus_keep_ghost)`. The spec model is in `src/verus/model.rs`. The
+trusted items are in `src/verus/tcb.rs`.
+
+#### what Verus proves
+
+Parts marked TODO are in progress (P5 for apply, P8 for the driver).
+
+- **T1, position.** `lt` is a strict total order: irreflexive, transitive, and
+  trichotomous. `pos_gt` and `Position::new` match their specs.
+- **T2, batch.** `validate` returns `Ok` if and only if the batch is well shaped.
+  Well shaped means: blocks strictly ascending, no empty span, and log indices
+  strictly ascending in each span. `Ok` implies that the flattened positions are strictly ascending. Each `Err`
+  names the first violation (`first_descent` gives the least `i >= 1` with
+  `v[i] <= v[i-1]`).
+- **T3, apply.** TODO (P5). The parts are: rejection keeps the state, dedup against
+  the cursor, total order across calls, idempotence, the post-state, and the fold
+  equality.
+- **T4, ring and bisection.** Every `BlockRing` fn matches its `Seq` model.
+  `index_at_or_below` finds the last entry at or below `n` in at most
+  `floor(log2 len) + 1` steps. `canonical_prefix` makes at most `log2 len + 1` source
+  calls. Its result is safe under A1 alone. It is optimal under A1, A2′, and
+  `down_closed(V)`.
+- **T5, checkpoint and rollback.** The checkpoint ring keeps its invariants.
+  `rollback_at_or_below` picks the newest live slot at or below the target. It
+  restores the fold, cursor, and ring prefix of that slot. An `Err` leaves the engine
+  unchanged. The refold invariant `inv(init, log)` holds across `checkpoint`,
+  `rollback_at_or_below`, `reset`, and `mark_unrecoverable`. TODO (P5): the same
+  invariant across `apply_batch`.
+- **T6, durable cursor and restart.** `durable_point() <= cursor()` in every `wf`
+  state. `decode_snapshot` returns only `wf` engines, for any input bytes, with no
+  trust in the codec or the checksum. `encode_durable_snapshot` returns the durable
+  point, and its envelope encodes the durable snapshot. A decoded envelope gives back
+  the durable snapshot view, except for the fold (A5). TODO (P8): the driver bound
+  `status().durable_cursor <= status().cursor`.
+- **T7, driver end to end.** TODO (P8). Take a tick that returns `Progressed` or
+  `Idle` with the engine `Active`. After it, the fold equals the fold of the canonical
+  log of the view of that tick.
+
+Verus checks every exec fn in the in-scope files for panics and overflow. The only
+exceptions are the fns listed as out of scope or pending in `Cargo.toml`.
+
+#### assumptions
+
+- **A1, hash commitment.** A block hash commits to its number, its logs, and its whole
+  ancestry. Each view that a source presents satisfies `a1::<S, E>(V)`: `chain(V)`
+  plus strictly ascending log indices. The decoded logs are per source type
+  (`logs::<S, E>`).
+- **A2, scan-view stability.** (i) Each `header_at` and `events_in` call answers from
+  one view. The source spec records that view in `sview_log`. (ii) Blocks of earlier
+  empty windows are unchanged in the last `events_in` view of the same scan. (iii) No
+  ABA: a cursor block that is canonical at the boundary fetch was canonical during the
+  last `events_in`.
+- **A2′, one bisection view.** All probes of one bisection see one view. Only T4c
+  optimality needs it. Optimality also takes `down_closed(V)` as a hypothesis: `V`
+  holds every height below each height it holds. `a1` does not include this, because
+  a pruned source answers `None` below its horizon. TODO (P8): T7 takes the weaker
+  `holds(V, start_block, n)` for each view a tick uses.
+- **A3, fold determinism.** `Fold::apply` is a function of the state view, the
+  position, and the event. The state view is `fview(&f)`, an uninterpreted `int`
+  (`F: ?Sized`, so `Fold` has no `Sized` bound). A `Halt` keeps the view. `Clone`
+  keeps the view (tcb item 1). Edits through `fold_mut` must keep the view. For this
+  reason `fold_mut` is out of scope.
+- **A4, sink honesty.** `SnapshotSink::durable_cursor` is `None` or a point offered
+  since the last `reset` (`sink_offered`). The sink given to a driver has offered
+  nothing past the engine's cursor and its live slots.
+- **A5, state codec.** `Persist::decode_state` of `encode_state`'s bytes gives back
+  the same fold view. Safety does not depend on this, only recovery of the same state.
+- **A6, trusted items.** Each item in `src/verus/tcb.rs`, listed below.
+- **A7, tooling.** Verus, Z3, vstd's `std_specs`, and rustc codegen are correct.
+  Allocation succeeds (partial correctness). The `std` build differs from the proved
+  build only in import paths and the CRC backend.
+
+#### trusted items (`src/verus/tcb.rs`)
+
+1. `axiom_clone_preserves_fview`: a clone has the same fold view (A3).
+2. `PartialOrdSpecImpl for Position`: the derived `PartialOrd` compares block, then
+   log index. The test `position_order_is_block_then_log_index` checks it.
+3. `OrdSpecImpl for Position`: the same for the derived `Ord`.
+4. `Vec::into_boxed_slice` keeps the elements in order (std docs).
+5. `<[T]>::sort_by_key` permutes the slice and claims no order, because
+   `Batch::validate` checks the order. TODO (P8): `group_into` calls
+   `sort_unstable_by_key`, so this entry changes to that fn.
+6. `<[T]>::split_last_chunk`: empty contract, it asserts nothing.
+7. `snapshot::crc32c`: empty contract. Decode never trusts the checksum value.
+8. `wincode::ReadError`: an opaque type, it asserts nothing.
+9. `snapshot::read_envelope`: empty contract. Decode checks every decoded field.
+10. `snapshot::write_payload`: empty contract. Encode checks the output length itself.
+11. `snapshot::trailer_bytes`: empty contract. No proof reads the trailer bytes.
+12. `IteratorSpecImpl for Spans`: asserts nothing. `Spans` opts out of the iterator
+    laws, so `next` and `size_hint` verify panic-free.
+13. `IteratorSpecImpl for Observed`: asserts nothing, as for `Spans`.
+
+`.github/scripts/verus-gates.py` fails when a trusted construct appears outside
+`tcb.rs`. It also fails on a fn in an in-scope file that has no verifying attribute
+and is not on the out-of-scope list. The list is in `Cargo.toml`.
+
+#### out of scope
+
+- `harness` and `storage/*`: threads and fsync. Fuzz tests cover them, and no proof
+  does.
+- `Display` and `Debug` impls, and `next_delay` timing.
+- Liveness beyond loop termination, and performance beyond the probe bounds.
+- Implementations of the trusted traits: `NoSink` (A4) and every `Persist` fold (A5).
+- `Engine::fold_mut` (A3).
+
+#### running it
+
+CI runs the `verus` job on x86 Linux with the release pinned in
+`.github/workflows/ci.yml`. The job fails unless Verus reports
+`N verified, 0 errors` with `N` at or above `VERUS_MIN_VERIFIED`. On x86 Linux:
+
+1. Download the pinned `verus-<version>-x86-linux.zip` and put its directory on `PATH`.
+2. Read the toolchain from the zip:
+   `jq -r '.verus.toolchain | split(" ")[0]' version.json`.
+3. Install it with `rustup toolchain install <toolchain> --component rustc-dev --component llvm-tools`.
+4. From the workspace root, run:
+
+```sh
+python3 .github/scripts/verus-gates.py --self-test
+python3 .github/scripts/verus-gates.py crates/chainfold
+RUSTUP_TOOLCHAIN=<toolchain> cargo clean -p chainfold
+RUSTUP_TOOLCHAIN=<toolchain> cargo verus verify -p chainfold --features verus,wincode \
+    --check-toolchain --fwd-verus-args-to roots
+```
+
+Clean before each run. A cached run prints no results line and verifies nothing.
+There is no prebuilt Verus for aarch64 Linux. Build it from source there (Verus
+`BUILD.md`, Z3 4.16.0), or use CI.
+<!-- ANCHOR_END: verification -->
+
 ## development
 
 ### Prerequisites
