@@ -144,17 +144,37 @@ pub(crate) fn write_payload(
 }
 
 /// Little-endian bytes of a CRC32C trailer.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "Verus has no spec for u32::to_le_bytes; each cast keeps one byte"
+)]
+#[cfg_attr(verus_keep_ghost, verus_spec(r => ensures r@ == le_bytes(crc)))]
 #[inline]
-pub(crate) fn trailer_bytes(crc: u32) -> [u8; 4] {
-    crc.to_le_bytes()
+fn trailer_bytes(crc: u32) -> [u8; 4] {
+    let bytes = [
+        crc as u8,
+        (crc >> 8) as u8,
+        (crc >> 16) as u8,
+        (crc >> 24) as u8,
+    ];
+    #[cfg(verus_keep_ghost)]
+    proof! {
+        assert(bytes@ =~= le_bytes(crc));
+    }
+    bytes
 }
 
 /// Serializes an envelope and appends its CRC32C trailer.
 ///
 /// The codec refuses a field longer than `MAX_ENVELOPE_FIELD_LEN`, which is the only
 /// way a fixed-shape envelope fails to serialize into a growable buffer.
-// The codec only appends; the length check makes that a checked fact, not a trusted one.
-#[cfg_attr(verus_keep_ghost, verus_verify)]
+// On failure the codec may leave anything past `start`; the length check keeps the
+// truncation in bounds without trusting it to only append.
+#[cfg_attr(verus_keep_ghost, verus_spec(r =>
+    ensures
+        r is Ok ==> final(out)@ == old(out)@ + frame(envelope@) && encodable(envelope@)
+            && wire_layout(envelope@),
+))]
 fn write_envelope<E>(
     envelope: &Envelope<&'static [u8]>,
     out: &mut Vec<u8>,
@@ -166,8 +186,16 @@ fn write_envelope<E>(
             limit: MAX_ENVELOPE_FIELD_LEN,
         });
     }
+    #[cfg(verus_keep_ghost)]
+    proof! {
+        assert(out@.subrange(start as int, out@.len() as int) =~= wire(envelope@));
+    }
     let crc = crc32c(&out[start..]);
     out.extend_from_slice(&trailer_bytes(crc));
+    #[cfg(verus_keep_ghost)]
+    proof! {
+        assert(out@ =~= old(out)@ + frame(envelope@));
+    }
     Ok(())
 }
 
@@ -231,7 +259,7 @@ fn cursor_fields(cursor: Option<Position>) -> (u8, u64, u64) {
         ring.wf(),
         len <= ring@.len(),
     ensures
-        encodes::<F, _>(r, cursor, ring@.subrange(0, len as int)),
+        encodes::<F>(r@, cursor, ring@.subrange(0, len as int)),
 ))]
 fn envelope<F: Persist>(
     fold: &F,
@@ -380,12 +408,16 @@ impl<F: Persist> Engine<F> {
     ///
     /// The returned point is the encoded snapshot's cursor, trailing the live cursor by
     /// the checkpoint span.
+    // The appended bytes are the durable snapshot's frame, which `decode_snapshot` turns
+    // back into the durable snapshot bar the fold.
     #[cfg_attr(verus_keep_ghost, verus_spec(r =>
         requires
             self.wf(),
         ensures
-            r matches Ok(Some(p)) ==> self@.durable_point() == Some(p),
+            r matches Ok(Some(p)) ==> self@.durable_point() == Some(p)
+                && exists|b: Seq<u8>| final(out)@ == old(out)@ + b && #[trigger] durable_frame::<F>(self@, b),
             r matches Ok(None) <==> self@.durable_point() is None,
+            r matches Ok(None) ==> final(out)@ == old(out)@,
     ))]
     pub fn encode_durable_snapshot(
         &self,
@@ -395,7 +427,14 @@ impl<F: Persist> Engine<F> {
             return Ok(None);
         };
         match write_envelope(&envelope, out) {
-            Ok(()) => Ok(Some(point)),
+            Ok(()) => {
+                #[cfg(verus_keep_ghost)]
+                proof! {
+                    assert(out@ == old(out)@ + frame(envelope@));
+                    assert(durable_frame::<F>(self@, frame(envelope@)));
+                }
+                Ok(Some(point))
+            }
             Err(error) => Err(error),
         }
     }
@@ -408,7 +447,7 @@ impl<F: Persist> Engine<F> {
         ensures
             match r {
                 None => self@.durable_point() is None,
-                Some((e, p)) => self@.durable_point() == Some(p) && durable_encodes::<F, _>(self@, e),
+                Some((e, p)) => self@.durable_point() == Some(p) && durable_encodes::<F>(self@, e@),
             },
     ))]
     fn durable_envelope(&self) -> Option<(Envelope<&'static [u8]>, Position)> {
@@ -428,16 +467,31 @@ impl<F: Persist> Engine<F> {
 #[cfg_attr(verus_keep_ghost, cfg_eval, verus_verify)]
 impl<F: Persist> Engine<F> {
     /// Rebuilds an engine from an envelope; checkpoints, skips, freshness start empty.
-    // Any bytes that decode give a `wf` engine, with no trust in the codec or the
-    // checksum (both have empty contracts in tcb.rs). Every `Err` path is panic-free.
+    // Any bytes that decode give a `wf` engine that passed the magic, version and
+    // checksum checks, with no trust in the codec. A durable frame (the bytes
+    // `encode_durable_snapshot` appends) gives back its durable snapshot bar the fold,
+    // or the fold's own state error; that direction trusts the codec's round trip.
+    // Every `Err` path is panic-free.
     #[cfg_attr(verus_keep_ghost, verus_spec(r =>
         ensures
-            r matches Ok(e) ==> e.wf() && restored(e@, config),
+            r matches Ok(e) ==> e.wf() && restored(e@, config) && frame_checked(bytes@),
+            forall|v: EngineView|
+                #[trigger] durable_frame::<F>(v, bytes@) && v.wf() && config.valid()
+                    && v.ring.len() <= config.ring_capacity ==> match r {
+                    Ok(e) => durable_restart(v, e@, config.checkpoint_slots as nat),
+                    Err(error) => error matches SnapshotError::State(_),
+                },
     ))]
     pub fn decode_snapshot(
         bytes: &[u8],
         config: EngineConfig,
     ) -> Result<Self, SnapshotError<F::PersistError>> {
+        #[cfg(verus_keep_ghost)]
+        proof! {
+            assert forall|v: EngineView| #[trigger] durable_frame::<F>(v, bytes@) implies frame_checked(bytes@) by {
+                lemma_durable_frame::<F>(v, bytes@);
+            }
+        }
         if let Err(error) = config.validate() {
             return Err(SnapshotError::Config(error));
         }
@@ -447,15 +501,17 @@ impl<F: Persist> Engine<F> {
         if bytes[..MAGIC_LEN] != SNAPSHOT_MAGIC {
             return Err(SnapshotError::BadMagic);
         }
+        #[cfg(verus_keep_ghost)]
+        proof! {
+            assert(bytes@.subrange(0, 8) =~= SNAPSHOT_MAGIC@);
+        }
         let version =
             u16::from(bytes[MAGIC_LEN]) | (u16::from(bytes[MAGIC_LEN + 1]) << 8);
         if version != SNAPSHOT_VERSION {
             return Err(SnapshotError::BadVersion { got: version });
         }
 
-        let Some((payload, trailer)) = bytes.split_last_chunk::<CRC_LEN>() else {
-            return Err(SnapshotError::TooShort);
-        };
+        let (payload, trailer) = bytes.split_at(bytes.len() - CRC_LEN);
         let expected_crc = u32::from(trailer[0])
             | (u32::from(trailer[1]) << 8)
             | (u32::from(trailer[2]) << 16)
@@ -468,11 +524,47 @@ impl<F: Persist> Engine<F> {
             });
         }
 
+        #[cfg(verus_keep_ghost)]
+        proof! {
+            assert(payload@ == bytes@.subrange(0, bytes@.len() - 4));
+            assert(trailer@ =~= bytes@.subrange(bytes@.len() - 4, bytes@.len() as int));
+        }
+
         let envelope = match read_envelope(payload) {
             Ok(envelope) => envelope,
-            Err(_error) => return Err(SnapshotError::Envelope),
+            Err(_error) => {
+                #[cfg(verus_keep_ghost)]
+                proof! {
+                    assert forall|v: EngineView| #[trigger] durable_frame::<F>(v, bytes@) implies false by {
+                        let e = lemma_durable_frame::<F>(v, bytes@);
+                        assert(payload@ == wire(e));
+                    }
+                }
+                return Err(SnapshotError::Envelope);
+            }
         };
-        Self::from_envelope(envelope, config)
+        #[cfg(verus_keep_ghost)]
+        proof_decl! {
+            let ghost read = envelope@;
+        }
+        let r = Self::from_envelope(envelope, config);
+        #[cfg(verus_keep_ghost)]
+        proof! {
+            assert forall|v: EngineView|
+                #[trigger] durable_frame::<F>(v, bytes@) && v.wf() && config.valid()
+                    && v.ring.len() <= config.ring_capacity implies match r {
+                    Ok(e) => durable_restart(v, e@, config.checkpoint_slots as nat),
+                    Err(error) => error matches SnapshotError::State(_),
+                } by {
+                let e = lemma_durable_frame::<F>(v, bytes@);
+                assert(payload@ == wire(e));
+                assert(read == e);
+                lemma_durable_round_trip::<F>(v, e, config);
+                let k = e.ring_numbers.len() as int;
+                assert(prefix_at_or_below(v.ring, v.durable_point().unwrap().block, k));
+            }
+        }
+        r
     }
 
     /// Checks a decoded envelope's fields and rebuilds the engine they describe.
@@ -482,8 +574,9 @@ impl<F: Persist> Engine<F> {
         requires
             config.valid(),
         ensures
-            r matches Ok(e) ==> e.wf() && restored(e@, config) && decoded(e@, envelope),
-            accepted::<F, _>(envelope, config) ==> r is Ok || r matches Err(SnapshotError::State(_)),
+            r matches Ok(e) ==> e.wf() && restored(e@, config) && decoded(e@, envelope@),
+            r is Ok ==> accepted::<F>(envelope@, config),
+            accepted::<F>(envelope@, config) ==> r is Ok || r matches Err(SnapshotError::State(_)),
     ))]
     fn from_envelope(
         envelope: Envelope<Vec<u8>>,
@@ -491,6 +584,10 @@ impl<F: Persist> Engine<F> {
     ) -> Result<Self, SnapshotError<F::PersistError>> {
         if envelope.tag.as_slice() != F::STATE_TAG.as_bytes() {
             return Err(SnapshotError::BadTag);
+        }
+        #[cfg(verus_keep_ghost)]
+        proof! {
+            assert(envelope.tag@ =~= F::STATE_TAG.spec_bytes());
         }
 
         if envelope.ring_numbers.len() > config.ring_capacity {
@@ -625,9 +722,8 @@ pub open spec fn from_lanes(
     &&& ring_from_lanes(v.ring, numbers, hashes, numbers.len() as int)
 }
 
-/// What `decode_snapshot` returns. Nothing but the fold, cursor and
-/// ring comes from the bytes; the cursor and ring are some envelope's fields, and the
-/// ring fits the configured window.
+/// What `decode_snapshot` returns. Nothing but the fold, cursor and ring comes from the
+/// bytes, and the ring fits the configured window.
 pub open spec fn restored(v: EngineView, config: EngineConfig) -> bool {
     &&& v.status == EngineStatus::Active
     &&& v.last_verified is None
@@ -635,8 +731,129 @@ pub open spec fn restored(v: EngineView, config: EngineConfig) -> bool {
     &&& v.resets == 0
     &&& v.slots == Seq::new(config.checkpoint_slots as nat, |_i: int| None::<SlotView>)
     &&& v.ring.len() <= config.ring_capacity
-    &&& exists|cursor_set: u8, cursor_block: u64, cursor_log_index: u64, numbers: Seq<u64>, hashes: Seq<u8>|
-        from_lanes(v, cursor_set, cursor_block, cursor_log_index, numbers, hashes)
+}
+
+/// The CRC32C of `bytes`.
+pub uninterp spec fn crc32c_spec(bytes: Seq<u8>) -> u32;
+
+/// The little-endian `u32` of four bytes.
+pub open spec fn le_u32(t: Seq<u8>) -> u32 {
+    (t[0] as u32) | ((t[1] as u32) << 8) | ((t[2] as u32) << 16) | ((t[3] as u32) << 24)
+}
+
+/// The four little-endian bytes of `x`.
+pub open spec fn le_bytes(x: u32) -> Seq<u8> {
+    seq![x as u8, (x >> 8) as u8, (x >> 16) as u8, (x >> 24) as u8]
+}
+
+/// What decode checks before the codec runs: room for magic, version and trailer, the
+/// magic, the version, and a trailer that is the CRC32C of the payload before it.
+pub open spec fn frame_checked(b: Seq<u8>) -> bool {
+    let n = b.len() - 4;
+    &&& b.len() >= 14
+    &&& b.subrange(0, 8) == SNAPSHOT_MAGIC@
+    &&& (b[8] as u16) | ((b[9] as u16) << 8) == SNAPSHOT_VERSION
+    &&& crc32c_spec(b.subrange(0, n)) == le_u32(b.subrange(n, b.len() as int))
+}
+
+/// `b` is the frame `encode_durable_snapshot` writes for `v`: the codec's bytes for the
+/// envelope of `v`'s durable snapshot, then their CRC32C.
+pub closed spec fn durable_frame<F: Persist>(v: EngineView, b: Seq<u8>) -> bool {
+    exists|e: EnvelopeView|
+        #[trigger] durable_encodes::<F>(v, e) && encodable(e) && wire_layout(e) && b == frame(e)
+}
+
+/// `d` is `v`'s durable snapshot bar the fold, with `slots` empty checkpoint slots: the
+/// durable point as cursor, and the ring entries at or below its block.
+pub open spec fn durable_restart(v: EngineView, d: EngineView, slots: nat) -> bool {
+    exists|k: int|
+        #[trigger] prefix_at_or_below(v.ring, v.durable_point().unwrap().block, k)
+            && d == (EngineView { fold: d.fold, ..v.durable_snapshot(k, slots) })
+}
+
+/// An envelope's fields as spec values, with the tag as its bytes.
+pub(crate) struct EnvelopeView {
+    pub(crate) magic: [u8; 8],
+    pub(crate) version: u16,
+    pub(crate) tag: Seq<u8>,
+    pub(crate) cursor_set: u8,
+    pub(crate) cursor_block: u64,
+    pub(crate) cursor_log_index: u64,
+    pub(crate) ring_numbers: Seq<u64>,
+    pub(crate) ring_hashes: Seq<u8>,
+    pub(crate) state: Seq<u8>,
+}
+
+impl<T: View<V = Seq<u8>>> View for Envelope<T> {
+    type V = EnvelopeView;
+
+    closed spec fn view(&self) -> EnvelopeView {
+        EnvelopeView {
+            magic: self.magic,
+            version: self.version,
+            tag: self.tag@,
+            cursor_set: self.cursor_set,
+            cursor_block: self.cursor_block,
+            cursor_log_index: self.cursor_log_index,
+            ring_numbers: self.ring_numbers@,
+            ring_hashes: self.ring_hashes@,
+            state: self.state@,
+        }
+    }
+}
+
+/// The codec's bytes for `e`: fixint little endian, fields in declaration order, each
+/// variable-length field after its `u64` length. Meaningful where `encodable(e)`.
+pub(crate) uninterp spec fn wire(e: EnvelopeView) -> Seq<u8>;
+
+/// The codec serializes `e`: no field is longer than `MAX_ENVELOPE_FIELD_LEN`.
+pub(crate) uninterp spec fn encodable(e: EnvelopeView) -> bool;
+
+/// `wire(e)` opens with the magic, then the version little endian.
+pub(crate) open spec fn wire_layout(e: EnvelopeView) -> bool {
+    let w = wire(e);
+    &&& w.len() >= 10
+    &&& w.subrange(0, 8) == e.magic@
+    &&& (w[8] as u16) | ((w[9] as u16) << 8) == e.version
+}
+
+/// The frame encode writes for `e`: the codec's bytes, then their CRC32C little endian.
+pub(crate) open spec fn frame(e: EnvelopeView) -> Seq<u8> {
+    wire(e) + le_bytes(crc32c_spec(wire(e)))
+}
+
+proof fn lemma_le_u32_bytes(x: u32)
+    ensures
+        le_u32(le_bytes(x)) == x,
+{
+    let t = le_bytes(x);
+    assert(t[0] == x as u8 && t[1] == (x >> 8) as u8 && t[2] == (x >> 16) as u8 && t[3] == (x >> 24) as u8);
+    assert(((x as u8) as u32) | ((((x >> 8) as u8) as u32) << 8) | ((((x >> 16) as u8) as u32) << 16)
+        | ((((x >> 24) as u8) as u32) << 24) == x) by (bit_vector);
+}
+
+/// A durable frame passes decode's frame checks, and its payload is the codec's bytes for
+/// the envelope it frames.
+proof fn lemma_durable_frame<F: Persist>(v: EngineView, b: Seq<u8>) -> (e: EnvelopeView)
+    requires
+        durable_frame::<F>(v, b),
+    ensures
+        durable_encodes::<F>(v, e),
+        encodable(e),
+        b == frame(e),
+        frame_checked(b),
+        b.subrange(0, b.len() - 4) == wire(e),
+{
+    let e = choose|e: EnvelopeView|
+        #[trigger] durable_encodes::<F>(v, e) && encodable(e) && wire_layout(e) && b == frame(e);
+    let w = wire(e);
+    let n = b.len() - 4;
+    assert(b.subrange(0, n) =~= w);
+    assert(b.subrange(0, 8) =~= w.subrange(0, 8));
+    assert(b[8] == w[8] && b[9] == w[9]);
+    assert(b.subrange(n, b.len() as int) =~= le_bytes(crc32c_spec(w)));
+    lemma_le_u32_bytes(crc32c_spec(w));
+    e
 }
 
 
@@ -658,30 +875,30 @@ spec fn cursor_lanes(cursor: Option<Position>) -> (u8, u64, u64) {
 
 /// `e` is the envelope encode builds for `cursor` and `ring`. Its state bytes are the
 /// fold's own encoding, which is trusted.
-spec fn encodes<F: Persist, T: View<V = Seq<u8>>>(e: Envelope<T>, cursor: Option<Position>, ring: Seq<BlockRef>) -> bool {
+spec fn encodes<F: Persist>(e: EnvelopeView, cursor: Option<Position>, ring: Seq<BlockRef>) -> bool {
     &&& e.magic == SNAPSHOT_MAGIC
     &&& e.version == SNAPSHOT_VERSION
-    &&& e.tag@ == F::STATE_TAG.spec_bytes()
+    &&& e.tag == F::STATE_TAG.spec_bytes()
     &&& (e.cursor_set, e.cursor_block, e.cursor_log_index) == cursor_lanes(cursor)
-    &&& lanes(ring, e.ring_numbers@, e.ring_hashes@)
+    &&& lanes(ring, e.ring_numbers, e.ring_hashes)
 }
 
 /// `e` encodes `v`'s durable snapshot: the durable point, and the ring prefix at or
 /// below its block, whose length is the lane length.
-spec fn durable_encodes<F: Persist, T: View<V = Seq<u8>>>(v: EngineView, e: Envelope<T>) -> bool {
-    let k = e.ring_numbers@.len() as int;
+spec fn durable_encodes<F: Persist>(v: EngineView, e: EnvelopeView) -> bool {
+    let k = e.ring_numbers.len() as int;
     &&& v.durable_point() is Some
     &&& prefix_at_or_below(v.ring, v.durable_point().unwrap().block, k)
-    &&& encodes::<F, _>(e, v.durable_snapshot(k, 0).cursor, v.durable_snapshot(k, 0).ring)
+    &&& encodes::<F>(e, v.durable_snapshot(k, 0).cursor, v.durable_snapshot(k, 0).ring)
 }
 
 /// The envelope fields `from_envelope` accepts, bar the state bytes.
-spec fn accepted<F: Persist, T: View<V = Seq<u8>>>(e: Envelope<T>, config: EngineConfig) -> bool {
-    let n = e.ring_numbers@;
-    &&& e.tag@ == F::STATE_TAG.spec_bytes()
+spec fn accepted<F: Persist>(e: EnvelopeView, config: EngineConfig) -> bool {
+    let n = e.ring_numbers;
+    &&& e.tag == F::STATE_TAG.spec_bytes()
     &&& n.len() <= config.ring_capacity
     &&& forall|a: int, b: int| #![trigger n[a], n[b]] 0 <= a < b < n.len() ==> n[a] < n[b]
-    &&& e.ring_hashes@.len() == 32 * n.len()
+    &&& e.ring_hashes.len() == 32 * n.len()
     &&& if e.cursor_set != 0 {
         n.len() > 0 && n.last() == e.cursor_block
     } else {
@@ -690,21 +907,21 @@ spec fn accepted<F: Persist, T: View<V = Seq<u8>>>(e: Envelope<T>, config: Engin
 }
 
 /// `v`'s cursor and ring are the ones envelope `e` describes.
-spec fn decoded<T>(v: EngineView, e: Envelope<T>) -> bool {
-    from_lanes(v, e.cursor_set, e.cursor_block, e.cursor_log_index, e.ring_numbers@, e.ring_hashes@)
+spec fn decoded(v: EngineView, e: EnvelopeView) -> bool {
+    from_lanes(v, e.cursor_set, e.cursor_block, e.cursor_log_index, e.ring_numbers, e.ring_hashes)
 }
 
 /// Round trip at the envelope level: the envelope encode builds for an ascending ring
 /// that ends at the cursor block passes `from_envelope`'s checks, and every engine it
 /// decodes to has that cursor and ring.
-proof fn lemma_envelope_round_trip<F: Persist, T: View<V = Seq<u8>>>(
-    e: Envelope<T>,
+proof fn lemma_envelope_round_trip<F: Persist>(
+    e: EnvelopeView,
     cursor: Option<Position>,
     ring: Seq<BlockRef>,
     config: EngineConfig,
 )
     requires
-        encodes::<F, _>(e, cursor, ring),
+        encodes::<F>(e, cursor, ring),
         ring_ascending(ring),
         match cursor {
             Some(c) => ring.len() > 0 && ring.last().number == c.block,
@@ -712,10 +929,10 @@ proof fn lemma_envelope_round_trip<F: Persist, T: View<V = Seq<u8>>>(
         },
         ring.len() <= config.ring_capacity,
     ensures
-        accepted::<F, _>(e, config),
+        accepted::<F>(e, config),
         forall|v: EngineView| #[trigger] decoded(v, e) ==> v.cursor == cursor && v.ring == ring,
 {
-    let n = e.ring_numbers@;
+    let n = e.ring_numbers;
     assert forall|a: int, b: int| 0 <= a < b < n.len() implies #[trigger] n[a] < #[trigger] n[b] by {
         assert(ring[a].number < ring[b].number);
     }
@@ -733,23 +950,23 @@ proof fn lemma_envelope_round_trip<F: Persist, T: View<V = Seq<u8>>>(
 
 /// Round trip: decoding the envelope `encode_durable_snapshot` builds gives back the
 /// durable snapshot's view, bar the fold, for a config whose window holds the ring.
-proof fn lemma_durable_round_trip<F: Persist, T: View<V = Seq<u8>>>(v: EngineView, e: Envelope<T>, config: EngineConfig)
+proof fn lemma_durable_round_trip<F: Persist>(v: EngineView, e: EnvelopeView, config: EngineConfig)
     requires
         v.wf(),
-        durable_encodes::<F, _>(v, e),
+        durable_encodes::<F>(v, e),
         v.ring.len() <= config.ring_capacity,
     ensures
-        accepted::<F, _>(e, config),
+        accepted::<F>(e, config),
         forall|d: EngineView|
             restored(d, config) && #[trigger] decoded(d, e) ==> d == (EngineView {
                 fold: d.fold,
-                ..v.durable_snapshot(e.ring_numbers@.len() as int, config.checkpoint_slots as nat)
+                ..v.durable_snapshot(e.ring_numbers.len() as int, config.checkpoint_slots as nat)
             }),
 {
-    let k = e.ring_numbers@.len() as int;
+    let k = e.ring_numbers.len() as int;
     lemma_durable_snapshot(v, k, 0);
     let snap = v.durable_snapshot(k, 0);
-    lemma_envelope_round_trip::<F, _>(e, snap.cursor, snap.ring, config);
+    lemma_envelope_round_trip::<F>(e, snap.cursor, snap.ring, config);
     let full = v.durable_snapshot(k, config.checkpoint_slots as nat);
     assert forall|d: EngineView| restored(d, config) && #[trigger] decoded(d, e) implies d == (
     EngineView { fold: d.fold, ..full }) by {

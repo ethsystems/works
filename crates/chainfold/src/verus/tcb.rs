@@ -66,17 +66,13 @@ pub assume_specification<T, K: Ord, F: FnMut(&T) -> K>[ <[T]>::sort_unstable_by_
         final(v)@.to_multiset() == old(v)@.to_multiset(),
 ;
 
-// Trusted: empty contract, it asserts nothing. `decode_snapshot` splits off the checksum
-// trailer; its safety comes from the checks after it, so the split is never trusted (a
-// mutation test showed no proof reads a stronger spec).
-pub assume_specification<T, const N: usize>[ <[T]>::split_last_chunk::<N> ](s: &[T]) -> Option<
-    (&[T], &[T; N]),
->;
-
-// Trusted: empty contract, it asserts nothing. `decode_snapshot` calls the checksum; its
-// safety comes from the checks after it, so the checksum's value is never trusted.
+// Trusted: the checksum is a function of the bytes (`crc32c_spec` is uninterpreted, so
+// nothing about its value is assumed). Encode writes it and decode compares against it.
 #[cfg(feature = "wincode")]
-pub assume_specification[ crate::snapshot::crc32c ](bytes: &[u8]) -> u32;
+pub assume_specification[ crate::snapshot::crc32c ](bytes: &[u8]) -> (r: u32)
+    ensures
+        r == crate::snapshot::crc32c_spec(bytes@),
+;
 
 // Trusted: an opaque type, it asserts nothing. The codec's error type, named by
 // `deserialize` below; decode maps every error to `SnapshotError::Envelope` without
@@ -86,32 +82,34 @@ pub assume_specification[ crate::snapshot::crc32c ](bytes: &[u8]) -> u32;
 #[verifier::external_body]
 pub struct ExReadError(wincode::ReadError);
 
-// Trusted: empty contract, it asserts nothing. `decode_snapshot` checks every field of
-// the decoded envelope itself, so no property of the codec is trusted. The entry is on
-// the crate's one-line wrapper, so the codec's config types and traits stay out of the
-// proofs.
+// Trusted: the codec round trip. Bytes the serializer produces for an envelope decode
+// back to that envelope (wincode's derived `SchemaWrite`/`SchemaRead` pair under one
+// config; the borrowed and owned tags serialize alike, checked by a test). Only the
+// durable round trip reads this: `decode_snapshot` checks every decoded field itself, so
+// its safety trusts nothing of the codec. The entry is on the crate's one-line wrapper,
+// so the codec's config types and traits stay out of the proofs.
 #[cfg(feature = "wincode")]
-pub assume_specification[ crate::snapshot::read_envelope ](payload: &[u8]) -> wincode::ReadResult<
+pub assume_specification[ crate::snapshot::read_envelope ](payload: &[u8]) -> (r: wincode::ReadResult<
     crate::snapshot::Envelope<Vec<u8>>,
->;
+>)
+    ensures
+        forall|e: crate::snapshot::EnvelopeView|
+            #[trigger] crate::snapshot::encodable(e) && crate::snapshot::wire(e) == payload@ ==> (r matches Ok(d) && d@ == e),
+;
 
-// Trusted: empty contract, it asserts nothing, and `out` may hold anything afterwards.
-// The encode path (`write_envelope`) calls the codec's serializer through the crate's
-// one-line wrapper, as for `read_envelope`. Its only use of the result is a length check
-// it makes itself, so no property of the codec is trusted; the state bytes rest on the
-// fold's `Persist` codec.
+// Trusted: on success the serializer appends exactly its bytes for the envelope, which
+// open with the magic and the little-endian version (fixint layout, pinned by a test).
+// On failure `out` may hold anything past its old length; `write_envelope` truncates it.
+// The state bytes rest on the fold's `Persist` codec.
 #[cfg(feature = "wincode")]
 pub assume_specification[ crate::snapshot::write_payload ](
     out: &mut Vec<u8>,
     envelope: &crate::snapshot::Envelope<&'static [u8]>,
-) -> bool;
-
-// Trusted: empty contract, it asserts nothing. `write_envelope` appends the trailer bytes
-// to a buffer whose content no proof reads, so their value is never trusted. The entry is
-// on a one-line wrapper because `u32::to_le_bytes`'s array length is a const expression
-// that `assume_specification` cannot match.
-#[cfg(feature = "wincode")]
-pub assume_specification[ crate::snapshot::trailer_bytes ](crc: u32) -> [u8; 4];
+) -> (r: bool)
+    ensures
+        r ==> final(out)@ == old(out)@ + crate::snapshot::wire(envelope@)
+            && crate::snapshot::encodable(envelope@) && crate::snapshot::wire_layout(envelope@),
+;
 
 // Trusted: asserts nothing. `Spans` opts out of vstd's iterator laws, so verified callers
 // learn nothing from `Spans::next`; this lets `next` and `size_hint` verify panic-free. A

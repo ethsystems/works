@@ -249,9 +249,14 @@ trusted items are in `src/verus/tcb.rs`.
   the log by the entries it ran the fold on.
 - **T6, durable cursor and restart.** `durable_point() <= cursor()` in every `wf`
   state. `decode_snapshot` returns only `wf` engines, for any input bytes, with no
-  trust in the codec or the checksum. `encode_durable_snapshot` returns the durable
-  point, and its envelope encodes the durable snapshot. A decoded envelope gives back
-  the durable snapshot view, except for the fold (A5). `Driver::status` reports
+  trust in the codec. An `Ok` passed the length, magic, version, and CRC32C checks
+  on the input bytes (`frame_checked`). The envelope it decoded carried the fold's own
+  tag and an ascending ring within W that ends at the cursor block.
+  `encode_durable_snapshot` returns the durable point and appends the durable
+  frame: the codec's bytes for the durable snapshot's envelope, then their CRC32C.
+  Decoding that frame, under a config whose window holds the ring, gives back the
+  durable snapshot view except for the fold (A5), or the fold's `State` error. That
+  direction trusts the codec round trip (tcb items 6 and 7). `Driver::status` reports
   `durable_cursor <= cursor` while the driver state is `durable_ok`. Every
   driver method keeps `durable_ok`.
 - **T7, driver end to end.** Under A1, A2, and A3, `Driver::tick` keeps the ghost
@@ -304,16 +309,18 @@ exceptions are the fns listed as out of scope in `Cargo.toml`.
 2. `Vec::into_boxed_slice` keeps the elements in order (std docs).
 3. `<[T]>::sort_unstable_by_key` permutes the slice (std docs). It claims no order,
    because `Batch::validate` checks the order. `group_into` uses it.
-4. `<[T]>::split_last_chunk`: empty contract, it asserts nothing.
-5. `snapshot::crc32c`: empty contract. Decode never trusts the checksum value.
-6. `wincode::ReadError`: an opaque type, it asserts nothing.
-7. `snapshot::read_envelope`: empty contract. Decode checks every decoded field.
-8. `snapshot::write_payload`: empty contract. Encode checks the output length itself.
-9. `snapshot::trailer_bytes`: empty contract. No proof reads the trailer bytes.
-10. `IteratorSpecImpl for Spans`: asserts nothing. `Spans` opts out of the iterator
-    laws, so `next` and `size_hint` verify panic-free.
-11. `IteratorSpecImpl for Observed`: asserts nothing, as for `Spans`.
-12. `axiom_no_sink_offers_nothing`: `NoSink` stores nothing, so it holds no offers (A4).
+4. `snapshot::crc32c`: the checksum is a function of the bytes (`crc32c_spec` is
+   uninterpreted, so no value is assumed).
+5. `wincode::ReadError`: an opaque type, it asserts nothing.
+6. `snapshot::read_envelope`: the codec round trip. The bytes the serializer wrote
+   for an envelope decode back to it. Decode's safety does not read this, since it
+   checks every decoded field.
+7. `snapshot::write_payload`: on success the serializer appends its bytes for the
+   envelope (`wire`), which open with the magic and the little-endian version.
+8. `IteratorSpecImpl for Spans`: asserts nothing. `Spans` opts out of the iterator
+   laws, so `next` and `size_hint` verify panic-free.
+9. `IteratorSpecImpl for Observed`: asserts nothing, as for `Spans`.
+10. `axiom_no_sink_offers_nothing`: `NoSink` stores nothing, so it holds no offers (A4).
 
 `.github/scripts/verus-gates.py` fails when a trusted construct appears outside
 `tcb.rs`. It also fails on a fn in an in-scope file that has no verifying attribute
