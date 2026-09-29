@@ -50,9 +50,10 @@ pub enum EngineStatus {
         /// Position the fold halted at.
         at: Position,
     },
-    /// Fold refused an event after mutating state.
+    /// Fold refused an event after mutating state, or panicked out of `apply`.
     Poisoned {
-        /// Position the fold poisoned at.
+        /// Position the fold poisoned at. After a caught panic, the cursor the batch
+        /// started from (`(0, 0)` without one); the fold may have run on events past it.
         at: Position,
     },
     /// Automated recovery is exhausted; only a reset leaves this state.

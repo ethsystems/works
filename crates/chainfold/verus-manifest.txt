@@ -477,7 +477,7 @@ spec ce2556cedc48 src/engine.rs::Engine::rollback_at_or_below
 spec 8e8ed0ca68bc src/engine.rs::Engine::reset
 spec 85f5e4503449 src/engine.rs::Engine::mark_unrecoverable
 spec fa270da69437 src/engine.rs::Engine::restore_cursor_and_ring
-spec 68d5e2f65928 src/engine.rs::Engine::apply_span
+spec 1434288381d9 src/engine.rs::Engine::apply_span
 spec dc18f9984fcc src/engine.rs::Engine::consumed_through
 spec 69eeb2fc53a2 src/engine.rs::Engine::advance
 spec 4e5851b1aefe src/engine.rs::Engine::halt

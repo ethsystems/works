@@ -57,7 +57,8 @@ and recovery), and the adapters (`std`: tokio harness, snapshot store, flusher).
   grow without bound.
 - `FoldError` is classified at the fold, not guessed by the engine: `Skip` (not mine,
   counted and stepped over), `Halt` (clean below this position, rollback or resync),
-  `Poison` (partially mutated, untrusted until a restore).
+  `Poison` (partially mutated, untrusted until a restore). A panic out of `apply` that
+  the caller catches leaves the engine `Poisoned` too, so no event is folded twice.
 - `Source` is three reads: `head`, `header_at`, `events_in`. The driver owns the window
   walk, the boundary refetch, and the grouping into spans, so a source cannot get the
   batch shape wrong and every source gets fork detection. The boundary is refetched

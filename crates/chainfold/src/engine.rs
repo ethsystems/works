@@ -450,7 +450,9 @@ impl<F: Fold> Engine<F> {
             assert(split_at_tip(bv, v0.cursor, i0));
         }
 
+        let mut from = Position::new(0, 0);
         if let Some(cursor) = self.cursor {
+            from = cursor;
             let boundary = batch.boundary.ok_or(ApplyError::MissingBoundary)?;
             if boundary.number != cursor.block {
                 return Err(ApplyError::BoundaryNumberMismatch {
@@ -508,6 +510,12 @@ impl<F: Fold> Engine<F> {
             skipped: 0,
         };
         let mut start = 0usize;
+        // A panic out of `Fold::apply` unwinds past the cursor update with the fold
+        // partly mutated, so the spans run under Poisoned at the starting cursor and a
+        // caught panic never leaves an engine that the next batch trusts. The loop proof
+        // reads the engine with its batch-start status.
+        let mark = EngineStatus::Poisoned { at: from };
+        self.status = mark;
         #[cfg_attr(verus_keep_ghost, verus_spec(
             invariant
                 self.wf(),
@@ -518,7 +526,8 @@ impl<F: Fold> Engine<F> {
                 bv.wf(),
                 setup(v0, bv, w, i0),
                 v0.cursor is Some ==> bv.boundary == Some(v0.ring.last()),
-                loop_state::<F>(v0, bv, w, i0, self@, i as int),
+                self@.status == mark,
+                loop_state::<F>(v0, bv, w, i0, EngineView { status: v0.status, ..self@ }, i as int),
                 start == bv.start(i as int),
                 forall|k: int, j: int|
                     #![trigger bv.blocks[k], v0.ring[j]]
@@ -542,7 +551,7 @@ impl<F: Fold> Engine<F> {
             let span = batch.span(i, start);
             #[cfg(verus_keep_ghost)]
             proof_decl! {
-                let ghost pre = self@;
+                let ghost pre = EngineView { status: v0.status, ..self@ };
             }
             #[cfg(verus_keep_ghost)]
             proof! {
@@ -557,8 +566,10 @@ impl<F: Fold> Engine<F> {
             if redelivered {
                 match self.ring.hash_at(span.number) {
                     Some(observed_hash) if &observed_hash != span.hash => {
+                        self.status = EngineStatus::Active;
                         #[cfg(verus_keep_ghost)]
                         proof! {
+                            assert(self@ == pre);
                             let j = choose|j: int|
                                 0 <= j < v0.ring.len() && #[trigger] v0.ring[j].number == bv.blocks[i as int];
                             assert(v0.ring[j].hash != bv.hashes[i as int]);
@@ -592,9 +603,14 @@ impl<F: Fold> Engine<F> {
             #[cfg(verus_keep_ghost)]
             proof! {
                 lemma_span_newer::<F>(v0, bv, w, i0, pre, i as int);
+                let sq = bv.span_events(i as int);
+                let blk = bv.block(i as int);
                 if applied is Ok {
-                    lemma_span_ok::<F>(v0, bv, w, i0, pre, self@, i as int);
+                    let post = EngineView { status: v0.status, ..self@ };
+                    assert(span_post::<F>(pre, post, w, sq, blk, true));
+                    lemma_span_ok::<F>(v0, bv, w, i0, pre, post, i as int);
                 } else {
+                    assert(span_post::<F>(pre, self@, w, sq, blk, false));
                     lemma_span_stop::<F>(v0, bv, w, i0, pre, self@, i as int);
                 }
             }
@@ -613,6 +629,7 @@ impl<F: Fold> Engine<F> {
                 }
             }
         }
+        self.status = EngineStatus::Active;
         #[cfg(verus_keep_ghost)]
         proof! {
             let n = bv.ends.len() as int;
@@ -876,7 +893,6 @@ impl<F: Fold> Engine<F> {
     #[cfg_attr(verus_keep_ghost, verus_spec(r =>
         requires
             old(self).wf(),
-            old(self)@.status is Active,
             span.log_indices@.len() == span.events@.len(),
             forall|j: int, k: int|
                 0 <= j < k < span.log_indices@.len() ==> span.log_indices@[j] < span.log_indices@[k],
@@ -1651,6 +1667,62 @@ mod tests {
         let result = engine.apply_batch(&batch_of(Some(block(5, 0)), vec![]));
         // then CursorBlockUnobserved, never a panic
         assert_eq!(result, Err(ApplyError::CursorBlockUnobserved { block: 5 }));
+    }
+
+    /// Counts applied events and panics on the event at `panic_at`.
+    #[cfg(feature = "std")]
+    struct PanicFold {
+        applied: u32,
+        panic_at: Position,
+    }
+
+    #[cfg(feature = "std")]
+    impl Fold for PanicFold {
+        type Event = u64;
+        type Error = core::convert::Infallible;
+
+        fn apply(
+            &mut self,
+            pos: Position,
+            _event: &Self::Event,
+        ) -> Result<(), FoldError<Self::Error>> {
+            self.applied += 1;
+            assert_ne!(pos, self.panic_at, "scripted fold panic");
+            Ok(())
+        }
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn panic_in_fold_leaves_the_engine_poisoned() {
+        // given a fold that counts the second event of a three-event span, then panics
+        let fold = PanicFold {
+            applied: 0,
+            panic_at: Position::new(1, 1),
+        };
+        let config = EngineConfig {
+            ring_capacity: 8,
+            checkpoint_slots: 0,
+        };
+        let mut engine = Engine::new(fold, config).unwrap();
+        let batch = batch_of(None, vec![(block(1, 0), vec![0, 1, 2])]);
+        // when the panic is caught
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            engine.apply_batch(&batch)
+        }));
+        assert!(caught.is_err());
+        // then the engine is Poisoned from where the batch started
+        let poisoned = EngineStatus::Poisoned {
+            at: Position::new(0, 0),
+        };
+        assert_eq!(engine.status(), poisoned);
+        assert_eq!(engine.cursor(), None);
+        // and applying the batch again is refused, never folding its events twice
+        assert_eq!(
+            engine.apply_batch(&batch),
+            Err(ApplyError::NotActive { status: poisoned })
+        );
+        assert_eq!(engine.fold().applied, 2);
     }
 
     #[test]
