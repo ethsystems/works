@@ -164,6 +164,94 @@ A suspected fork bisects to the ancestor and rolls back; only a fork below every
 checkpoint escalates to a resync. `with_sink` and the `resume*` constructors add a
 `SnapshotSink`.
 
+### writing a source
+
+A `Source` is trusted to meet its spec (A2), and the calls a JSON-RPC source makes decide
+whether it does. Two answers matter most:
+
+- `events_in` errs on a range past the head of the node that answers it. A node that
+  answers up to its own head instead makes the newest blocks read as blocks with no
+  events: the tip moves past them and their events are skipped (A2 iii). A source that
+  answers every call from one chain needs no such check, since a short answer is exact
+  there.
+- `events_at` reads `eth_getLogs` by `blockHash` and errs on a hash the node does not know
+  or has not executed. An empty answer for such a hash is folded as a block with no
+  events (A2 ii).
+
+`events_at` can often skip the request. The header that `head` reads carries `logsBloom`.
+A source that keeps it with the hash may answer `events_at` for that hash with `Ok` and
+nothing appended when the bloom rules out every address and topic of its filter. The
+answer is exact: the hash commits to the header, so the bloom is that block's own, and a
+bloom has no false negatives. Two details decide it, and a mistake in either skips events
+silently:
+
+- the bits: for each address and topic, the first three big-endian byte pairs of its
+  keccak-256, each masked to 11 bits, index one of the bloom's 2048 bits, counted from
+  the least significant bit of the bloom read as a big-endian number;
+- the filter: a log matches when its address is any of the filter's addresses and, at
+  each topic position the filter names, its topic is any of the ones listed there. So the
+  bloom rules the block out when the filter names addresses and it holds none of them, or
+  when it holds none of the topics of some named position.
+
+Test the bloom check against mainnet headers: every log's address and topics must be in
+its block's bloom. A new head block with no matching logs then costs one request, not two.
+
+Some backends break the two answers above, from each client's code at the versions named
+and from one provider, measured:
+
+| backend | range past its head | hash it lacks or has not executed | first good version |
+|---|---|---|---|
+| geth | answers up to its head to v1.15.8; errs from v1.15.9 | errs on an unknown hash; answers nothing for a block it holds without receipts (a side-chain block it never executed) | v1.15.9, for ranges only |
+| reth | answers up to its head to v1.9.x; errs from v1.10.0 | errs | v1.10.0 |
+| Nethermind | answers up to its head to 1.35.0; errs from 1.36.0 | errs | 1.36.0 |
+| erigon | errs from v3.4.0; earlier not known | errs; to v3.6.x, a hash off its canonical chain answers the canonical block at that height | v3.7.0 |
+| Besu | errs; first version not known | errs | not known |
+| dRPC (`eth.drpc.org`, measured) | a range above its head answered the head block's logs | errs on an unknown hash | none (a provider) |
+
+Behind a load balancer, the backends also lag each other. Any one of these keeps a
+lagging backend from skipping events:
+
+- a confirmation depth: `head` answers the block N below the node's latest, or the `safe`
+  tag, and the source serves nothing above it. A range then never passes the head of a
+  backend that lags by less than N blocks. It costs N blocks of latency (`safe` is about
+  one epoch), and `safe` adds a trust in the tag. `safe` can also step back between
+  backends; the driver then walks from the cursor, which costs calls.
+- one pinned node: a node you run, or a sticky session.
+- a minimum client version: every backend at or above its first good version above. No
+  geth version fixes its by-hash answer, so a geth pool also needs one of the other two.
+
+`window()` is the span of one `events_in` call, 500 blocks by default. A window over the
+provider's cap errs, and so does every walk that needs a full one. Set it per provider:
+
+- Alchemy: 10 blocks on the free tier; paid, 2,000 blocks, or any range with at most
+  10,000 logs.
+- QuickNode: 5 blocks on the free trial, 10,000 paid.
+- Infura: at most 10,000 logs per answer, not a block cap: size the window so one window
+  of your filter stays under it.
+- nodes you run: reth caps 100,000 blocks and 20,000 logs by default, Nethermind 20,000
+  logs, geth nothing.
+
+Calls per scenario, counted with a counting source over `ScriptedChain`: window 10, the
+driver caught up at block 100. One call is one `Source` method, one JSON-RPC request.
+
+| scenario | calls |
+|---|---|
+| poll, no new block | 1 |
+| one new block, with or without events | 2 |
+| one new empty block, then 9 idle polls | 11 |
+| 2, 10, 25 new empty blocks (one tick) | 3, 4, 5 |
+| an event after 1, 10, 100 empty windows (ticks to fold it) | 4, 13, 103 |
+| 1, 10, 100 empty windows, then 10 polls with no new block | 13, 22, 112 |
+| 1, 10, 100 empty windows, then 10 polls with one new block each | 22, 31, 121 |
+| reorg of the cursor block (ticks to idle) | 17 |
+| reorg before the second window of a 30-block walk (ticks to idle) | 14 |
+| reorg of the tip, 10 blocks above the cursor (ticks to idle) | 4 |
+| reorg below the tip and above the cursor that adds an event (ticks to idle) | 6 |
+| one new block, `events_at` to a node without it, lag clears after one tick (ticks to idle) | 6 |
+| one-window answer torn by a reorg, 5 blocks above the cursor (ticks to idle) | 7 |
+
+The bloom check is not in these counts: `ScriptedChain` answers every `events_at` itself.
+
 ### durability (`storage` feature)
 
 `SnapshotStore::open` returns whatever the last commit made durable, `Engine::decode_snapshot`
@@ -326,8 +414,8 @@ exceptions are the fns listed as out of scope in `Cargo.toml`.
   answers the canonical block at that height). Nothing in the crate checks an answer
   against the block: a dropped or an invented log is folded as given, and nothing
   reports it. A1 then also needs the source to check logs against the receipts root, or
-  to trust its node. (iii) No ABA only on the head block within one tick: a view of the
-  tick between two views that hold the head block the tick read first holds it too. The
+  to trust its node. (iii) No ABA within one tick on any block of its first view, the one its
+  `head` call read: a view of the tick between two views that hold such a block holds it. The
   scan tip needs no such assumption across ticks, because A1 makes it a fact of the tip's
   hash, true in every view that holds the tip. The block on top of the tip is read by
   its hash, so a load-balanced node without it errs and the tip stays below it. Only a

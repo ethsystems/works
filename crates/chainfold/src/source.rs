@@ -81,7 +81,9 @@ pub trait Source {
     fn header_at(&mut self, number: u64) -> Result<Option<BlockRef>, Self::Error>;
 
     /// Appends every event in `from..=to`, exactly: no event of the range is left out and
-    /// none is added. Any order; the driver sorts and groups.
+    /// none is added. Any order; the driver sorts and groups. A range past the head of the
+    /// node that answers it gives `Err`, not a short answer, unless every call answers from
+    /// one chain: a short answer from a node that lags reads as blocks with no events.
     #[cfg_attr(verus_keep_ghost, verus_spec(r =>
         ensures
             a1::<Self, Self::Event>(sview::<Self>(final(self))),
@@ -113,6 +115,15 @@ pub trait Source {
     /// whose block it has not executed, gives `Err`. A JSON-RPC source reads it with
     /// `eth_getLogs` by `blockHash`, never by number: a by-number read can answer another
     /// block at that height, or nothing from a node that lags.
+    ///
+    /// A source that holds the header for this hash, such as the one `head` just read, may
+    /// answer from its `logsBloom` instead: `Ok` with nothing appended when the bloom rules
+    /// out every address and topic of the source's filter. That is exact, since the hash
+    /// commits to the header and a bloom has no false negatives. The bloom test must set
+    /// the bits as the chain does (three 11-bit indices from the keccak-256 of each address
+    /// and topic) and read the filter as the node does (any of its addresses, and at each
+    /// topic position it names, any of the topics listed there). A wrong test skips events
+    /// and nothing reports it.
     #[cfg_attr(verus_keep_ghost, verus_spec(r =>
         ensures
             a1::<Self, Self::Event>(sview::<Self>(final(self))),
