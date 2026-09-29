@@ -2424,6 +2424,81 @@ mod tests {
         }
     }
 
+    /// Load balancer over two nodes: `head` comes from the up-to-date one, and while
+    /// `lagging` is set every other call goes to that older copy, which answers a range
+    /// past its own head with the blocks it holds.
+    struct Lagging {
+        inner: ScriptedChain,
+        lagging: Option<ScriptedChain>,
+    }
+
+    impl Lagging {
+        fn node(&mut self) -> &mut ScriptedChain {
+            self.lagging.as_mut().unwrap_or(&mut self.inner)
+        }
+    }
+
+    impl Source for Lagging {
+        type Event = u64;
+        type Error = PollFailure;
+
+        fn head(&mut self) -> Result<Head, PollFailure> {
+            self.inner.head()
+        }
+
+        fn header_at(&mut self, number: u64) -> Result<Option<BlockRef>, PollFailure> {
+            self.node().header_at(number)
+        }
+
+        fn events_in(
+            &mut self,
+            from: u64,
+            to: u64,
+            out: &mut Vec<(BlockRef, u32, u64)>,
+        ) -> Result<(), PollFailure> {
+            self.node().events_in(from, to, out)
+        }
+
+        fn window(&self) -> u64 {
+            self.inner.window()
+        }
+    }
+
+    /// Proxy in front of a lagging node that answers a range starting past that node's
+    /// head with the logs of its head block.
+    struct Proxy(Lagging);
+
+    impl Source for Proxy {
+        type Event = u64;
+        type Error = PollFailure;
+
+        fn head(&mut self) -> Result<Head, PollFailure> {
+            self.0.head()
+        }
+
+        fn header_at(&mut self, number: u64) -> Result<Option<BlockRef>, PollFailure> {
+            self.0.header_at(number)
+        }
+
+        fn events_in(
+            &mut self,
+            from: u64,
+            to: u64,
+            out: &mut Vec<(BlockRef, u32, u64)>,
+        ) -> Result<(), PollFailure> {
+            if let Some(tip) = self.0.lagging.as_ref().and_then(ScriptedChain::tip)
+                && from > tip.number
+            {
+                return self.0.events_in(tip.number, tip.number, out);
+            }
+            self.0.events_in(from, to, out)
+        }
+
+        fn window(&self) -> u64 {
+            self.0.window()
+        }
+    }
+
     /// Source that re-serves the same one-event block whatever one-block range is asked
     /// for, so the engine dedupes every poll after the first.
     struct Stuck {
@@ -3634,6 +3709,43 @@ mod tests {
         assert_eq!(driver.engine().fold().applied, folded);
     }
 
+    #[test]
+    #[ignore = "a torn answer of a one-window scan is folded"]
+    fn torn_single_window_is_dropped_then_folded() {
+        // given a driver caught up on block 1, then blocks 2..=6 with events at 4 and 6,
+        // all in the one window [1, 6] from the cursor block
+        let mut chain = ScriptedChain::new(1);
+        chain.push_block(&[1]);
+        chain.set_window(6);
+        let mut driver = adversary_driver(chain);
+        run_to_idle(&mut driver);
+        for events in [&[][..], &[], &[40], &[], &[60]] {
+            driver.source_mut().inner.push_block(events);
+        }
+        let replacement = vec![vec![31], vec![], vec![], vec![61]];
+        let mut reorged = driver.source_mut().inner.clone();
+        let slices: Vec<&[u64]> = replacement.iter().map(Vec::as_slice).collect();
+        reorged.reorg(4, &slices);
+        let one = driver.source_mut().inner.header(1).unwrap();
+        let old_four = driver.source_mut().inner.header(4).unwrap();
+        let new_six = reorged.header(6).unwrap();
+        // when blocks 3..=6 are replaced as that window is read, and its one answer
+        // carries the cursor block and mixes old block 4 with new block 6
+        driver.source_mut().before_window = Some((1, 4, replacement));
+        driver.source_mut().torn =
+            Some((1, vec![(one, 0, 1), (old_four, 0, 40), (new_six, 0, 61)]));
+        let outcome = driver.tick();
+        run_to_idle(&mut driver);
+        // then the head block moved under the read, so the torn answer is not folded,
+        // and the fold converges on the new chain
+        assert_eq!(outcome, Tick::SourceError);
+        assert_eq!(driver.source_mut().inner.header(6), Some(new_six));
+        let chain = driver.source_mut().inner.clone();
+        let folded = canonical_fold(chain);
+        assert!(folded.contains(&(Position::new(3, 0), 31)));
+        assert_eq!(driver.engine().fold().applied, folded);
+    }
+
     /// Scripted chain whose events carry their log index in the high 32 bits, so a block's
     /// indices can be any ascending set.
     #[derive(Clone)]
@@ -3732,8 +3844,9 @@ mod tests {
         folded
     }
 
-    #[test]
-    fn every_tick_folds_what_a_fold_from_scratch_does() {
+    /// Ticks random runs and checks every tick's fold against a fold from scratch; with
+    /// `older_views`, some ticks read a copy of the chain saved at an earlier step.
+    fn check_every_tick_against_a_fold_from_scratch(older_views: bool) {
         for seed in 0..2_000 {
             // given a well-behaved source: random log indices, windows from 1 block up,
             // and at times heights near u64::MAX
@@ -3760,9 +3873,14 @@ mod tests {
             let mut driver =
                 Driver::new(RecordingFold::default(), Indexed(chain), engine, config)
                     .unwrap();
+            let mut saved = None;
             for step in 0..400 {
-                // when blocks arrive or reorg away to a random depth between ticks, and
-                // the driver at times restarts from its snapshot
+                // when blocks arrive or reorg away to a random depth between ticks, the
+                // driver at times restarts from its snapshot, and with `older_views` a
+                // tick at times reads a saved copy of the chain
+                if older_views && rng.below(4) == 0 {
+                    saved = Some(driver.source_mut().clone());
+                }
                 let chain = &mut driver.source_mut().0;
                 match rng.below(10) {
                     0..=4 => {
@@ -3799,8 +3917,15 @@ mod tests {
                     )
                     .unwrap();
                 }
+                let newer = match saved.clone() {
+                    Some(view) if rng.below(4) == 0 => {
+                        Some(core::mem::replace(driver.source_mut(), view))
+                    }
+                    _ => None,
+                };
                 let tick = driver.tick();
-                // then no tick errs, and the fold is the fold from scratch up to the cursor
+                // then no tick errs, and the fold is the fold from scratch over the chain
+                // the tick read, up to the cursor
                 assert!(
                     !matches!(tick, Tick::SourceError | Tick::Terminal(_)),
                     "seed {seed} step {step}: {tick:?}"
@@ -3815,8 +3940,21 @@ mod tests {
                     want,
                     "seed {seed} step {step}: {tick:?}"
                 );
+                if let Some(newer) = newer {
+                    *driver.source_mut() = newer;
+                }
             }
         }
+    }
+
+    #[test]
+    fn every_tick_folds_what_a_fold_from_scratch_does() {
+        check_every_tick_against_a_fold_from_scratch(false);
+    }
+
+    #[test]
+    fn a_tick_on_an_older_view_folds_what_a_fold_from_scratch_of_it_does() {
+        check_every_tick_against_a_fold_from_scratch(true);
     }
 
     fn counted_driver(chain: ScriptedChain) -> Driver<RecordingFold, Counted> {
@@ -3949,6 +4087,58 @@ mod tests {
         assert!(folded.contains(&(Position::new(6, 0), 6)));
         assert!(!folded.contains(&(Position::new(6, 1), 7)));
         assert_eq!(driver.engine().cursor(), Some(Position::new(6, 0)));
+    }
+
+    /// Ticks `source` over a new block its lagging node lacks, then without the lag, and
+    /// checks the block folds.
+    fn fold_past_a_lagging_node<S>(source: S, nodes: fn(&mut S) -> &mut Lagging)
+    where
+        S: Source<Event = u64, Error = PollFailure>,
+    {
+        // given a driver caught up on five one-event blocks, two per window
+        let mut driver = Driver::new(
+            RecordingFold::default(),
+            source,
+            engine_config(2),
+            DriverConfig::from_block(1),
+        )
+        .unwrap();
+        run_to_idle(&mut driver);
+        let lagging = nodes(driver.source_mut());
+        lagging.inner.set_window(2);
+        // when block 6 arrives with an event, and a tick reads it from a node that does
+        // not hold it yet
+        lagging.lagging = Some(lagging.inner.clone());
+        lagging.inner.push_block(&[6]);
+        driver.tick();
+        let lagging = nodes(driver.source_mut());
+        lagging.lagging = None;
+        run_to_idle(&mut driver);
+        // then once the node catches up, block 6 folds
+        let chain = nodes(driver.source_mut()).inner.clone();
+        let folded = canonical_fold(chain);
+        assert!(folded.contains(&(Position::new(6, 0), 6)));
+        assert_eq!(driver.engine().fold().applied, folded);
+    }
+
+    #[test]
+    #[ignore = "a node that lags the head answers the new block without its events, and the tip moves past it"]
+    fn lagging_backend_new_block_is_not_skipped() {
+        let chain = one_event_chain(5);
+        fold_past_a_lagging_node(
+            Lagging {
+                inner: chain.clone(),
+                lagging: None,
+            },
+            |source| source,
+        );
+        fold_past_a_lagging_node(
+            Proxy(Lagging {
+                inner: chain,
+                lagging: None,
+            }),
+            |source| &mut source.0,
+        );
     }
 
     #[test]
