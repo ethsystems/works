@@ -547,7 +547,7 @@ spec f3a69551aff7 src/ring.rs::BlockRing::get
 spec 8615c27e0eb9 src/ring.rs::BlockRing::hash_at
 spec afce9ffa629d src/ring.rs::BlockRing::index_of
 spec 349c72e1eedb src/ring.rs::BlockRing::truncate_above
-spec fdf7db668b85 src/ring.rs::BlockRing::index_at_or_below
+spec 77d0f88e0a22 src/ring.rs::BlockRing::index_at_or_below
 spec 9df274ff4bf0 src/ring.rs::BlockRing::clear
 spec 448c363d6a77 src/ring.rs::BlockRing::iter
 spec c9d43a64dd24 src/ring.rs::BlockRing::len

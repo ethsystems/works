@@ -248,8 +248,8 @@ trusted items are in `src/verus/tcb.rs`.
   and cursor (`lemma_idempotent`).
 - **T4, ring and bisection.** Every `BlockRing` fn matches its `Seq` model, and
   `Observed::next` yields the head of the iterator's view. `index_at_or_below` finds
-  the last entry at or below `n`; a proof assert in its body bounds its loop to
-  `floor(log2 len) + 1` steps (a ghost count, not part of the contract).
+  the last entry at or below `n` in at most `floor(log2 len) + 1` loop steps, in its
+  ensures (a tracked step count that the build erases).
   `canonical_prefix` makes at most `log2 len + 1` source calls, in its ensures. Its
   result is safe under A1 alone. It is optimal under A1, A2′, and `down_closed(V)`.
 - **T5, checkpoint and rollback.** The checkpoint ring keeps its invariants.

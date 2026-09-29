@@ -362,6 +362,12 @@ impl BlockRing {
             }
             return Some(guess);
         }
+        #[cfg(verus_keep_ghost)]
+        proof_decl! {
+            let tracked mut steps = 0int;
+        }
+        #[cfg(verus_keep_ghost)]
+        proof_with! {Tracked(&mut steps)}
         let logical = self.index_at_or_below(number)?;
         if self.numbers[self.physical(logical)] == number {
             Some(logical)
@@ -385,8 +391,12 @@ impl BlockRing {
         #[cfg(verus_keep_ghost)]
         proof_decl! {
             let ghost pre = self@;
+            let tracked mut steps = 0int;
         }
-        self.len = match self.index_at_or_below(number) {
+        #[cfg(verus_keep_ghost)]
+        proof_with! {Tracked(&mut steps)}
+        let found = self.index_at_or_below(number);
+        self.len = match found {
             Some(logical) => logical + 1,
             None => 0,
         };
@@ -401,9 +411,12 @@ impl BlockRing {
 
     /// Logical index of the newest entry at or below the argument.
     #[cfg_attr(verus_keep_ghost, verus_spec(r =>
+        with
+            Tracked(steps): Tracked<&mut int>,
         requires
             self.wf(),
         ensures
+            0 <= *final(steps) <= log(2, self@.len() as int) + 1,
             match r {
                 None => forall|i: int| 0 <= i < self.len ==> #[trigger] self@[i].number > number,
                 Some(i) => i < self.len && self@[i as int].number <= number
@@ -415,6 +428,11 @@ impl BlockRing {
             }),
     ))]
     fn index_at_or_below(&self, number: u64) -> Option<usize> {
+        #[cfg(verus_keep_ghost)]
+        proof! {
+            *steps = 0;
+            lemma_log_nonnegative(2, self.len as int);
+        }
         let newest = self.len.checked_sub(1)?;
         if self.numbers[self.physical(newest)] <= number {
             #[cfg(verus_keep_ghost)]
@@ -430,8 +448,7 @@ impl BlockRing {
         let mut high = newest;
         // Ghost probe count: the loop runs at most floor(log2 newest) + 1 times.
         #[cfg(verus_keep_ghost)]
-        proof_decl! {
-            let ghost mut probes: nat = 0;
+        proof! {
             lemma2_to64();
         }
         #[cfg_attr(verus_keep_ghost, verus_spec(
@@ -441,8 +458,9 @@ impl BlockRing {
                 low <= high <= newest,
                 low > 0 ==> self@[low as int].number <= number,
                 forall|j: int| high < j < self.len ==> #[trigger] self@[j].number > number,
-                pow2(probes) * (high - low) <= newest,
-                probes > 0 ==> pow2((probes - 1) as nat) <= newest,
+                *steps >= 0,
+                pow2(*steps as nat) * (high - low) <= newest,
+                *steps > 0 ==> pow2((*steps - 1) as nat) <= newest,
             decreases high - low,
         ))]
         while low < high {
@@ -460,6 +478,7 @@ impl BlockRing {
             }
             #[cfg(verus_keep_ghost)]
             proof! {
+                let ghost probes = *steps as nat;
                 lemma_pow2_unfold(probes + 1);
                 lemma_pow2_pos(probes);
                 assert(pow2(probes + 1) * (high - low) <= newest) by (nonlinear_arith)
@@ -474,15 +493,14 @@ impl BlockRing {
                         pow2(probes) > 0,
                         pow2(probes) * gap <= newest,
                 ;
-                probes = probes + 1;
+                *steps = *steps + 1;
             }
         }
         // The loop ran at most floor(log2 len) + 1 times.
         #[cfg(verus_keep_ghost)]
         proof! {
-            lemma_probe_bound(probes, newest as int);
+            lemma_probe_bound(*steps as nat, newest as int);
             lemma_log_is_ordered(2, newest as int, self.len as int);
-            assert(probes <= log(2, self.len as int) + 1);
         }
         if self.numbers[self.physical(low)] <= number {
             Some(low)
@@ -544,7 +562,14 @@ impl BlockRing {
     ))]
     #[cfg(any(feature = "wincode", test))]
     pub(crate) fn len_at_or_below(&self, number: u64) -> usize {
-        match self.index_at_or_below(number) {
+        #[cfg(verus_keep_ghost)]
+        proof_decl! {
+            let tracked mut steps = 0int;
+        }
+        #[cfg(verus_keep_ghost)]
+        proof_with! {Tracked(&mut steps)}
+        let found = self.index_at_or_below(number);
+        match found {
             Some(logical) => logical + 1,
             None => 0,
         }

@@ -528,7 +528,9 @@ def verified_fns(report: dict, crate_name: str) -> list[str]:
     for module in report.get("times-ms", {}).get("smt", {}).get("smt-run-module-times", []):
         for f in module.get("function-breakdown", []):
             if f["function"].startswith(f"{crate_name}::") and f.get("success"):
-                fns.append(f"fn {f.get('mode:') or '?'} {f['function']}")
+                # A fn with `with` ghost args verifies under a prefixed name.
+                name = f["function"].replace("::_VERUS_VERIFIED_", "::")
+                fns.append(f"fn {f.get('mode:') or '?'} {name}")
     return sorted(fns)
 
 
