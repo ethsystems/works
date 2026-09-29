@@ -12,6 +12,7 @@ use chainfold::{
     Driver,
     DriverConfig,
     EngineConfig,
+    Head,
     ReplayHorizon,
     Source,
     Tick,
@@ -56,7 +57,7 @@ impl Source for Probed {
     type Error = PollFailure;
     type Event = u64;
 
-    fn head(&mut self) -> Result<u64, PollFailure> {
+    fn head(&mut self) -> Result<Head, PollFailure> {
         self.inner.head()
     }
 

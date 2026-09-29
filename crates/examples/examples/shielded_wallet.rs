@@ -16,6 +16,7 @@ use chainfold::{
     EngineConfig,
     Fold,
     FoldError,
+    Head,
     Position,
     Source,
     Tick,
@@ -157,11 +158,22 @@ impl Source for Pool {
     type Error = core::convert::Infallible;
     type Event = u64;
 
-    fn head(&mut self) -> Result<u64, Self::Error> {
-        Ok(self
+    fn head(&mut self) -> Result<Head, Self::Error> {
+        let (number, hash) = self
             .blocks
             .last()
-            .map_or(self.first_block.saturating_sub(1), |block| block.number))
+            .map_or((self.first_block.saturating_sub(1), [0; 32]), |block| {
+                (block.number, block.hash)
+            });
+        let parent = self
+            .blocks
+            .len()
+            .checked_sub(2)
+            .map_or([0; 32], |i| self.blocks[i].hash);
+        Ok(Head {
+            block: BlockRef { number, hash },
+            parent,
+        })
     }
 
     fn header_at(&mut self, number: u64) -> Result<Option<BlockRef>, Self::Error> {

@@ -103,6 +103,7 @@ pub use sink::{
 };
 pub use source::{
     DEFAULT_WINDOW,
+    Head,
     ReplayHorizon,
     Source,
 };

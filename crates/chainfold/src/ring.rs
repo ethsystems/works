@@ -806,7 +806,10 @@ mod tests {
     use super::BlockRing;
     use crate::{
         position::BlockRef,
-        source::Source,
+        source::{
+            Head,
+            Source,
+        },
     };
     #[cfg(not(feature = "std"))]
     use alloc::{
@@ -995,8 +998,14 @@ mod tests {
         type Error = u32;
         type Event = ();
 
-        fn head(&mut self) -> Result<u64, u32> {
-            Ok(0)
+        fn head(&mut self) -> Result<Head, u32> {
+            Ok(Head {
+                block: BlockRef {
+                    number: 0,
+                    hash: [0; 32],
+                },
+                parent: [0; 32],
+            })
         }
 
         fn header_at(&mut self, number: u64) -> Result<Option<BlockRef>, u32> {

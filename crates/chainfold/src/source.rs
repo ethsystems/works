@@ -8,6 +8,7 @@ use crate::position::BlockRef;
 use {
     crate::verus::model::{
         a1,
+        anc,
         header,
         range_entries,
         sview,
@@ -30,6 +31,16 @@ pub enum ReplayHorizon {
     FromBlock(u64),
 }
 
+/// The head block and its parent's hash, from one header read.
+#[cfg_attr(verus_keep_ghost, verus_verify)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Head {
+    /// The head block.
+    pub block: BlockRef,
+    /// Hash of the head block's parent.
+    pub parent: [u8; 32],
+}
+
 /// Random-access event supply over one chain.
 // Each call answers from one view, `sview` of the source after the call, and every view
 // satisfies `a1`. `sview_log` records those views in call order. Implementations are
@@ -41,15 +52,17 @@ pub trait Source {
     /// Failure reading the source.
     type Error;
 
-    /// Highest block this source will serve.
+    /// Highest block this source will serve, with its parent's hash.
     #[cfg_attr(verus_keep_ghost, verus_spec(r =>
         ensures
             a1::<Self, Self::Event>(sview::<Self>(final(self))),
             sview_log::<Self>(final(self)) == sview_log::<Self>(old(self)).push(
                 sview::<Self>(final(self)),
             ),
+            r matches Ok(h) ==> header(sview::<Self>(final(self)), h.block.number) == Some(h.block)
+                && (h.block.number > 0 ==> anc(h.block.hash, (h.block.number - 1) as u64).hash == h.parent),
     ))]
-    fn head(&mut self) -> Result<u64, Self::Error>;
+    fn head(&mut self) -> Result<Head, Self::Error>;
 
     /// Header of one block, or None when it is not on the current chain.
     #[cfg_attr(verus_keep_ghost, verus_spec(r =>
@@ -62,7 +75,8 @@ pub trait Source {
     ))]
     fn header_at(&mut self, number: u64) -> Result<Option<BlockRef>, Self::Error>;
 
-    /// Appends every event in `from..=to`. Any order; the driver sorts and groups.
+    /// Appends every event in `from..=to`, exactly: no event of the range is left out and
+    /// none is added. Any order; the driver sorts and groups.
     #[cfg_attr(verus_keep_ghost, verus_spec(r =>
         ensures
             a1::<Self, Self::Event>(sview::<Self>(final(self))),

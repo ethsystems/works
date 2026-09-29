@@ -20,6 +20,7 @@ use crate::{
     },
     sink::SnapshotSink,
     source::{
+        Head,
         ReplayHorizon,
         Source,
     },
@@ -299,15 +300,28 @@ impl Source for ScriptedChain {
     type Event = u64;
     type Error = PollFailure;
 
-    fn head(&mut self) -> Result<u64, PollFailure> {
+    fn head(&mut self) -> Result<Head, PollFailure> {
         if self.pending_failures > 0 {
             self.pending_failures -= 1;
             return Err(PollFailure);
         }
-        Ok(self
-            .blocks
-            .last()
-            .map_or(self.first_block.saturating_sub(1), |block| block.number))
+        // An empty chain reports the block before its first, which it does not hold.
+        let Some((tip, older)) = self.blocks.split_last() else {
+            return Ok(Head {
+                block: BlockRef {
+                    number: self.first_block.saturating_sub(1),
+                    hash: [0; 32],
+                },
+                parent: [0; 32],
+            });
+        };
+        Ok(Head {
+            block: BlockRef {
+                number: tip.number,
+                hash: tip.hash,
+            },
+            parent: older.last().map_or([0; 32], |block| block.hash),
+        })
     }
 
     fn header_at(&mut self, number: u64) -> Result<Option<BlockRef>, PollFailure> {
@@ -742,11 +756,13 @@ mod tests {
         // given an empty chain starting at 1
         let mut chain = ScriptedChain::new(1);
         // then head is below the first block, so nothing is in range
-        assert_eq!(chain.head(), Ok(0));
-        // and once blocks exist it is the tip
+        assert_eq!(chain.head().map(|head| head.block.number), Ok(0));
+        // and once blocks exist it is the tip, with its parent's hash
         chain.push_block(&[1]);
         chain.push_block(&[2]);
-        assert_eq!(chain.head(), Ok(2));
+        let head = chain.head().unwrap();
+        assert_eq!(Some(head.block), chain.tip());
+        assert_eq!(Some(head.parent), chain.header(1).map(|block| block.hash));
     }
 
     #[test]
@@ -775,6 +791,6 @@ mod tests {
         // then two errors then success
         assert_eq!(first, Err(PollFailure));
         assert_eq!(second, Err(PollFailure));
-        assert_eq!(third, Ok(1));
+        assert_eq!(third.map(|head| head.block.number), Ok(1));
     }
 }
