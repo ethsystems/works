@@ -741,11 +741,16 @@ impl<'a> Observed<'a> {
 } // verus!
 
 // The yielded sequence is `Observed@`, fixed by `iter`. tcb.rs opts `Observed` out of
-// vstd's iterator laws, so this verifies panic- and overflow-free only.
+// vstd's iterator laws, so `next` carries its own ensures: it pops the head of the view.
 #[cfg_attr(verus_keep_ghost, cfg_eval, verus_verify)]
 impl<'a> Iterator for Observed<'a> {
     type Item = BlockRef;
 
+    #[cfg_attr(verus_keep_ghost, verus_spec(r =>
+        ensures
+            r == if old(self)@.len() == 0 { None } else { Some(old(self)@[0]) },
+            final(self)@ == if old(self)@.len() == 0 { old(self)@ } else { old(self)@.drop_first() },
+    ))]
     fn next(&mut self) -> Option<Self::Item> {
         #[cfg(verus_keep_ghost)]
         proof! {

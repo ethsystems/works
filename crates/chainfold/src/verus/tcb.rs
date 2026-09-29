@@ -117,10 +117,11 @@ pub assume_specification[ crate::snapshot::write_payload ](
             && crate::snapshot::encodable(envelope@) && crate::snapshot::wire_layout(envelope@),
 ;
 
-// Trusted: asserts nothing. `Spans` opts out of vstd's iterator laws, so verified callers
-// learn nothing from `Spans::next`; this lets `next` and `size_hint` verify panic-free. A
-// lawful spec would need `remaining()` as a sequence of slice references, which spec code
-// cannot build. No verified code iterates `Spans`; the engine uses `Batch::span`.
+// Trusted: asserts nothing. `Spans` opts out of vstd's iterator laws, which lets `next`
+// and `size_hint` verify; `next` states what it yields in its own ensures (the span at
+// `index()`, as `Batch::span` gives it). A lawful spec would need `remaining()` as a
+// sequence of slice references, which spec code cannot build. No verified code iterates
+// `Spans`; the engine uses `Batch::span`.
 impl<'a, E> vstd::std_specs::iter::IteratorSpecImpl for crate::batch::Spans<'a, E> {
     open spec fn obeys_prophetic_iter_laws(&self) -> bool {
         false
@@ -146,7 +147,7 @@ impl<'a, E> vstd::std_specs::iter::IteratorSpecImpl for crate::batch::Spans<'a, 
 }
 
 // Trusted: asserts nothing, as for `Spans`. `Observed` opts out of vstd's iterator laws;
-// the sequence it yields is `Observed@`, which `BlockRing::iter` fixes.
+// `next`'s own ensures pops the head of `Observed@`, which `BlockRing::iter` fixes.
 impl<'a> vstd::std_specs::iter::IteratorSpecImpl for crate::ring::Observed<'a> {
     open spec fn obeys_prophetic_iter_laws(&self) -> bool {
         false

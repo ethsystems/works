@@ -230,6 +230,57 @@ pub open spec fn run<F: ?Sized, E, Er>(s: (int, bool), log: Seq<(Position, E)>) 
     }
 }
 
+/// Count of `Skip` outcomes while folding `log` from state `s`; a stopped state runs no
+/// step, so it skips nothing.
+pub open spec fn skips<F: ?Sized, E, Er>(s: (int, bool), log: Seq<(Position, E)>) -> int
+    decreases log.len(),
+{
+    if log.len() == 0 {
+        0
+    } else {
+        let t = run::<F, E, Er>(s, log.drop_last());
+        skips::<F, E, Er>(s, log.drop_last()) + if !t.1 && step::<F, E, Er>(
+            t.0,
+            log.last().0,
+            log.last().1,
+        ).1 matches Err(FoldError::Skip(_)) {
+            1int
+        } else {
+            0int
+        }
+    }
+}
+
+/// `a + n`, saturated at `u64::MAX`: a counter bumped `n` times with `saturating_add(1)`.
+pub open spec fn sat_add(a: u64, n: int) -> u64 {
+    if a + n > u64::MAX {
+        u64::MAX
+    } else {
+        (a + n) as u64
+    }
+}
+
+pub proof fn lemma_skips_concat<F: ?Sized, E, Er>(
+    s: (int, bool),
+    a: Seq<(Position, E)>,
+    b: Seq<(Position, E)>,
+)
+    ensures
+        skips::<F, E, Er>(s, a + b) == skips::<F, E, Er>(s, a) + skips::<F, E, Er>(
+            run::<F, E, Er>(s, a),
+            b,
+        ),
+    decreases b.len(),
+{
+    if b.len() == 0 {
+        assert(a + b =~= a);
+    } else {
+        assert((a + b).drop_last() =~= a + b.drop_last());
+        lemma_skips_concat::<F, E, Er>(s, a, b.drop_last());
+        lemma_run_concat::<F, E, Er>(s, a, b.drop_last());
+    }
+}
+
 /// The view after folding `log` into `v`.
 pub open spec fn fold<F: ?Sized, E, Er>(v: int, log: Seq<(Position, E)>) -> int {
     run::<F, E, Er>((v, false), log).0

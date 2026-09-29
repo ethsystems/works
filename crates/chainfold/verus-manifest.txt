@@ -1,6 +1,6 @@
 # Checked by .github/scripts/verus-gates.py; regenerate it with `--update` (see there).
 # tcb and spec lines: hash of the normalized text, then the item. fn lines: from Verus.
-verified 309
+verified 312
 fn exec chainfold::batch::Batch::clear
 fn exec chainfold::batch::Batch::clone
 fn exec chainfold::batch::Batch::default
@@ -197,6 +197,7 @@ fn proof chainfold::engine::lemma_span_indices
 fn proof chainfold::engine::lemma_span_newer
 fn proof chainfold::engine::lemma_span_ok
 fn proof chainfold::engine::lemma_span_redelivered
+fn proof chainfold::engine::lemma_span_skips
 fn proof chainfold::engine::lemma_span_sorted
 fn proof chainfold::engine::lemma_span_stop
 fn proof chainfold::ring::BlockRing::lemma_index_unique
@@ -255,6 +256,7 @@ fn proof chainfold::verus::model::lemma_run_absorb
 fn proof chainfold::verus::model::lemma_run_concat
 fn proof chainfold::verus::model::lemma_run_push
 fn proof chainfold::verus::model::lemma_run_stopped
+fn proof chainfold::verus::model::lemma_skips_concat
 fn proof chainfold::verus::model::lemma_sorted_unique
 fn proof chainfold::verus::model::lemma_split_unique
 fn proof chainfold::verus::model::lemma_upto
@@ -283,6 +285,7 @@ fn spec chainfold::verus::model::live_count
 fn spec chainfold::verus::model::range_entries
 fn spec chainfold::verus::model::ring_ext
 fn spec chainfold::verus::model::run
+fn spec chainfold::verus::model::skips
 fn spec chainfold::verus::model::upto
 tcb 7ebdfa63aa20 axiom_clone_preserves_fview
 tcb 7a2dc6fca3ce axiom_no_sink_offers_nothing
@@ -319,11 +322,12 @@ spec daba8dba592a src/batch.rs::Batch::is_empty
 spec 6a99ea19ce53 src/batch.rs::Batch::span_count
 spec 83a7cab57445 src/batch.rs::Batch::push_block
 spec b61a41922fac src/batch.rs::Batch::span
-spec 245735c5c449 src/batch.rs::Batch::spans
+spec bedb9bd937dc src/batch.rs::Batch::spans
 spec 2c159d487a62 src/batch.rs::Batch::validate
 spec 18ab42293e28 src/batch.rs::Batch::push_block_from_tail
 spec e0835439c2b0 src/batch.rs::first_descent
 spec e0835439c2b0 src/batch.rs::locate_descent
+spec 3ac522936560 src/batch.rs::Spans::next
 spec 61edd8712bed src/batch.rs::ascending_upto
 spec 3784ba796b43 src/batch.rs::descent_result
 spec 5e995bc69736 src/batch.rs::finite_into_iter
@@ -348,7 +352,9 @@ spec 0014a5b2ec4c src/batch.rs::lemma_flat_upto
 spec 00167d7dedfd src/batch.rs::lemma_span_of
 spec c96c54407265 src/batch.rs::lemma_shaped_sorted
 spec 7ee46317e68c src/batch.rs::lemma_batch_view
-spec f756d56b69a7 src/batch.rs::Spans::inv
+spec c4eec97bc52c src/batch.rs::Spans::inv
+spec 7b376a7af9cb src/batch.rs::Spans::batch_view
+spec 77ee751175b5 src/batch.rs::Spans::index
 spec 2afe39a5b344 src/batch.rs::Batch[View]
 spec 0a6a20e071aa src/batch.rs::Batch[View]::V
 spec 6654c949d18c src/batch.rs::Batch[View]::view
@@ -471,13 +477,13 @@ spec 44bd4a141049 src/engine.rs::Engine::oldest_checkpoint
 spec 12ec425a59f4 src/engine.rs::Engine::fold
 spec 8d9c4278f9f6 src/engine.rs::Engine::observed
 spec d72aca3f4ba0 src/engine.rs::Engine::ring
-spec 5bf565baf58d src/engine.rs::Engine::apply_batch
+spec 47f88f509efb src/engine.rs::Engine::apply_batch
 spec 50d1cb2cdb97 src/engine.rs::Engine::checkpoint
 spec ce2556cedc48 src/engine.rs::Engine::rollback_at_or_below
 spec 8e8ed0ca68bc src/engine.rs::Engine::reset
 spec 85f5e4503449 src/engine.rs::Engine::mark_unrecoverable
 spec fa270da69437 src/engine.rs::Engine::restore_cursor_and_ring
-spec 1434288381d9 src/engine.rs::Engine::apply_span
+spec fe0621e786fd src/engine.rs::Engine::apply_span
 spec dc18f9984fcc src/engine.rs::Engine::consumed_through
 spec 69eeb2fc53a2 src/engine.rs::Engine::advance
 spec 4e5851b1aefe src/engine.rs::Engine::halt
@@ -499,6 +505,7 @@ spec 386f13a600ce src/engine.rs::Engine::lemma_live_bridge
 spec 134ea7a0e014 src/engine.rs::Engine::lemma_oldest_bridge
 spec 1307b11c48d9 src/engine.rs::span_seq
 spec 4c9cf813709a src/engine.rs::span_post
+spec bddf509fffd1 src/engine.rs::lemma_span_skips
 spec de4af8d9be11 src/engine.rs::setup
 spec 7104601f475a src/engine.rs::tip_state
 spec fc844f41703b src/engine.rs::loop_state
@@ -516,7 +523,7 @@ spec 22ac8de0305e src/engine.rs::lemma_span_ok
 spec 061a9c67e5fa src/engine.rs::lemma_calls_split
 spec eaf10b33ff73 src/engine.rs::lemma_span_stop
 spec eab5219f55f2 src/engine.rs::lemma_loop_done
-spec 000eaa637619 src/engine.rs::lemma_calls_facts
+spec 063acce9f271 src/engine.rs::lemma_calls_facts
 spec 63e7f43c2d04 src/engine.rs::lemma_post_ring
 spec 6514919487b3 src/engine.rs::lemma_post_inv
 spec fcae33727bc3 src/engine.rs::lemma_post_anchors
@@ -547,6 +554,7 @@ spec c9d43a64dd24 src/ring.rs::BlockRing::len
 spec 53e65560dc87 src/ring.rs::BlockRing::len_at_or_below
 spec 51dd6a8a82df src/ring.rs::BlockRing::observes
 spec b46b3eae7f15 src/ring.rs::BlockRing::canonical_prefix
+spec a9978f8d8ee6 src/ring.rs::Observed::next
 spec 920b780888f3 src/ring.rs::lemma_mask_is_mod
 spec bc617a95a168 src/ring.rs::lemma_mask_wraps
 spec ee9e8c44d6e7 src/ring.rs::lemma_probe_bound
@@ -634,6 +642,9 @@ spec a6e2f743a1b9 src/verus/model.rs::fview
 spec c854a020de4b src/verus/model.rs::step
 spec d73a8dc333f2 src/verus/model.rs::fold_step
 spec 33a3f9648ea4 src/verus/model.rs::run
+spec 56973b90dfd0 src/verus/model.rs::skips
+spec 70554d39be86 src/verus/model.rs::sat_add
+spec ed3b8801dde5 src/verus/model.rs::lemma_skips_concat
 spec 5be45d9deb53 src/verus/model.rs::fold
 spec bc2244ef49d6 src/verus/model.rs::lemma_run_push
 spec 641f76b88ea8 src/verus/model.rs::lemma_run_concat

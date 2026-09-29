@@ -61,6 +61,7 @@ use {
             lemma_ring_ext_push,
             lemma_run_concat,
             lemma_run_push,
+            lemma_skips_concat,
             lemma_upto,
             lemma_upto_append,
             lemma_upto_upto,
@@ -77,6 +78,8 @@ use {
             ring_ext,
             ring_push,
             run,
+            sat_add,
+            skips,
             span_refs,
             split_at_tip,
             stopped,
@@ -392,6 +395,10 @@ impl<F: Fold> Engine<F> {
                 old(self)@.cursor,
                 batch@.flat(),
             ).len() && s.applied + s.skipped == newer(old(self)@.cursor, batch@.flat()).len(),
+            r matches Ok(s) ==> s.skipped == skips::<F, F::Event, F::Error>(
+                (old(self)@.fold, false),
+                calls::<F, F::Event, F::Error>(old(self)@, batch@),
+            ) && final(self)@.skips == sat_add(old(self)@.skips, s.skipped as int),
             // Cursor and ring.
             final(self)@.cursor == cursor_after(
                 old(self)@.cursor,
@@ -538,6 +545,11 @@ impl<F: Fold> Engine<F> {
                     bv.flat_upto(i as int),
                 ).len(),
                 summary.applied + summary.skipped == newer(v0.cursor, bv.flat_upto(i as int)).len(),
+                summary.skipped == skips::<F, F::Event, F::Error>(
+                    (v0.fold, false),
+                    newer(v0.cursor, bv.flat_upto(i as int)),
+                ),
+                self@.skips == sat_add(v0.skips, summary.skipped as int),
                 bv.flat_upto(i as int).len() == start,
         ))]
         for i in 0..batch.span_count() {
@@ -606,6 +618,7 @@ impl<F: Fold> Engine<F> {
                 let sq = bv.span_events(i as int);
                 let blk = bv.block(i as int);
                 if applied is Ok {
+                    lemma_span_skips::<F>(v0, bv, w, i0, pre, i as int);
                     let post = EngineView { status: v0.status, ..self@ };
                     assert(span_post::<F>(pre, post, w, sq, blk, true));
                     lemma_span_ok::<F>(v0, bv, w, i0, pre, post, i as int);
@@ -923,6 +936,14 @@ impl<F: Fold> Engine<F> {
             ).len(),
             r is Ok ==> final(summary).applied + final(summary).skipped == old(summary).applied
                 + old(summary).skipped + newer(old(self)@.cursor, span_seq(*span)).len(),
+            r is Ok ==> final(summary).skipped == old(summary).skipped + skips::<F, F::Event, F::Error>(
+                (old(self)@.fold, false),
+                newer(old(self)@.cursor, span_seq(*span)),
+            ),
+            r is Ok ==> final(summary).skipped >= old(summary).skipped && final(self)@.skips == sat_add(
+                old(self)@.skips,
+                final(summary).skipped - old(summary).skipped,
+            ),
     ))]
     fn apply_span(
         &mut self,
@@ -1011,6 +1032,12 @@ impl<F: Fold> Engine<F> {
                 summary.deduped == old(summary).deduped + deduped,
                 summary.applied + summary.skipped == old(summary).applied + old(summary).skipped
                     + offset,
+                summary.skipped == old(summary).skipped + skips::<F, F::Event, F::Error>(
+                    (pre.fold, false),
+                    p.subrange(0, offset as int),
+                ),
+                summary.skipped >= old(summary).skipped,
+                self@.skips == sat_add(pre.skips, summary.skipped - old(summary).skipped),
                 old(summary).deduped + old(summary).applied + old(summary).skipped
                     + span.events@.len() <= usize::MAX,
         ))]
@@ -1020,6 +1047,7 @@ impl<F: Fold> Engine<F> {
             proof! {
                 let head = p.subrange(0, offset as int);
                 assert(p.subrange(0, offset + 1) =~= head.push(p[offset as int]));
+                assert(head.push(p[offset as int]).drop_last() =~= head);
                 lemma_run_push::<F, F::Event, F::Error>((pre.fold, false), head, p[offset as int]);
             }
             match self.fold.apply(at, &events[offset]) {
@@ -2501,6 +2529,33 @@ spec fn span_post<F: Fold>(
     &&& q.len() == 0 ==> post == pre
 }
 
+/// The skip count over the batch so far grows by span `i`'s.
+proof fn lemma_span_skips<F: Fold>(
+    v0: EngineView,
+    bv: BatchView<F::Event>,
+    w: int,
+    i0: int,
+    pre: EngineView,
+    i: int,
+)
+    requires
+        setup(v0, bv, w, i0),
+        0 <= i < bv.ends.len(),
+        loop_state::<F>(v0, bv, w, i0, pre, i),
+        pre.wf(),
+    ensures
+        skips::<F, F::Event, F::Error>((v0.fold, false), newer(v0.cursor, bv.flat_upto(i + 1)))
+            == skips::<F, F::Event, F::Error>((v0.fold, false), newer(v0.cursor, bv.flat_upto(i)))
+            + skips::<F, F::Event, F::Error>((pre.fold, false), newer(pre.cursor, bv.span_events(i))),
+{
+    reveal(loop_state);
+    lemma_span_newer::<F>(v0, bv, w, i0, pre, i);
+    let g = newer(v0.cursor, bv.flat_upto(i));
+    assert(bv.flat_upto(i + 1) == bv.flat_upto(i) + bv.span_events(i));
+    lemma_newer_add(v0.cursor, bv.flat_upto(i), bv.span_events(i));
+    lemma_skips_concat::<F, F::Event, F::Error>((v0.fold, false), g, newer(v0.cursor, bv.span_events(i)));
+}
+
 /// Facts fixed once `apply_batch` has passed its checks; `i0` spans are at or below the
 /// cursor block.
 #[verifier::opaque]
@@ -2970,6 +3025,7 @@ proof fn lemma_loop_done<F: Fold>(v0: EngineView, bv: BatchView<F::Event>, w: in
 
 /// The calls of an accepted batch are sorted, after the old cursor, and, without a
 /// stop, reach the last entry of the batch.
+#[verifier::rlimit(30)]
 proof fn lemma_calls_facts<F: Fold>(v0: EngineView, bv: BatchView<F::Event>, w: int, i0: int)
     requires
         setup(v0, bv, w, i0),

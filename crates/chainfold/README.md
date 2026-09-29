@@ -242,13 +242,16 @@ trusted items are in `src/verus/tcb.rs`.
   `v[i] <= v[i-1]`).
 - **T3, apply.** `apply_batch` runs the fold on the entries after the cursor, in
   order, up to the first stop. A rejection changes only the checked freshness. The
-  fold, cursor, and ring follow those calls, and a second apply of the batch changes
-  nothing.
-- **T4, ring and bisection.** Every `BlockRing` fn matches its `Seq` model.
-  `index_at_or_below` finds the last entry at or below `n` in at most
-  `floor(log2 len) + 1` steps. `canonical_prefix` makes at most `log2 len + 1` source
-  calls. Its result is safe under A1 alone. It is optimal under A1, A2′, and
-  `down_closed(V)`.
+  fold, cursor, and ring follow those calls. On `Ok`, `skipped` counts the calls that
+  returned `Skip`, `skip_count` grows by it (saturating), and nothing of the batch is
+  newer than the cursor, so a second apply runs the fold on nothing and keeps the fold
+  and cursor (`lemma_idempotent`).
+- **T4, ring and bisection.** Every `BlockRing` fn matches its `Seq` model, and
+  `Observed::next` yields the head of the iterator's view. `index_at_or_below` finds
+  the last entry at or below `n`; a proof assert in its body bounds its loop to
+  `floor(log2 len) + 1` steps (a ghost count, not part of the contract).
+  `canonical_prefix` makes at most `log2 len + 1` source calls, in its ensures. Its
+  result is safe under A1 alone. It is optimal under A1, A2′, and `down_closed(V)`.
 - **T5, checkpoint and rollback.** The checkpoint ring keeps its invariants.
   `rollback_at_or_below` picks the newest live slot at or below the target. It
   restores the fold, cursor, and ring prefix of that slot. An `Err` leaves the engine
@@ -332,8 +335,9 @@ exceptions are the fns listed as out of scope in `Cargo.toml`.
 7. `snapshot::write_payload`: on success the serializer appends its bytes for the
    envelope (`wire`), which open with the magic and the little-endian version.
 8. `IteratorSpecImpl for Spans`: asserts nothing. `Spans` opts out of the iterator
-   laws, so `next` and `size_hint` verify panic-free.
-9. `IteratorSpecImpl for Observed`: asserts nothing, as for `Spans`.
+   laws; `next` states in its own ensures that it yields the batch's next span.
+9. `IteratorSpecImpl for Observed`: asserts nothing, as for `Spans`. `next` yields the
+   head of `Observed@`.
 10. `axiom_no_sink_offers_nothing`: `NoSink` stores nothing, so it holds no offers (A4).
 
 `.github/scripts/verus-gates.py` fails when a trusted construct appears outside

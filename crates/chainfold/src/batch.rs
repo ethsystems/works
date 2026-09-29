@@ -206,6 +206,9 @@ impl<E> Batch<E> {
     #[cfg_attr(verus_keep_ghost, verus_spec(r =>
         requires
             self@.wf(),
+        ensures
+            r.batch_view() == self@,
+            r.index() == 0,
     ))]
     pub fn spans(&self) -> Spans<'_, E> {
         Spans {
@@ -471,6 +474,22 @@ pub struct Spans<'a, E> {
 impl<'a, E> Iterator for Spans<'a, E> {
     type Item = SpanView<'a, E>;
 
+    #[cfg_attr(verus_keep_ghost, verus_spec(r =>
+        ensures
+            final(self).batch_view() == old(self).batch_view(),
+            match r {
+                None => old(self).index() == old(self).batch_view().ends.len()
+                    && final(self).index() == old(self).index(),
+                Some(s) => {
+                    let (b, i) = (old(self).batch_view(), old(self).index());
+                    &&& i < b.ends.len()
+                    &&& final(self).index() == i + 1
+                    &&& s.number == b.blocks[i]
+                    &&& *s.hash == b.hashes[i]
+                    &&& span_matches(b, i, s)
+                },
+            },
+    ))]
     fn next(&mut self) -> Option<Self::Item> {
         #[cfg(verus_keep_ghost)]
         proof! {
@@ -488,8 +507,11 @@ impl<'a, E> Iterator for Spans<'a, E> {
         }
         let number = self.batch.blocks[self.next];
         let hash = &self.batch.hashes[self.next];
-        self.next += 1;
-        self.start = end;
+        *self = Self {
+            batch: self.batch,
+            next: self.next + 1,
+            start: end,
+        };
         Some(SpanView {
             number,
             hash,
@@ -1061,8 +1083,19 @@ impl<'a, E> Spans<'a, E> {
     spec fn inv(&self) -> bool {
         &&& self.batch@.wf()
         &&& self.next <= self.batch@.ends.len()
+        &&& self.start == self.batch@.start(self.next as int)
         &&& self.start <= self.batch@.events.len()
         &&& self.next < self.batch@.ends.len() ==> self.start <= self.batch@.ends[self.next as int]
+    }
+
+    /// The batch being walked.
+    pub closed spec fn batch_view(&self) -> BatchView<E> {
+        self.batch@
+    }
+
+    /// Index of the span `next` yields.
+    pub closed spec fn index(&self) -> int {
+        self.next as int
     }
 }
 
