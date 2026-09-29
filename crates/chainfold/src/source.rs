@@ -9,6 +9,7 @@ use {
     crate::verus::model::{
         a1,
         anc,
+        hash_entries,
         header,
         infallible,
         range_entries,
@@ -104,6 +105,32 @@ pub trait Source {
         &mut self,
         from: u64,
         to: u64,
+        out: &mut Vec<(BlockRef, u32, Self::Event)>,
+    ) -> Result<(), Self::Error>;
+
+    /// Appends every event of the block with hash `block.hash`, exactly: no log of that
+    /// block is left out and none is added. Any order. A hash the source does not know, or
+    /// whose block it has not executed, gives `Err`. A JSON-RPC source reads it with
+    /// `eth_getLogs` by `blockHash`, never by number: a by-number read can answer another
+    /// block at that height, or nothing from a node that lags.
+    #[cfg_attr(verus_keep_ghost, verus_spec(r =>
+        ensures
+            a1::<Self, Self::Event>(sview::<Self>(final(self))),
+            sview_log::<Self>(final(self)) == sview_log::<Self>(old(self)).push(
+                sview::<Self>(final(self)),
+            ),
+            infallible::<Self>(old(self)) ==> r is Ok && infallible::<Self>(final(self)),
+            r is Ok ==> {
+                let (pre, post) = (old(out)@, final(out)@);
+                &&& pre.len() <= post.len()
+                &&& post.subrange(0, pre.len() as int) == pre
+                &&& post.subrange(pre.len() as int, post.len() as int).to_multiset()
+                    == hash_entries::<Self, Self::Event>(*block).to_multiset()
+            },
+    ))]
+    fn events_at(
+        &mut self,
+        block: &BlockRef,
         out: &mut Vec<(BlockRef, u32, Self::Event)>,
     ) -> Result<(), Self::Error>;
 

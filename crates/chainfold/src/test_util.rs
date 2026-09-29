@@ -355,6 +355,29 @@ impl Source for ScriptedChain {
         Ok(())
     }
 
+    fn events_at(
+        &mut self,
+        block: &BlockRef,
+        out: &mut Vec<(BlockRef, u32, u64)>,
+    ) -> Result<(), PollFailure> {
+        // The chain keeps no forks, so a hash off it is unknown.
+        let scripted = block
+            .number
+            .checked_sub(self.first_block)
+            .and_then(|offset| usize::try_from(offset).ok())
+            .and_then(|index| self.blocks.get(index))
+            .filter(|scripted| scripted.hash == block.hash)
+            .ok_or(PollFailure)?;
+        out.extend(scripted.events.iter().enumerate().map(|(index, event)| {
+            (
+                *block,
+                u32::try_from(index).expect("log index fits in u32"),
+                *event,
+            )
+        }));
+        Ok(())
+    }
+
     fn horizon(&self) -> ReplayHorizon {
         self.horizon
     }
@@ -749,6 +772,31 @@ mod tests {
         // then only those two blocks' events
         let numbers: Vec<u64> = out.iter().map(|(block, ..)| block.number).collect();
         assert_eq!(numbers, vec![2, 3]);
+    }
+
+    #[test]
+    fn events_at_answers_by_hash_and_errs_on_an_unknown_hash() {
+        // given three blocks with two events each
+        let mut chain = ScriptedChain::new(1);
+        for i in 0..3u64 {
+            chain.push_block(&[2 * i, 2 * i + 1]);
+        }
+        let old = chain.header(2).unwrap();
+        let mut out = Vec::new();
+        // when block 2 is read by its hash
+        chain.events_at(&old, &mut out).unwrap();
+        // then exactly its events, under its header
+        assert_eq!(out, vec![(old, 0, 2), (old, 1, 3)]);
+        // and after a reorg replaces it, its old hash errs and leaves the output alone
+        chain.reorg(2, &[&[9], &[9]]);
+        assert_eq!(chain.events_at(&old, &mut out), Err(PollFailure));
+        assert_eq!(out.len(), 2);
+        // and a height past the tip errs too
+        let past = BlockRef {
+            number: 4,
+            hash: old.hash,
+        };
+        assert_eq!(chain.events_at(&past, &mut out), Err(PollFailure));
     }
 
     #[test]

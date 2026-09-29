@@ -148,6 +148,47 @@ impl Pool {
         })
     }
 
+    /// Appends the values this key opens in the blocks `keep` selects, at the position
+    /// they were published at.
+    fn scan(
+        &mut self,
+        keep: impl Fn(&Block) -> bool,
+        out: &mut Vec<(BlockRef, u32, u64)>,
+    ) {
+        let Self {
+            blocks,
+            scanner,
+            scanned,
+            ..
+        } = self;
+
+        // one scan over every kept block: chunked decapsulation is what a scanner buys over
+        // a per-envelope open, and the position lane keeps each hit's origin.
+        let mut positions = Vec::new();
+        let mut envelopes = Vec::new();
+        for block in blocks.iter().filter(|b| keep(b)) {
+            let header = BlockRef {
+                number: block.number,
+                hash: block.hash,
+            };
+            for (index, envelope) in block.notes.iter().enumerate() {
+                let log_index = u32::try_from(index).expect("log index fits in u32");
+                positions.push((header, log_index));
+                envelopes.push(envelope);
+            }
+        }
+        *scanned += envelopes.len();
+
+        out.extend(scanner.scan(envelopes, POOL_AAD).map(|(index, note)| {
+            let (header, log_index) = positions[index];
+            (
+                header,
+                log_index,
+                note.expect("every envelope in this pool is well formed"),
+            )
+        }));
+    }
+
     /// Every envelope on the current chain, oldest first.
     fn published(&self) -> impl Iterator<Item = &Envelope> {
         self.blocks.iter().flat_map(|block| block.notes.iter())
@@ -155,7 +196,7 @@ impl Pool {
 }
 
 impl Source for Pool {
-    type Error = core::convert::Infallible;
+    type Error = &'static str;
     type Event = u64;
 
     fn head(&mut self) -> Result<Head, Self::Error> {
@@ -186,38 +227,20 @@ impl Source for Pool {
         to: u64,
         out: &mut Vec<(BlockRef, u32, u64)>,
     ) -> Result<(), Self::Error> {
-        let Self {
-            blocks,
-            scanner,
-            scanned,
-            ..
-        } = self;
+        self.scan(|block| (from..=to).contains(&block.number), out);
+        Ok(())
+    }
 
-        // one scan over the whole window: chunked decapsulation is what a scanner buys over
-        // a per-envelope open, and the position lane keeps each hit's origin.
-        let mut positions = Vec::new();
-        let mut envelopes = Vec::new();
-        for block in blocks.iter().filter(|b| (from..=to).contains(&b.number)) {
-            let header = BlockRef {
-                number: block.number,
-                hash: block.hash,
-            };
-            for (index, envelope) in block.notes.iter().enumerate() {
-                let log_index = u32::try_from(index).expect("log index fits in u32");
-                positions.push((header, log_index));
-                envelopes.push(envelope);
-            }
+    fn events_at(
+        &mut self,
+        block: &BlockRef,
+        out: &mut Vec<(BlockRef, u32, u64)>,
+    ) -> Result<(), Self::Error> {
+        // the pool keeps no forks, so a hash off the current chain is unknown.
+        if self.header(block.number) != Some(*block) {
+            return Err("unknown block hash");
         }
-        *scanned += envelopes.len();
-
-        out.extend(scanner.scan(envelopes, POOL_AAD).map(|(index, note)| {
-            let (header, log_index) = positions[index];
-            (
-                header,
-                log_index,
-                note.expect("every envelope in this pool is well formed"),
-            )
-        }));
+        self.scan(|candidate| candidate.hash == block.hash, out);
         Ok(())
     }
 

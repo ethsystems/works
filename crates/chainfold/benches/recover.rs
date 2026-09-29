@@ -75,6 +75,14 @@ impl Source for Probed {
         self.inner.events_in(from, to, out)
     }
 
+    fn events_at(
+        &mut self,
+        block: &BlockRef,
+        out: &mut Vec<(BlockRef, u32, u64)>,
+    ) -> Result<(), PollFailure> {
+        self.inner.events_at(block, out)
+    }
+
     fn horizon(&self) -> ReplayHorizon {
         self.inner.horizon()
     }

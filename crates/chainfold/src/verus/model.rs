@@ -63,6 +63,12 @@ pub open spec fn block_entries<S: ?Sized, E>(v: ChainView, n: u64) -> Seq<(Block
     }
 }
 
+/// Entries of block `b` in the `Source::events_at` shape, log order. A function of the
+/// hash alone, so the same in every view.
+pub open spec fn hash_entries<S: ?Sized, E>(b: BlockRef) -> Seq<(BlockRef, u32, E)> {
+    logs::<S, E>(b.hash).map_values(|x: (u32, E)| (b, x.0, x.1))
+}
+
 /// Entries of heights `lo..=hi` of `v`, ascending by height.
 pub open spec fn range_entries<S: ?Sized, E>(v: ChainView, lo: int, hi: int) -> Seq<
     (BlockRef, u32, E),
@@ -1581,6 +1587,18 @@ pub proof fn lemma_re_complete<S: ?Sized, E>(v: ChainView, lo: int, hi: int, p: 
     }
 }
 
+
+/// A view that holds `b` has `hash_entries(b)` as the entries of its height.
+pub proof fn lemma_hash_entries<S: ?Sized, E>(v: ChainView, b: BlockRef)
+    requires
+        v.contains_key(b.number),
+        v[b.number] == b,
+    ensures
+        range_entries::<S, E>(v, b.number as int, b.number as int) == hash_entries::<S, E>(b),
+{
+    assert(range_entries::<S, E>(v, b.number as int, b.number as int - 1) =~= seq![]);
+    assert(range_entries::<S, E>(v, b.number as int, b.number as int) =~= hash_entries::<S, E>(b));
+}
 
 /// Views that agree on `[lo, hi]` give the same entries there.
 pub proof fn lemma_re_agree<S: ?Sized, E>(v: ChainView, u: ChainView, lo: int, hi: int)

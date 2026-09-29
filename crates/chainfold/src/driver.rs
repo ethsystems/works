@@ -2372,6 +2372,14 @@ mod tests {
             self.inner.events_in(from, to, out)
         }
 
+        fn events_at(
+            &mut self,
+            block: &BlockRef,
+            out: &mut Vec<(BlockRef, u32, u64)>,
+        ) -> Result<(), PollFailure> {
+            self.inner.events_at(block, out)
+        }
+
         fn horizon(&self) -> ReplayHorizon {
             self.inner.horizon()
         }
@@ -2409,6 +2417,15 @@ mod tests {
         ) -> Result<(), PollFailure> {
             self.calls += 1;
             self.inner.events_in(from, to, out)
+        }
+
+        fn events_at(
+            &mut self,
+            block: &BlockRef,
+            out: &mut Vec<(BlockRef, u32, u64)>,
+        ) -> Result<(), PollFailure> {
+            self.calls += 1;
+            self.inner.events_at(block, out)
         }
 
         fn window(&self) -> u64 {
@@ -2451,6 +2468,14 @@ mod tests {
             self.node().events_in(from, to, out)
         }
 
+        fn events_at(
+            &mut self,
+            block: &BlockRef,
+            out: &mut Vec<(BlockRef, u32, u64)>,
+        ) -> Result<(), PollFailure> {
+            self.node().events_at(block, out)
+        }
+
         fn window(&self) -> u64 {
             self.inner.window()
         }
@@ -2486,13 +2511,21 @@ mod tests {
             self.0.events_in(from, to, out)
         }
 
+        fn events_at(
+            &mut self,
+            block: &BlockRef,
+            out: &mut Vec<(BlockRef, u32, u64)>,
+        ) -> Result<(), PollFailure> {
+            self.0.events_at(block, out)
+        }
+
         fn window(&self) -> u64 {
             self.0.window()
         }
     }
 
-    /// Source that re-serves the same one-event block whatever one-block range is asked
-    /// for, so the engine dedupes every poll after the first.
+    /// Source that re-serves the same one-event block whatever one-block range or block is
+    /// asked for, so the engine dedupes every poll after the first.
     struct Stuck {
         block: BlockRef,
     }
@@ -2538,6 +2571,15 @@ mod tests {
             Ok(())
         }
 
+        fn events_at(
+            &mut self,
+            _block: &BlockRef,
+            out: &mut Vec<(BlockRef, u32, u64)>,
+        ) -> Result<(), PollFailure> {
+            out.push((self.block, 0, 1));
+            Ok(())
+        }
+
         fn window(&self) -> u64 {
             1
         }
@@ -2559,12 +2601,13 @@ mod tests {
         /// Reorg run by the next `head` call.
         on_head: Option<(usize, Vec<u64>)>,
         /// Reorg run by the `events_in` call for the window starting at the given block,
-        /// before it answers: depth, then the replacement blocks' events.
+        /// or the `events_at` call for a block of that number, before it answers: depth,
+        /// then the replacement blocks' events.
         before_window: Option<(u64, usize, Vec<Vec<u64>>)>,
         /// Answer served as is by the `events_in` call for the window starting at the
-        /// given block.
+        /// given block, or the `events_at` call for a block of that number.
         torn: Option<(u64, Answer)>,
-        /// Extra entry served whenever the queried range covers its block.
+        /// Extra entry served whenever the queried range or block covers its block.
         rogue: Option<(BlockRef, u32, u64)>,
     }
 
@@ -2577,6 +2620,27 @@ mod tests {
                 torn: None,
                 rogue: None,
             }
+        }
+
+        /// Runs the reorg set for a read starting at `from`, then serves the torn answer
+        /// set for it; true when it served one.
+        fn misbehave(&mut self, from: u64, out: &mut Answer) -> bool {
+            if self
+                .before_window
+                .as_ref()
+                .is_some_and(|(start, ..)| *start == from)
+                && let Some((_, depth, blocks)) = self.before_window.take()
+            {
+                let slices: Vec<&[u64]> = blocks.iter().map(Vec::as_slice).collect();
+                self.inner.reorg(depth, &slices);
+            }
+            if self.torn.as_ref().is_some_and(|(start, _)| *start == from)
+                && let Some((_, mut answer)) = self.torn.take()
+            {
+                out.append(&mut answer);
+                return true;
+            }
+            false
         }
     }
 
@@ -2601,19 +2665,7 @@ mod tests {
             to: u64,
             out: &mut Vec<(BlockRef, u32, u64)>,
         ) -> Result<(), PollFailure> {
-            if self
-                .before_window
-                .as_ref()
-                .is_some_and(|(start, ..)| *start == from)
-                && let Some((_, depth, blocks)) = self.before_window.take()
-            {
-                let slices: Vec<&[u64]> = blocks.iter().map(Vec::as_slice).collect();
-                self.inner.reorg(depth, &slices);
-            }
-            if self.torn.as_ref().is_some_and(|(start, _)| *start == from)
-                && let Some((_, mut answer)) = self.torn.take()
-            {
-                out.append(&mut answer);
+            if self.misbehave(from, out) {
                 return Ok(());
             }
             if let Some(entry) = self.rogue
@@ -2624,13 +2676,29 @@ mod tests {
             self.inner.events_in(from, to, out)
         }
 
+        fn events_at(
+            &mut self,
+            block: &BlockRef,
+            out: &mut Vec<(BlockRef, u32, u64)>,
+        ) -> Result<(), PollFailure> {
+            if self.misbehave(block.number, out) {
+                return Ok(());
+            }
+            if let Some(entry) = self.rogue
+                && entry.0.number == block.number
+            {
+                out.push(entry);
+            }
+            self.inner.events_at(block, out)
+        }
+
         fn window(&self) -> u64 {
             self.inner.window()
         }
     }
 
-    /// Chain whose only block is number `u64::MAX`; errors on a second `events_in` in
-    /// one tick, so a scan that spins fails the tick instead of hanging the test.
+    /// Chain whose only block is number `u64::MAX`; errors on a second log read in one
+    /// tick, so a scan that spins fails the tick instead of hanging the test.
     struct Summit {
         event: Option<u64>,
         queries: u32,
@@ -2674,6 +2742,19 @@ mod tests {
             {
                 out.push((Self::BLOCK, 0, event));
             }
+            Ok(())
+        }
+
+        fn events_at(
+            &mut self,
+            block: &BlockRef,
+            out: &mut Vec<(BlockRef, u32, u64)>,
+        ) -> Result<(), PollFailure> {
+            self.queries += 1;
+            if self.queries > 1 || *block != Self::BLOCK {
+                return Err(PollFailure);
+            }
+            out.extend(self.event.map(|event| (Self::BLOCK, 0, event)));
             Ok(())
         }
     }
@@ -3762,6 +3843,19 @@ mod tests {
         ) -> Result<(), PollFailure> {
             let at = out.len();
             self.0.events_in(from, to, out)?;
+            for entry in &mut out[at..] {
+                entry.1 = u32::try_from(entry.2 >> 32).expect("index lane fits in u32");
+            }
+            Ok(())
+        }
+
+        fn events_at(
+            &mut self,
+            block: &BlockRef,
+            out: &mut Vec<(BlockRef, u32, u64)>,
+        ) -> Result<(), PollFailure> {
+            let at = out.len();
+            self.0.events_at(block, out)?;
             for entry in &mut out[at..] {
                 entry.1 = u32::try_from(entry.2 >> 32).expect("index lane fits in u32");
             }

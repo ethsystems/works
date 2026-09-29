@@ -1027,6 +1027,18 @@ mod tests {
         ) -> Result<(), u32> {
             Ok(())
         }
+
+        fn events_at(
+            &mut self,
+            block: &BlockRef,
+            _out: &mut Vec<(BlockRef, u32, ())>,
+        ) -> Result<(), u32> {
+            if self.canonical.contains(block) {
+                Ok(())
+            } else {
+                Err(self.calls)
+            }
+        }
     }
 
     /// Rings of every length up to `capacity`, wrapped first so logical and physical

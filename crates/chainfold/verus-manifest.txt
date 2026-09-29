@@ -1,6 +1,6 @@
 # Checked by .github/scripts/verus-gates.py; regenerate it with `--update` (see there).
 # tcb and spec lines: hash of the normalized text, then the item. fn lines: from Verus.
-verified 345
+verified 346
 fn exec chainfold::batch::Batch::clear
 fn exec chainfold::batch::Batch::clone
 fn exec chainfold::batch::Batch::default
@@ -260,6 +260,7 @@ fn proof chainfold::verus::model::lemma_filter_all
 fn proof chainfold::verus::model::lemma_filter_ext
 fn proof chainfold::verus::model::lemma_filter_none
 fn proof chainfold::verus::model::lemma_flat_prefix
+fn proof chainfold::verus::model::lemma_hash_entries
 fn proof chainfold::verus::model::lemma_idempotent
 fn proof chainfold::verus::model::lemma_last_complete
 fn proof chainfold::verus::model::lemma_lt_irreflexive
@@ -691,6 +692,7 @@ spec dedb1dcce647 src/snapshot.rs::lemma_durable_round_trip
 spec 2d0ebce5bf1c src/source.rs::Source::head
 spec 60e9745c28c5 src/source.rs::Source::header_at
 spec 4b22afee78c2 src/source.rs::Source::events_in
+spec 872b304f87a4 src/source.rs::Source::events_at
 spec 5096f455b429 src/verus/model.rs::ChainView
 spec c1082d47113e src/verus/model.rs::anc
 spec a94a5426cd1d src/verus/model.rs::logs
@@ -699,6 +701,7 @@ spec abef6950ffff src/verus/model.rs::logs_ascending
 spec d44f3b002871 src/verus/model.rs::a1
 spec 944a1dc66684 src/verus/model.rs::header
 spec 88bf97780af6 src/verus/model.rs::block_entries
+spec 1d8ea7f2b7a1 src/verus/model.rs::hash_entries
 spec 21fce1a9a751 src/verus/model.rs::range_entries
 spec 06344a7df998 src/verus/model.rs::before
 spec f419c36c2572 src/verus/model.rs::canon
@@ -816,6 +819,7 @@ spec 600c3d75523f src/verus/model.rs::lemma_re_split
 spec 7ae43c62f82b src/verus/model.rs::lemma_pe_split
 spec 62b2e439b925 src/verus/model.rs::lemma_re_facts
 spec 022303e9ac77 src/verus/model.rs::lemma_re_complete
+spec 53e9da1a0036 src/verus/model.rs::lemma_hash_entries
 spec 80d8d9e2c24f src/verus/model.rs::lemma_re_agree
 spec feb3ef092ec6 src/verus/model.rs::lemma_re_sorted
 spec 0f73a003c035 src/verus/model.rs::lemma_sorted_unique
