@@ -958,7 +958,7 @@ where
                     assert(accepted(v, bv) && !stopped::<F, F::Event, F::Error>(v, bv));
                     let cl = calls::<F, F::Event, F::Error>(v, bv);
                     assert forall|log: Seq<(Position, F::Event)>, h: ChainView|
-                        #[trigger] old(self).dinv(log, h) && a2_tick(hist, l0, start, t0)
+                        #[trigger] old(self).dinv(log, h) && views_ok(hist, l0, start)
                             implies dinv::<F, S, F::Event, F::Error>(
                         post,
                         fview::<F>(&self.initial),
@@ -975,7 +975,6 @@ where
                         post.cursor,
                         if bv.ends.len() > 0 { hist[sv.0] } else { h },
                         start,
-                        hist,
                     ) by {
                         lemma_scan_t7::<F, S, F::Event, F::Error>(
                             v,
@@ -1024,7 +1023,7 @@ where
                                 implies tick_inv(*old(self), *self, tick, init, log) by {}
                         assert forall|log: Seq<(Position, F::Event)>, h: ChainView|
                             #[trigger] old(self).dinv(log, h) implies t7_tick(*old(self), *self, tick, log, h) by {
-                            if a2_tick(hist, l0, start, t0) {
+                            if views_ok(hist, l0, start) {
                                 let h2 = if bv.ends.len() > 0 { hist[sv.0] } else { h };
                                 assert(dinv::<F, S, F::Event, F::Error>(post, fview::<F>(&self.initial), start, log + cl, h2));
                                 assert(self.dinv(log + cl, h2));
@@ -1047,7 +1046,7 @@ where
                             implies tick_inv(*old(self), *self, tick, init, log) by {}
                     assert forall|log: Seq<(Position, F::Event)>, h: ChainView|
                         #[trigger] old(self).dinv(log, h) implies t7_tick(*old(self), *self, tick, log, h) by {
-                        if a2_tick(hist, l0, start, t0) {
+                        if views_ok(hist, l0, start) {
                             let h2 = if bv.ends.len() > 0 { hist[sv.0] } else { h };
                             assert(dinv::<F, S, F::Event, F::Error>(post, fview::<F>(&self.initial), start, log + cl, h2));
                             assert(self.dinv(log + cl, h2));
@@ -4512,10 +4511,10 @@ pub open spec fn scanned<S, E>(
 /// One witness of `scanned`. `s.0` names the view the tick concludes in, `s.1` the head
 /// block the first call read, `s.2` that view's anchor height, `[s.3, s.4]` the batch's
 /// window, and `s.5`, `s.6` the view and anchor height that vouch for a new tip. Under
-/// `a2_tick`, the view is anchored, holds nothing from the anchor to the window, and holds
-/// the batch's entries as the window's. A new tip is the head: with a batch, its window
-/// reaches the head; without one, the vouching view, if it holds the head, holds nothing
-/// from its anchor up to the head.
+/// `views_ok`, the view is anchored, holds nothing from the anchor to the window, and holds
+/// the batch's entries as the window's. A new tip is the head, which the vouching view
+/// holds: with a batch, that view is the tick's and its window reaches the head; without
+/// one, that view is anchored and holds nothing from its anchor up to the head.
 pub open spec fn scan_view<S, E>(
     hist: Seq<ChainView>,
     l0: int,
@@ -4534,24 +4533,27 @@ pub open spec fn scan_view<S, E>(
     &&& whi <= u64::MAX
     &&& t1 == t0 || t1 is None || (t1 == Some(hd) && a <= hd.number + 1 && aj <= hd.number + 1)
     &&& t1 == t0 && t0 is Some ==> b.triples().len() == 0
-    &&& a2_tick(hist, l0, start, t0) && (c matches Some(p) ==> p.block >= start) && (t0 matches Some(t) ==> t.number
+    &&& views_ok(hist, l0, start) && (c matches Some(p) ==> p.block >= start) && (t0 matches Some(t) ==> t.number
         + 1 >= start) ==> {
         &&& anchored(hist, k, c, t0, b.boundary, start, a)
         &&& range_entries::<S, E>(hist[k], a, wlo - 1).len() == 0
         &&& b.triples().to_multiset() == range_entries::<S, E>(hist[k], wlo, whi).to_multiset()
-        &&& t1 == Some(hd) && t1 != t0 ==> if b.triples().len() > 0 {
-            j == k && whi == hd.number
-        } else {
-            header(hist[j], hd.number) == Some(hd) ==> anchored(hist, j, c, t0, b.boundary, start, aj)
-                && range_entries::<S, E>(hist[j], aj, hd.number as int).len() == 0
+        &&& t1 == Some(hd) && t1 != t0 ==> {
+            &&& header(hist[j], hd.number) == Some(hd)
+            &&& if b.triples().len() > 0 {
+                j == k && whi == hd.number
+            } else {
+                anchored(hist, j, c, t0, b.boundary, start, aj)
+                    && range_entries::<S, E>(hist[j], aj, hd.number as int).len() == 0
+            }
         }
     }
 }
 
 /// View `hist[k]` ties a scan to the engine's state below height `a`: `a` is one past the
 /// cursor block, which the view holds as the boundary `bd`; the start block, with no
-/// cursor; or one past the old tip `t0`, which a view from `k` on holds when it lies at
-/// or above the start block.
+/// cursor; or one past the old tip `t0`, which the view holds when it lies at or above
+/// the start block.
 pub open spec fn anchored(
     hist: Seq<ChainView>,
     k: int,
@@ -4563,11 +4565,11 @@ pub open spec fn anchored(
 ) -> bool {
     ||| c is Some && a == c.unwrap().block + 1 && header(hist[k], c.unwrap().block) == bd
     ||| c is None && a == start
-    ||| t0 is Some && a == t0.unwrap().number + 1 && (t0.unwrap().number >= start ==> exists|p: int|
-        k <= p < hist.len() && #[trigger] header(hist[p], t0.unwrap().number) == t0)
+    ||| t0 is Some && a == t0.unwrap().number + 1 && (t0.unwrap().number >= start ==> header(hist[k], t0.unwrap().number)
+        == t0)
 }
 
-/// What a tick needs of its views over `hist` from `l0` (A2 ii, iii): each holds every
+/// What a tick needs of its views over `hist` from `l0` (A2 iii, iv): each holds every
 /// height from `start` up to each height it holds, and a block the first view holds is in
 /// every view between two views that hold it.
 #[verifier::opaque]
@@ -4576,43 +4578,24 @@ pub open spec fn views_ok(hist: Seq<ChainView>, l0: int, start: u64) -> bool {
     &&& forall|x: BlockRef| #[trigger] header(hist[l0], x.number) == Some(x) ==> no_aba(hist, l0, x)
 }
 
-/// `views_ok` for a tick from `l0`, and no ABA on the scan tip `t0` over the whole log.
-pub open spec fn a2_tick(hist: Seq<ChainView>, l0: int, start: u64, t0: Option<BlockRef>) -> bool {
-    &&& views_ok(hist, l0, start)
-    &&& t0 matches Some(t) ==> no_aba(hist, 0, t)
-}
-
-/// Scan tip `t` holds nothing left to fold above cursor `c`: the source log `hist` has a
-/// view `hist[j]`, at or after one that held `t`, that agrees with `h` below the floor and
-/// holds no entry from the floor through `t`, if it holds `t`.
-pub open spec fn tip_ok<S, E>(t: Option<BlockRef>, c: Option<Position>, h: ChainView, start: u64, hist: Seq<ChainView>) -> bool {
+/// Scan tip `t` holds nothing left to fold above cursor `c`, as a fact of its hash: every
+/// view that holds `t` agrees with `h` below the floor and holds no entry from the floor
+/// through `t`.
+pub open spec fn tip_ok<S, E>(t: Option<BlockRef>, c: Option<Position>, h: ChainView, start: u64) -> bool {
     match t {
-        Some(t) => tip_vouched::<S, E>(t, c, h, start, hist),
+        Some(t) => tip_vouched::<S, E>(t, c, h, start),
         None => true,
     }
 }
 
-pub open spec fn tip_vouched<S, E>(t: BlockRef, c: Option<Position>, h: ChainView, start: u64, hist: Seq<ChainView>) -> bool {
-    exists|i: int, j: int| #[trigger] tip_seen::<S, E>(t, c, h, start, hist, i, j)
+pub open spec fn tip_vouched<S, E>(t: BlockRef, c: Option<Position>, h: ChainView, start: u64) -> bool {
+    &&& scan_floor(c, start) <= t.number + 1
+    &&& forall|v: ChainView| #[trigger] tip_seen::<S, E>(t, c, h, start, v)
 }
 
-pub open spec fn tip_seen<S, E>(
-    t: BlockRef,
-    c: Option<Position>,
-    h: ChainView,
-    start: u64,
-    hist: Seq<ChainView>,
-    i: int,
-    j: int,
-) -> bool {
+pub open spec fn tip_seen<S, E>(t: BlockRef, c: Option<Position>, h: ChainView, start: u64, v: ChainView) -> bool {
     let lo = scan_floor(c, start);
-    let v = hist[j];
-    &&& 0 <= i <= j < hist.len()
-    &&& header(hist[i], t.number) == Some(t)
-    &&& lo <= t.number + 1
-    &&& a1::<S, E>(v)
-    &&& from_start(v, start)
-    &&& header(v, t.number) == Some(t) ==> {
+    a1::<S, E>(v) && from_start(v, start) && header(v, t.number) == Some(t) ==> {
         &&& forall|n: u64| start <= n < lo ==> #[trigger] header(v, n) == header(h, n)
         &&& range_entries::<S, E>(v, lo, t.number as int).len() == 0
     }
@@ -5004,7 +4987,7 @@ proof fn lemma_rung_walk<S, E>(
         assert(hist.len() == h3.len());
         assert(hist.last() == h3.last());
     }
-    if a2_tick(hist, l0, start, t0) && (c matches Some(p) ==> p.block >= start) && (t0 matches Some(t) ==> t.number
+    if views_ok(hist, l0, start) && (c matches Some(p) ==> p.block >= start) && (t0 matches Some(t) ==> t.number
         + 1 >= start) {
         if let Some(p) = c {
             if m > 0 {
@@ -5024,6 +5007,9 @@ proof fn lemma_rung_walk<S, E>(
             }
         }
         assert(anchored(hist, k, c, t0, b.boundary, start, lo));
+        if reached {
+            assert(header(hist[l0], hd.number) == header(vk, hd.number));
+        }
         if m == 0 {
             assert(range_entries::<S, E>(vk, lo, wl - 1) =~= Seq::empty());
             assert(b.triples() =~= range_entries::<S, E>(vk, wl, wh));
@@ -5087,8 +5073,11 @@ proof fn lemma_rung_gap<S, E>(
     let a = from as int;
     let p = h3.len() - 1;
     assert(hist[p] == h3.last());
-    if a2_tick(hist, l0, start, t0) && (c matches Some(q) ==> q.block >= start) && tip.number + 1 >= start {
-        assert(k <= p < hist.len() && header(hist[p], tip.number) == t0);
+    if views_ok(hist, l0, start) && (c matches Some(q) ==> q.block >= start) && tip.number + 1 >= start {
+        assert(header(hist[l0], hd.number) == header(vk, hd.number));
+        if tip.number >= start {
+            assert(header(hist[p], tip.number) == header(vk, tip.number));
+        }
         assert(anchored(hist, k, c, t0, b.boundary, start, a));
         if t1 == Some(hd) && b.triples().len() == 0 {
             vstd::seq_lib::to_multiset_len(b.triples());
@@ -5175,7 +5164,7 @@ proof fn lemma_rung_next<S, E>(
     let v0 = hist[l0];
     vstd::seq_lib::to_multiset_len(b.triples());
     vstd::seq_lib::to_multiset_len(range_entries::<S, E>(v0, n, n));
-    if a2_tick(hist, l0, start, Some(tip)) && (c matches Some(p) ==> p.block >= start) && tip.number + 1 >= start {
+    if views_ok(hist, l0, start) && (c matches Some(p) ==> p.block >= start) && tip.number + 1 >= start {
         if tip.number >= start {
             reveal(views_ok);
             assert(from_start(v0, start));
@@ -5187,72 +5176,30 @@ proof fn lemma_rung_next<S, E>(
     assert(scan_view::<S, E>(hist, l0, start, c, Some(tip), Some(hd), b, (l0, hd, n, n, n, l0, n)));
 }
 
-/// A later view that holds the tip agrees with the tip's vouching view up to the tip, so
-/// it agrees with `h` below the floor and holds nothing from the floor through the tip.
-proof fn lemma_tip_use<S, E>(
-    t: BlockRef,
-    c: Option<Position>,
-    h: ChainView,
-    start: u64,
-    old: Seq<ChainView>,
-    hist: Seq<ChainView>,
-    k: int,
-)
+/// A view that holds tip `t`, agrees with `h` below the floor and holds nothing from the
+/// floor through `t` vouches for `t`: every view that holds `t` agrees with it up to `t`.
+proof fn lemma_tip_view<S, E>(t: BlockRef, c: Option<Position>, h: ChainView, start: u64, u: ChainView)
     requires
-        tip_ok::<S, E>(Some(t), c, h, start, old),
-        grew::<S, E>(old, hist),
-        old.len() <= k < hist.len(),
-        a1::<S, E>(hist[k]),
-        from_start(hist[k], start),
-        header(hist[k], t.number) == Some(t),
-        no_aba(hist, 0, t),
-        t.number >= start,
-        c matches Some(p) ==> p.block >= start,
+        a1::<S, E>(u),
+        from_start(u, start),
+        header(u, t.number) == Some(t),
+        start <= scan_floor(c, start) <= t.number + 1,
+        forall|n: u64| start <= n < scan_floor(c, start) ==> #[trigger] header(u, n) == header(h, n),
+        range_entries::<S, E>(u, scan_floor(c, start), t.number as int).len() == 0,
     ensures
-        scan_floor(c, start) <= t.number + 1,
-        forall|n: u64| start <= n < scan_floor(c, start) ==> #[trigger] header(hist[k], n) == header(h, n),
-        range_entries::<S, E>(hist[k], scan_floor(c, start), t.number as int).len() == 0,
+        tip_vouched::<S, E>(t, c, h, start),
 {
-    let (i, j) = choose|i: int, j: int| #[trigger] tip_seen::<S, E>(t, c, h, start, old, i, j);
     let lo = scan_floor(c, start);
-    lemma_grew_next::<S, E>(old, hist);
-    let v = old[j];
-    assert(hist[i] == old[i] && hist[j] == v);
-    if i < j {
-        assert(header(hist[i], t.number) == Some(t));
-        assert(header(hist[k], t.number) == Some(t));
-        assert(header(hist[j], t.number) == Some(t));
-    }
-    assert(header(v, t.number) == Some(t));
-    lemma_from_start(v, start, t.number);
-    lemma_from_start(hist[k], start, t.number);
-    lemma_view_agree(v, hist[k], start, t.number);
-    assert forall|n: u64| start <= n < lo implies #[trigger] header(hist[k], n) == header(h, n) by {
-        assert(header(v, n) == header(hist[k], n));
-    }
-    lemma_re_agree::<S, E>(v, hist[k], lo, t.number as int);
-}
-
-/// A tip stays vouched for as the source log grows.
-proof fn lemma_tip_grew<S, E>(
-    t: Option<BlockRef>,
-    c: Option<Position>,
-    h: ChainView,
-    start: u64,
-    old: Seq<ChainView>,
-    hist: Seq<ChainView>,
-)
-    requires
-        tip_ok::<S, E>(t, c, h, start, old),
-        grew::<S, E>(old, hist),
-    ensures
-        tip_ok::<S, E>(t, c, h, start, hist),
-{
-    if let Some(t) = t {
-        let (i, j) = choose|i: int, j: int| #[trigger] tip_seen::<S, E>(t, c, h, start, old, i, j);
-        lemma_grew_next::<S, E>(old, hist);
-        assert(hist[i] == old[i] && hist[j] == old[j]);
-        assert(tip_seen::<S, E>(t, c, h, start, hist, i, j));
+    assert forall|v: ChainView| #[trigger] tip_seen::<S, E>(t, c, h, start, v) by {
+        if a1::<S, E>(v) && from_start(v, start) && header(v, t.number) == Some(t) {
+            lemma_from_start(u, start, t.number);
+            lemma_from_start(v, start, t.number);
+            lemma_view_agree(u, v, start, t.number);
+            assert forall|n: u64| start <= n < lo implies #[trigger] header(v, n) == header(h, n) by {
+                assert(header(u, n) == header(v, n));
+            }
+            lemma_re_agree::<S, E>(u, v, lo, t.number as int);
+        }
     }
 }
 
@@ -5263,7 +5210,6 @@ proof fn lemma_anchor<S, E>(
     start: u64,
     h: ChainView,
     t0: Option<BlockRef>,
-    old: Seq<ChainView>,
     hist: Seq<ChainView>,
     k: int,
     bd: Option<BlockRef>,
@@ -5274,12 +5220,10 @@ proof fn lemma_anchor<S, E>(
         a1::<S, E>(h),
         e.cursor matches Some(p) ==> holds(h, start, p.block) && h.contains_key(p.block) && h[p.block]
             == e.ring.last() && p.block >= start,
-        tip_ok::<S, E>(t0, e.cursor, h, start, old),
-        grew::<S, E>(old, hist),
-        old.len() <= k < hist.len(),
+        tip_ok::<S, E>(t0, e.cursor, h, start),
+        0 <= k < hist.len(),
         a1::<S, E>(hist[k]),
         from_start(hist[k], start),
-        t0 matches Some(t) ==> no_aba(hist, 0, t),
         anchored(hist, k, e.cursor, t0, bd, start, a),
         e.cursor is Some ==> bd == Some(e.ring.last()),
     ensures
@@ -5299,17 +5243,8 @@ proof fn lemma_anchor<S, E>(
         assert(range_entries::<S, E>(v, lo, a - 1) =~= Seq::empty());
     } else {
         let t = t0.unwrap();
-        let (i, j) = choose|i: int, j: int| #[trigger] tip_seen::<S, E>(t, c, h, start, old, i, j);
         if t.number >= start {
-            let q = choose|q: int| k <= q < hist.len() && #[trigger] header(hist[q], t.number) == t0;
-            lemma_grew_next::<S, E>(old, hist);
-            if k < q {
-                assert(hist[i] == old[i]);
-                assert(header(hist[i], t.number) == Some(t));
-                assert(header(hist[q], t.number) == Some(t));
-                assert(header(hist[k], t.number) == Some(t));
-            }
-            lemma_tip_use::<S, E>(t, c, h, start, old, hist, k);
+            assert(tip_seen::<S, E>(t, c, h, start, v));
             if let Some(p) = c {
                 assert forall|n: u64| start <= n <= p.block implies #[trigger] header(h, n) == header(v, n) by {
                     assert(n < lo);
@@ -5321,25 +5256,23 @@ proof fn lemma_anchor<S, E>(
     }
 }
 
-/// After an apply that took a window reaching the head `hd` in view `vk`, nothing is left
-/// to fold in `vk` above the new cursor up to `hd`.
-proof fn lemma_tip_step<S, E>(vk: ChainView, wlo: int, hd: BlockRef, start: u64, hist: Seq<ChainView>, l0: int, k: int)
+/// After an apply that took a window reaching the head `hd` in view `vk`, which holds
+/// `hd`, nothing is left to fold above the new cursor up to `hd`.
+proof fn lemma_tip_step<S, E>(vk: ChainView, wlo: int, hd: BlockRef, start: u64)
     requires
         a1::<S, E>(vk),
         from_start(vk, start),
-        0 <= wlo,
+        start <= wlo,
         range_entries::<S, E>(vk, wlo, hd.number as int).len() > 0,
-        0 <= l0 <= k < hist.len(),
-        hist[k] == vk,
-        header(hist[l0], hd.number) == Some(hd),
+        header(vk, hd.number) == Some(hd),
     ensures
-        tip_vouched::<S, E>(hd, Some(tpos(range_entries::<S, E>(vk, wlo, hd.number as int).last()).0), vk, start, hist),
+        tip_vouched::<S, E>(hd, Some(tpos(range_entries::<S, E>(vk, wlo, hd.number as int).last()).0), vk, start),
 {
     let r = range_entries::<S, E>(vk, wlo, hd.number as int);
     let c2 = tpos(r.last()).0;
     lemma_last_complete::<S, E>(vk, wlo, hd.number as int);
     lemma_re_split::<S, E>(vk, wlo, c2.block as int, hd.number as int);
-    assert(tip_seen::<S, E>(hd, Some(c2), vk, start, hist, l0, k));
+    lemma_tip_view::<S, E>(hd, Some(c2), vk, start, vk);
 }
 
 /// The batch's entries do not read its boundary.
@@ -5493,7 +5426,7 @@ impl<F: Fold, S: Source<Event = F::Event>, K: SnapshotSink<F>> Driver<F, S, K> {
     /// vouched for in the source log.
     pub closed spec fn dinv(&self, log: Seq<(Position, F::Event)>, h: ChainView) -> bool {
         &&& dinv::<F, S, F::Event, F::Error>(self.engine@, self.init_view(), self.start_block(), log, h)
-        &&& tip_ok::<S, F::Event>(self.tip, self.engine@.cursor, h, self.start_block(), sview_log::<S>(&self.source))
+        &&& tip_ok::<S, F::Event>(self.tip, self.engine@.cursor, h, self.start_block())
     }
 }
 
@@ -5519,7 +5452,7 @@ pub open spec fn tick_inv<F: Fold, S: Source<Event = F::Event>, K: SnapshotSink<
 }
 
 /// The driver's end-to-end claim across one tick from `pre` with `pre.dinv(log, h)`. The
-/// hypothesis, for a tick that applied a batch: `a2_tick` for the tick's views. Then the
+/// hypothesis, for a tick that applied a batch: `views_ok` for the tick's views. Then the
 /// invariant carries over, and after `Progressed`/`Idle` with the engine Active the fold is
 /// the fold of the canonical logs of one of the tick's views, with the ring a hash chain
 /// inside that view. After `RolledBack`, `Inv` holds over the canonical logs of a view that
@@ -5533,7 +5466,7 @@ pub open spec fn t7_tick<F: Fold, S: Source<Event = F::Event>, K: SnapshotSink<F
 ) -> bool {
     let (l0, hist) = (pre.source_log().len() as int, post.source_log());
     let start = pre.start_block();
-    let hyp = (r is Progressed || r is Idle || r is DurabilityLost) ==> a2_tick(hist, l0, start, pre.tip_view());
+    let hyp = (r is Progressed || r is Idle || r is DurabilityLost) ==> views_ok(hist, l0, start);
     let ring = pre.engine_view().ring;
     &&& hyp ==> exists|log2: Seq<(Position, F::Event)>, h2: ChainView| #[trigger] post.dinv(log2, h2)
     &&& hyp && (r is Progressed || r is Idle) && post.engine_view().status is Active ==> exists|k: int|
@@ -5756,7 +5689,7 @@ proof fn lemma_scan_t7<F: ?Sized, S, E, Er>(
         0 < w,
         v.status is Active,
         dinv::<F, S, E, Er>(v, init, start, log, h),
-        tip_ok::<S, E>(t0, v.cursor, h, start, old),
+        tip_ok::<S, E>(t0, v.cursor, h, start),
         grew::<S, E>(old, hist),
         accepted(v, b),
         !stopped::<F, E, Er>(v, b),
@@ -5766,7 +5699,7 @@ proof fn lemma_scan_t7<F: ?Sized, S, E, Er>(
         post.status == v.status,
         post.inv::<F, E, Er>(init, log + calls::<F, E, Er>(v, b)),
         scan_view::<S, E>(hist, old.len() as int, start, v.cursor, t0, t1, b, sv),
-        a2_tick(hist, old.len() as int, start, t0),
+        views_ok(hist, old.len() as int, start),
     ensures
         ({
             let h2 = if b.ends.len() > 0 {
@@ -5776,10 +5709,9 @@ proof fn lemma_scan_t7<F: ?Sized, S, E, Er>(
             };
             &&& dinv::<F, S, E, Er>(post, init, start, log + calls::<F, E, Er>(v, b), h2)
             &&& t7_state::<F, S, E, Er>(post, init, start, hist[sv.0])
-            &&& tip_ok::<S, E>(t1, post.cursor, h2, start, hist)
+            &&& tip_ok::<S, E>(t1, post.cursor, h2, start)
         }),
 {
-    let l0 = old.len() as int;
     let (k, hd, a, wlo, whi, j, aj) = sv;
     let vk = hist[k];
     let c = v.cursor;
@@ -5793,10 +5725,7 @@ proof fn lemma_scan_t7<F: ?Sized, S, E, Er>(
         assert(h[p.block] == r.last());
         assert(r[r.len() - 1].number >= start);
     }
-    if let Some(t) = t0 {
-        let (i, jj) = choose|i: int, jj: int| #[trigger] tip_seen::<S, E>(t, c, h, start, old, i, jj);
-    }
-    lemma_anchor::<S, E>(v, start, h, t0, old, hist, k, b.boundary, a);
+    lemma_anchor::<S, E>(v, start, h, t0, hist, k, b.boundary, a);
     lemma_re_split::<S, E>(vk, lo, a - 1, wlo - 1);
     if b.ends.len() == 0 {
         lemma_apply_empty::<F, S, E, Er>(v, post, b, w, init, start, log, h, vk);
@@ -5806,24 +5735,20 @@ proof fn lemma_scan_t7<F: ?Sized, S, E, Er>(
     if b.ends.len() > 0 {
         lemma_batch_range::<S, E>(b, vk, wlo, whi);
     }
-    if let Some(nt) = t1 {
-        if t1 == t0 {
-            lemma_tip_grew::<S, E>(t0, c, h, start, old, hist);
-        } else if b.ends.len() > 0 {
-            lemma_tip_step::<S, E>(vk, wlo, hd, start, hist, l0, k);
+    if t1 is Some && t1 != t0 {
+        if b.ends.len() > 0 {
+            lemma_tip_step::<S, E>(vk, wlo, hd, start);
         } else {
             vstd::seq_lib::to_multiset_len(b.triples());
             assert(from_start(hist[j], start) && a1::<S, E>(hist[j]));
-            if header(hist[j], hd.number) == Some(hd) {
-                lemma_anchor::<S, E>(v, start, h, t0, old, hist, j, b.boundary, aj);
-                lemma_re_split::<S, E>(hist[j], lo, aj - 1, hd.number as int);
-                if let Some(p) = c {
-                    assert forall|n: u64| start <= n < lo implies #[trigger] header(hist[j], n) == header(h, n) by {
-                        assert(n <= p.block);
-                    }
+            lemma_anchor::<S, E>(v, start, h, t0, hist, j, b.boundary, aj);
+            lemma_re_split::<S, E>(hist[j], lo, aj - 1, hd.number as int);
+            if let Some(p) = c {
+                assert forall|n: u64| start <= n < lo implies #[trigger] header(hist[j], n) == header(h, n) by {
+                    assert(n <= p.block);
                 }
             }
-            assert(tip_seen::<S, E>(hd, c, h, start, hist, l0, j));
+            lemma_tip_view::<S, E>(hd, c, h, start, hist[j]);
         }
     }
 }

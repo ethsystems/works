@@ -1,6 +1,6 @@
 # Checked by .github/scripts/verus-gates.py; regenerate it with `--update` (see there).
 # tcb and spec lines: hash of the normalized text, then the item. fn lines: from Verus.
-verified 346
+verified 345
 fn exec chainfold::batch::Batch::clear
 fn exec chainfold::batch::Batch::clone
 fn exec chainfold::batch::Batch::default
@@ -197,9 +197,8 @@ fn proof chainfold::driver::lemma_rung_walk
 fn proof chainfold::driver::lemma_scan_t7
 fn proof chainfold::driver::lemma_sorted_desc
 fn proof chainfold::driver::lemma_step_canon
-fn proof chainfold::driver::lemma_tip_grew
 fn proof chainfold::driver::lemma_tip_step
-fn proof chainfold::driver::lemma_tip_use
+fn proof chainfold::driver::lemma_tip_view
 fn proof chainfold::driver::lemma_triples_at
 fn proof chainfold::driver::lemma_triples_ignore_boundary
 fn proof chainfold::driver::lemma_triples_len
@@ -464,13 +463,12 @@ spec c39b050fcbde src/driver.rs::scan_windows
 spec 93b27ee22fb3 src/driver.rs::wlo
 spec 0bb84c5768c5 src/driver.rs::walked
 spec 2e4986103c4d src/driver.rs::scanned
-spec 45c55348ea90 src/driver.rs::scan_view
-spec 8b78599f6ac7 src/driver.rs::anchored
+spec 8e7bfe8c408d src/driver.rs::scan_view
+spec c00692220613 src/driver.rs::anchored
 spec ed51b2a243f2 src/driver.rs::views_ok
-spec f000a43d1754 src/driver.rs::a2_tick
-spec 08b03b1744d3 src/driver.rs::tip_ok
-spec 658c2efa7708 src/driver.rs::tip_vouched
-spec 6b1ebd49174f src/driver.rs::tip_seen
+spec b2a875062915 src/driver.rs::tip_ok
+spec ea8b9068133b src/driver.rs::tip_vouched
+spec 2b9ec53c4d6d src/driver.rs::tip_seen
 spec 13cf9f9e0d77 src/driver.rs::no_aba
 spec 1faa90f9766b src/driver.rs::from_start
 spec 6edb90192ccb src/driver.rs::lost
@@ -490,10 +488,9 @@ spec 8c53b3aab297 src/driver.rs::lemma_rung_gap
 spec 24551f307d06 src/driver.rs::lemma_rung_same
 spec d267e8f9c624 src/driver.rs::lemma_parent
 spec ec37bed053a4 src/driver.rs::lemma_rung_next
-spec d66bb1c01c56 src/driver.rs::lemma_tip_use
-spec 0d0a1ec25d53 src/driver.rs::lemma_tip_grew
-spec 5a2ba4be2dcf src/driver.rs::lemma_anchor
-spec 7795bd76f7e3 src/driver.rs::lemma_tip_step
+spec 2599f343ed0e src/driver.rs::lemma_tip_view
+spec d9207a49df58 src/driver.rs::lemma_anchor
+spec 619d11ecb1db src/driver.rs::lemma_tip_step
 spec 3daec36eff36 src/driver.rs::lemma_triples_ignore_boundary
 spec f14419ef3938 src/driver.rs::horizon_refused
 spec 49846cefc37f src/driver.rs::snapshot_due
@@ -512,16 +509,16 @@ spec 46d9001d8ce5 src/driver.rs::Driver::source_log
 spec fe83048f5e5d src/driver.rs::Driver::source_infallible
 spec f405ac92a1f1 src/driver.rs::Driver::batch_view
 spec 41e94f949a52 src/driver.rs::Driver::tip_view
-spec 84848d467906 src/driver.rs::Driver::dinv
+spec a666f8ca53c2 src/driver.rs::Driver::dinv
 spec eb44b97cc947 src/driver.rs::tick_inv
-spec 69a7841872e3 src/driver.rs::t7_tick
+spec d082c7cfe79b src/driver.rs::t7_tick
 spec 194ea734fe7d src/driver.rs::dinv
 spec 76185f1fe215 src/driver.rs::t7_state
 spec 0607b9b53f6c src/driver.rs::lemma_flat_triples
 spec 8acb3a0daecf src/driver.rs::lemma_triples_at
 spec c79256f2565c src/driver.rs::lemma_batch_range
 spec c94a38a7ae83 src/driver.rs::lemma_ring_after_in
-spec f91ff22b510f src/driver.rs::lemma_scan_t7
+spec 7f14bf4ebcee src/driver.rs::lemma_scan_t7
 spec 54a5e9b643cd src/driver.rs::lemma_apply_empty
 spec 1137257ff8ce src/driver.rs::lemma_apply_step
 spec b0645749e04f src/driver.rs::lemma_step_canon

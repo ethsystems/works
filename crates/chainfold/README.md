@@ -286,8 +286,13 @@ trusted items are in `src/verus/tcb.rs`.
   canonical logs, up to the cursor, of one view the tick's calls answered from, and the
   ring is a hash chain in that view. After `RolledBack`, `inv` holds over the canonical
   logs of a view that confirmed the probed ring entry, when that view holds every height
-  from `start_block` to that entry. `dinv` also covers the scan tip: the chain it commits
-  to holds nothing to fold between the cursor and the tip.
+  from `start_block` to that entry. `dinv` also covers the scan tip, as a fact of its
+  hash: every view that holds the tip agrees with the chain view of `dinv` up to the
+  cursor block, and holds nothing to fold between the cursor and the tip. T7 takes A2
+  (iii) and (iv) only for the views of the tick itself, so a tick may answer from a
+  view older than one an earlier tick read. The test
+  `a_tick_on_an_older_view_folds_what_a_fold_from_scratch_of_it_does` runs such ticks
+  and checks each fold against a fold from scratch of the view that the tick read.
 
   A tick returns `SourceError` only if a source call failed or the chain changed during
   the tick: some call answered from a view other than the first call's. The engine never
@@ -321,15 +326,17 @@ exceptions are the fns listed as out of scope in `Cargo.toml`.
   answers the canonical block at that height). Nothing in the crate checks an answer
   against the block: a dropped or an invented log is folded as given, and nothing
   reports it. A1 then also needs the source to check logs against the receipts root, or
-  to trust its node. (iii) No ABA: a view between two views that hold a block holds it
-  too. The proofs use this for the head block within one tick, and for the scan tip from
-  the tick that set it. The block on top of the tip is read by its hash, so a
-  load-balanced node without it errs and the tip stays below it. A range read can still
-  break this: behind a load balancer whose nodes lag each other, a node without the
-  newest blocks answers `events_in` for them with nothing, the tip moves past them, and
-  their events are skipped. Point such a source at one node, or at nodes that never
-  answer below a head another has reported. (iv) Each view holds every height from
-  `start_block` up to each height it holds.
+  to trust its node. (iii) No ABA only on the head block within one tick: a view of the
+  tick between two views that hold the head block the tick read first holds it too. The
+  scan tip needs no such assumption across ticks, because A1 makes it a fact of the tip's
+  hash, true in every view that holds the tip. The block on top of the tip is read by
+  its hash, so a load-balanced node without it errs and the tip stays below it. Only a
+  range read on a backend that clamps it can still break (iii): behind a load balancer
+  whose nodes lag each other, a node that answers `events_in` past its own head with
+  nothing answers the newest blocks with nothing, the tip moves past them, and their
+  events are skipped. Point such a source at one node, at nodes that never answer below
+  a head another has reported, or at nodes that err on a range past their own head.
+  (iv) Each view holds every height from `start_block` up to each height it holds.
 - **A2′, one bisection view.** All probes of one bisection see one view. Only the
   optimality of `canonical_prefix` needs it. Optimality also takes `down_closed(V)` as a hypothesis: `V`
   holds every height below each height it holds. `a1` does not include this, because
