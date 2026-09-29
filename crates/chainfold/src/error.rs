@@ -96,8 +96,6 @@ impl core::error::Error for EngineStatus {}
 #[cfg_attr(verus_keep_ghost, verus_verify)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DivergenceCause {
-    /// Fork deeper than the oldest observed block in the ring.
-    ForkBeyondWindow,
     /// Replay is required but the source's horizon no longer covers the start block.
     HorizonExceeded {
         /// Block replay must start from.
@@ -110,7 +108,6 @@ pub enum DivergenceCause {
 impl fmt::Display for DivergenceCause {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::ForkBeyondWindow => write!(f, "fork deeper than the observed window"),
             Self::HorizonExceeded { needed, horizon } => {
                 write!(
                     f,

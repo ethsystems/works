@@ -68,8 +68,11 @@ and recovery), and the adapters (`std`: tokio harness, snapshot store, flusher).
 - rollback is bounded to K retained checkpoints. Over-rollback past still-canonical but
   unobserved blocks is intended; the discarded events replay deterministically.
 - the recovery ladder is rollback, then resync from genesis, then a typed terminal state.
-  `DivergenceCause` names which rung ran out: fork deeper than the window, no checkpoint
-  below the ancestor, source horizon short of the start block.
+  A fork deeper than the window or below every checkpoint resyncs; the only terminal
+  `DivergenceCause` is a source horizon short of the start block.
+- `Halt` and `Poison` stop the driver at `Tick::Terminal`: the fold is deterministic, so
+  replaying into the same event would stop again. The caller recovers through
+  `engine_mut`, with `rollback_at_or_below` or `reset`.
 - `EngineStatus::Unrecoverable` is only left by a `reset`. Automated progress stops
   rather than folding on untrusted state.
 - the snapshot envelope is engine-owned: magic, format version, fold identity tag,
@@ -192,11 +195,11 @@ dependency stack that a guest or wasm build has no use for.
 ### Tuning
 
 - `EngineConfig::ring_capacity` (W): observed-block window, a power of two in `[2, 1 << 20]`.
-  It bounds fork detection; a fork deeper than the oldest ring entry is
-  `ForkBeyondWindow`.
+  It bounds fork detection; a fork deeper than the oldest ring entry resyncs from the
+  start block.
 - `EngineConfig::checkpoint_slots` (K): retained rollback points, at most `1 << 16`. Zero
-  disables rollback, so `Halt` and `Poison` escalate straight to resync and anchor checks
-  never fire. That is the default shape of most consumers today, not an edge case.
+  disables rollback, so a resync (`reset`) is the only way out of `Halt` or `Poison`,
+  and anchor checks never fire. That is the default shape of most consumers today, not an edge case.
 - `DriverConfig::checkpoint_interval`: blocks of cursor progress between automatic
   checkpoints. The reorg an offered snapshot survives without a resync is
   `checkpoint_slots * checkpoint_interval` blocks; size both against the deepest reorg

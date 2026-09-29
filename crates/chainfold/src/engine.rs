@@ -415,7 +415,7 @@ impl<F: Fold> Engine<F> {
                 #[trigger] old(self)@.anchored(a) ==> final(self)@.anchored(a),
     ))]
     #[cfg_attr(verus_keep_ghost, verifier::spinoff_prover)]
-    #[cfg_attr(verus_keep_ghost, verifier::rlimit(50))]
+    #[cfg_attr(verus_keep_ghost, verifier::rlimit(200))]
     pub fn apply_batch(
         &mut self,
         batch: &Batch<F::Event>,
@@ -2103,9 +2103,13 @@ mod tests {
 
     #[test]
     fn unrecoverable_refuses_apply_and_rollback() {
-        // given mark_unrecoverable
+        // given mark_unrecoverable with a horizon past the start block
+        let cause = DivergenceCause::HorizonExceeded {
+            needed: 0,
+            horizon: 9,
+        };
         let mut engine = new_engine();
-        engine.mark_unrecoverable(DivergenceCause::ForkBeyondWindow);
+        engine.mark_unrecoverable(cause);
         // when applying or rolling back
         let apply_result =
             engine.apply_batch(&batch_of(None, vec![(block(1, 0), vec![0])]));
@@ -2114,17 +2118,10 @@ mod tests {
         assert_eq!(
             apply_result,
             Err(ApplyError::NotActive {
-                status: EngineStatus::Unrecoverable {
-                    cause: DivergenceCause::ForkBeyondWindow
-                },
+                status: EngineStatus::Unrecoverable { cause },
             })
         );
-        assert_eq!(
-            rollback_result,
-            Err(RollbackError::Unrecoverable {
-                cause: DivergenceCause::ForkBeyondWindow,
-            })
-        );
+        assert_eq!(rollback_result, Err(RollbackError::Unrecoverable { cause }));
     }
 
     #[test]
