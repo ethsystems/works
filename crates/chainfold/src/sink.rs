@@ -12,7 +12,7 @@ use {
 };
 
 /// Durability sink for engine snapshots; the apply path never fsyncs.
-// A4: `sink_offered` holds the points offered since the last `reset`, and
+// `sink_offered` holds the points offered since the last `reset`, and
 // `durable_cursor` reports one of them or None. Implementations are trusted to meet this.
 #[cfg_attr(verus_keep_ghost, verus_verify)]
 pub trait SnapshotSink<F> {

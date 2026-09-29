@@ -16,7 +16,7 @@ use crate::{
 ///
 /// A `Clone` fold must clone its full observable state: checkpoints are clones, and
 /// rollback resumes from them.
-// A3: `apply` is a deterministic function of the state view, position and event, and a
+// `apply` is a deterministic function of the state view, position and event, and a
 // Halt leaves the view unchanged. Implementations are trusted to meet this spec.
 #[cfg_attr(verus_keep_ghost, verus_verify)]
 pub trait Fold {

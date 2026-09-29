@@ -477,7 +477,7 @@ impl BlockRing {
                 probes = probes + 1;
             }
         }
-        // T4b: the loop ran at most floor(log2 len) + 1 times.
+        // The loop ran at most floor(log2 len) + 1 times.
         #[cfg(verus_keep_ghost)]
         proof! {
             lemma_probe_bound(probes, newest as int);
@@ -564,7 +564,7 @@ impl BlockRing {
     /// Bisects for the length of the oldest-first prefix the source still confirms, so
     /// entry `lo - 1` is the deepest canonical block and 0 means none is. At most
     /// `floor(log2 len) + 1` `header_at` calls; a source error is returned as is.
-    // T4c. This bisection's probes are the calls it appends to `sview_log`: `hist[k]` for
+    // This bisection's probes are the calls it appends to `sview_log`: `hist[k]` for
     // `k` from `old(source)`'s log length on, each one the view that answered that probe.
     #[cfg_attr(verus_keep_ghost, verus_spec(r =>
         requires
@@ -582,7 +582,7 @@ impl BlockRing {
                 &&& forall|k: int| from <= k < hist.len() ==> a1::<S, S::Event>(#[trigger] hist[k])
                 &&& r matches Ok(lo) ==> {
                     &&& lo <= self@.len()
-                    // Safety (A1): a probe's view held `ring[lo - 1]`, so by `ring_chain` it
+                    // Safety: a probe's view held `ring[lo - 1]`, so by `ring_chain` it
                     // holds `ring[..lo]` at every height it has.
                     &&& lo > 0 ==> exists|k: int|
                         from <= k < hist.len() && #[trigger] confirms(hist[k], self@[lo - 1])
@@ -594,7 +594,7 @@ impl BlockRing {
                     // A probe's view did not hold `ring[lo]`.
                     &&& lo < self@.len() ==> exists|k: int|
                         from <= k < hist.len() && !#[trigger] confirms(hist[k], self@[lo as int])
-                    // Optimality (A1 + A2'): with one view for every probe, `lo` is the
+                    // Optimality: with one view for every probe, `lo` is the
                     // longest prefix that view confirms.
                     &&& forall|v: ChainView|
                         (forall|k: int| from <= k < hist.len() ==> #[trigger] hist[k] == v)

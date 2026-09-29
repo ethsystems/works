@@ -378,7 +378,7 @@ where
                 &&& d.batch@.ends.len() == 0 && d.batch@.boundary is None
                 &&& d.last_checkpoint_block is None && d.last_snapshot_block is None
                 &&& !d.durability_lost && !d.caught_up && d.consecutive_errors == 0
-                // A4 reading: T6b holds when the sink was reset, else when it offered
+                // `durable_ok` holds when the sink was reset, else when it offered
                 // nothing past the engine's state.
                 &&& d.sink == sink || sink_offered::<K>(&d.sink) == Set::<Position>::empty()
                 &&& floor_ok(sink_offered::<K>(&sink), engine@) ==> d.durable_ok()
@@ -1050,7 +1050,7 @@ where
 
     /// Fills `batch` with the blocks strictly after the cursor, plus the cursor block's
     /// header as the source reports it now.
-    // B1: the boundary is read after every window, so its view is the last log entry.
+    // The boundary is read after every window, so its view is the last log entry.
     #[cfg_attr(verus_keep_ghost, verus_spec(r =>
         requires
             old(self).wf(),
@@ -1249,7 +1249,7 @@ where
     }
 
     /// Bisects the observed ring for the deepest still-canonical block, then rolls back.
-    // T4c: a RolledBack restore sits at or below a ring block some probe's view confirmed.
+    // A RolledBack restore sits at or below a ring block some probe's view confirmed.
     #[cfg_attr(verus_keep_ghost, verus_spec(r =>
         requires
             old(self).wf(),
@@ -1292,7 +1292,7 @@ where
     }
 
     /// Advances the loop by one poll, apply, and recovery step.
-    // T7: under A1-A3 (`t7_tick`'s hypotheses), `dinv` carries over and an Active
+    // Under `t7_tick`'s hypotheses, `dinv` carries over and an Active
     // Progressed/Idle tick leaves the fold at the canonical logs of the tick's view.
     #[cfg_attr(verus_keep_ghost, verus_spec(r =>
         requires
@@ -1347,7 +1347,7 @@ where
     }
 
     /// Snapshots the current driver and engine state.
-    // T6b: the reported durable cursor never leads the cursor.
+    // The reported durable cursor never leads the cursor.
     #[cfg_attr(verus_keep_ghost, verus_spec(r =>
         ensures
             r.cursor == self.engine_view().cursor,
@@ -2771,7 +2771,7 @@ pub open spec fn clamp_spec(mark: Option<u64>, to: Option<Position>) -> Option<u
     }
 }
 
-/// T6b floor: every offered point is at or below the cursor and every live slot's cursor.
+/// Every offered point is at or below the cursor and every live slot's cursor.
 pub open spec fn floor_ok(off: Set<Position>, e: EngineView) -> bool {
     forall|p: Position|
         #[trigger] off.contains(p) ==> opt_le(Some(p), e.cursor) && forall|k: int|
@@ -2801,7 +2801,8 @@ spec fn resynced<F: Fold, S: Source<Event = F::Event>, K: SnapshotSink<F>>(
     &&& sink_offered::<K>(&post.sink) == Set::<Position>::empty()
 }
 
-/// `recover_via_bisection`'s post-state: T4c for RolledBack, the ladder otherwise.
+/// `recover_via_bisection`'s post-state: a restore below a confirmed ring block for
+/// RolledBack, the ladder otherwise.
 spec fn recovered<F: Fold, S: Source<Event = F::Event>, K: SnapshotSink<F>>(
     pre: Driver<F, S, K>,
     post: Driver<F, S, K>,
@@ -2836,8 +2837,8 @@ spec fn recovered<F: Fold, S: Source<Event = F::Event>, K: SnapshotSink<F>>(
     &&& r is RolledBack || r is Resynced || r is Terminal || r is SourceError
 }
 
-/// `roll_back_to`'s Ok arm: T5b/T5c/T5d restated for the driver, plus the marks clamped
-/// to the restore point `to`.
+/// `roll_back_to`'s Ok arm: the engine rollback's target, post-state and `Inv`
+/// restated for the driver, plus the marks clamped to the restore point `to`.
 spec fn rolled_back<F: Fold, S: Source<Event = F::Event>, K: SnapshotSink<F>>(
     pre: Driver<F, S, K>,
     post: Driver<F, S, K>,
@@ -2906,14 +2907,14 @@ pub open spec fn scan_windows(wins: Seq<(int, int)>, first: int, w: u64, h: u64)
         } else {
             h as int
         }
-    // Adjacent pairs, so the trigger does not chain (cookbook section 2).
+    // Adjacent pairs, so the trigger does not chain.
     &&& forall|i: int, j: int|
         #![trigger wins[i], wins[j]]
         0 <= i && j == i + 1 && j < wins.len() ==> wins[j].0 == wins[i].1 + 1
 }
 
 /// `scan`'s Ok result over the source log `hist` from `l0`: the head call's view, one view
-/// per window, then the boundary view last (B1). Windows before the last are empty; the
+/// per window, then the boundary view last. Windows before the last are empty; the
 /// batch holds the last window's entries, or it is empty and the windows cover `[first, h]`.
 pub open spec fn scanned<S, E>(
     hist: Seq<ChainView>,
@@ -3027,7 +3028,7 @@ spec fn checkpoint_ran<F: Fold, S: Source<Event = F::Event>, K: SnapshotSink<F>>
         #[trigger] pre.engine@.anchored(a) ==> post.engine@.anchored(pre.engine@.stored_anchors(a))
 }
 
-/// T4c: view `v` confirmed `ring[lo - 1]`, so under `ring_chain` it holds `ring[..lo]`.
+/// View `v` confirmed `ring[lo - 1]`, so under `ring_chain` it holds `ring[..lo]`.
 pub open spec fn probe_held(ring: Seq<BlockRef>, lo: int, v: ChainView) -> bool {
     &&& confirms(v, ring[lo - 1])
     &&& ring_chain(ring) ==> forall|i: int|
@@ -3081,7 +3082,7 @@ impl<F: Fold, S: Source<Event = F::Event>, K: SnapshotSink<F>> Driver<F, S, K> {
         self.seen_resets == self.engine@.resets
     }
 
-    /// T6b, threaded through every method: while synced, the sink offered nothing past
+    /// Kept by every method: while synced, the sink offered nothing past
     /// the engine's cursor or any live slot.
     pub closed spec fn durable_ok(&self) -> bool {
         self.synced() ==> floor_ok(sink_offered::<K>(&self.sink), self.engine@)
@@ -3089,7 +3090,7 @@ impl<F: Fold, S: Source<Event = F::Event>, K: SnapshotSink<F>> Driver<F, S, K> {
 }
 
 impl<F: Fold, S: Source<Event = F::Event>, K: SnapshotSink<F>> Driver<F, S, K> {
-    /// View of the fold `resync` restarts from (T7 `init`).
+    /// View of the fold `resync` restarts from (`dinv`'s `init`).
     pub closed spec fn init_view(&self) -> int {
         fview::<F>(&self.initial)
     }
@@ -3098,7 +3099,7 @@ impl<F: Fold, S: Source<Event = F::Event>, K: SnapshotSink<F>> Driver<F, S, K> {
         self.config.start_block
     }
 
-    /// The views that answered the source so far (A2).
+    /// The views that answered the source so far.
     pub closed spec fn source_log(&self) -> Seq<ChainView> {
         sview_log::<S>(&self.source)
     }
@@ -3107,13 +3108,13 @@ impl<F: Fold, S: Source<Event = F::Event>, K: SnapshotSink<F>> Driver<F, S, K> {
         self.batch@
     }
 
-    /// T7 ghost state over log `log` and chain view `h` (`dinv`).
+    /// Ghost invariant over log `log` and chain view `h` (`dinv`).
     pub closed spec fn dinv(&self, log: Seq<(Position, F::Event)>, h: ChainView) -> bool {
         dinv::<F, S, F::Event, F::Error>(self.engine@, self.init_view(), self.start_block(), log, h)
     }
 }
 
-/// `Inv` threading through one tick (T5): the log grows by the applied calls, is cut at a
+/// `Inv` threading through one tick: the log grows by the applied calls, is cut at a
 /// rollback target, restarts empty at a resync, and stays on a source error.
 pub open spec fn tick_inv<F: Fold, S: Source<Event = F::Event>, K: SnapshotSink<F>>(
     pre: Driver<F, S, K>,
@@ -3134,8 +3135,9 @@ pub open spec fn tick_inv<F: Fold, S: Source<Event = F::Event>, K: SnapshotSink<
     }
 }
 
-/// T7's hypotheses for a tick that applied batch `b` built by a scan over `hist` from `l0`:
-/// A2 (ii)/(iii) for its windows, and its view holds `[start, c2.block]` for the new cursor.
+/// `t7_tick`'s hypotheses for a tick that applied batch `b` built by a scan over `hist`
+/// from `l0`: `a2_scan` for its windows, and its view holds `[start, c2.block]` for the
+/// new cursor.
 pub open spec fn a2_hyp<S, E>(
     hist: Seq<ChainView>,
     l0: int,
@@ -3149,14 +3151,14 @@ pub open spec fn a2_hyp<S, E>(
     &&& c2 matches Some(p) ==> holds(t7_view(hist, c, b), start, p.block)
 }
 
-/// T7 across one tick from `pre` with `pre.dinv(log, h)`. The hypotheses, for a tick that
-/// applied a batch: A2 (ii)/(iii) for the scan's windows, and the tick's view holding
-/// every height from `start_block` to the new cursor. Then the invariant carries over,
-/// and after `Progressed`/`Idle` with the engine Active the fold is the fold of the
-/// canonical logs of the tick's view (its last `events_in` view, or the boundary view for
-/// `Idle`), with the ring a hash chain inside that view. After `RolledBack`, `Inv` holds
-/// over the canonical logs of a view that confirmed the probed ring entry, when that view
-/// holds `[start_block, entry]` (T4c).
+/// The driver's end-to-end claim across one tick from `pre` with `pre.dinv(log, h)`. The
+/// hypotheses, for a tick that applied a batch: `a2_scan` for the scan's windows, and the
+/// tick's view holding every height from `start_block` to the new cursor. Then the
+/// invariant carries over, and after `Progressed`/`Idle` with the engine Active the fold
+/// is the fold of the canonical logs of the tick's view (its last `events_in` view, or
+/// the boundary view for `Idle`), with the ring a hash chain inside that view. After
+/// `RolledBack`, `Inv` holds over the canonical logs of a view that confirmed the probed
+/// ring entry, when that view holds `[start_block, entry]`.
 pub open spec fn t7_tick<F: Fold, S: Source<Event = F::Event>, K: SnapshotSink<F>>(
     pre: Driver<F, S, K>,
     post: Driver<F, S, K>,
@@ -3195,9 +3197,10 @@ pub open spec fn t7_tick<F: Fold, S: Source<Event = F::Event>, K: SnapshotSink<F
         ))
 }
 
-/// T7 invariant: `Inv` over `log`, and while Active `log` is the canonical history of the
-/// chain view `h` from `before(start)` to the cursor, which ends its block, with the ring
-/// in `h` at heights from `start`, and every stored slot cursor ending its block in `h`.
+/// Driver invariant: `Inv` over `log`, and while Active `log` is the canonical history of
+/// the chain view `h` from `before(start)` to the cursor, which ends its block, with the
+/// ring in `h` at heights from `start`, and every stored slot cursor ending its block in
+/// `h`.
 pub open spec fn dinv<F: ?Sized, S: ?Sized, E, Er>(
     e: EngineView,
     init: int,
@@ -3221,15 +3224,15 @@ pub open spec fn dinv<F: ?Sized, S: ?Sized, E, Er>(
     }
 }
 
-/// T7's conclusion for view `v`.
+/// A tick's conclusion for view `v`.
 pub open spec fn t7_state<F: ?Sized, S: ?Sized, E, Er>(e: EngineView, init: int, start: u64, v: ChainView) -> bool {
     &&& e.fold == fold::<F, E, Er>(init, canon::<S, E>(v, before(start), e.cursor))
     &&& ring_chain(e.ring)
     &&& ring_in(e.ring, v)
 }
 
-/// A2 (ii) and (iii) for one scan over `hist` from `l0` with windows `wins`: blocks of the
-/// earlier (empty) windows are unchanged in the last `events_in` view, and the cursor
+/// Scan-view stability for one scan over `hist` from `l0` with windows `wins`: blocks of
+/// the earlier (empty) windows are unchanged in the last `events_in` view, and the cursor
 /// block there is the one the boundary fetch saw.
 pub open spec fn a2_scan(hist: Seq<ChainView>, l0: int, wins: Seq<(int, int)>, cursor: Option<Position>) -> bool {
     let vk = hist[l0 + wins.len()];
@@ -3239,8 +3242,8 @@ pub open spec fn a2_scan(hist: Seq<ChainView>, l0: int, wins: Seq<(int, int)>, c
     &&& cursor matches Some(c) ==> header(vk, c.block) == header(hist[hist.len() - 1], c.block)
 }
 
-/// The view T7 names: the last `events_in` view for a non-empty batch, else the boundary
-/// view (the last view either way when there is no cursor).
+/// The view a tick's conclusion names: the last `events_in` view for a non-empty batch,
+/// else the boundary view (the last view either way when there is no cursor).
 pub open spec fn t7_view<E>(hist: Seq<ChainView>, cursor: Option<Position>, b: BatchView<E>) -> ChainView {
     if b.ends.len() > 0 && cursor is Some {
         hist[hist.len() - 2]
@@ -3296,7 +3299,7 @@ proof fn lemma_triples_at<E>(b: BatchView<E>, n: int, j: int)
     }
 }
 
-/// The windows before window `i` hold no entry in the last `events_in` view (A2 (ii)).
+/// The windows before window `i` hold no entry in the last `events_in` view.
 proof fn lemma_windows_empty<S, E>(
     hist: Seq<ChainView>,
     l0: int,
@@ -3458,7 +3461,8 @@ proof fn lemma_ring_after_in<E>(
     }
 }
 
-/// T7 for an accepted apply that did not stop, over the scan that built the batch.
+/// `dinv` and the tick's conclusion for an accepted apply that did not stop, over the
+/// scan that built the batch.
 proof fn lemma_apply_t7<F: ?Sized, S, E, Er>(
     v: EngineView,
     post: EngineView,
@@ -3740,8 +3744,9 @@ proof fn lemma_step_canon<S, E>(
     assert(pentries::<S, E>(vk, first as int, c2.block as int) =~= flat);
 }
 
-/// T7 and `Inv` across `poll_apply`'s recovery arm: the rejected apply changed nothing
-/// the invariants read, then `recovered` gives the rollback, resync or unchanged state.
+/// `dinv` and `Inv` across `poll_apply`'s recovery arm: the rejected apply changed
+/// nothing the invariants read, then `recovered` gives the rollback, resync or unchanged
+/// state.
 proof fn lemma_recover_t7<F: Fold, S: Source<Event = F::Event>, K: SnapshotSink<F>>(
     old: Driver<F, S, K>,
     pre: Driver<F, S, K>,
@@ -3809,7 +3814,7 @@ proof fn lemma_recover_t7<F: Fold, S: Source<Event = F::Event>, K: SnapshotSink<
     }
 }
 
-/// A fresh engine (no cursor, empty ring) satisfies the T7 invariant with the empty log
+/// A fresh engine (no cursor, empty ring) satisfies `dinv` with the empty log
 /// and the empty view.
 proof fn lemma_fresh_dinv<F: ?Sized, S, E, Er>(e: EngineView, init: int, start: u64)
     requires
@@ -3827,9 +3832,9 @@ proof fn lemma_fresh_dinv<F: ?Sized, S, E, Er>(e: EngineView, init: int, start: 
     }
 }
 
-/// T7 through a rollback to slot `k`'s cursor `to`: the ghost view stays, the log is cut
-/// at `to`; and a probe view that confirmed `ring[lo - 1]` and holds `[start, ring[lo -
-/// 1]]` agrees with the ghost view up to `to`.
+/// `dinv` through a rollback to slot `k`'s cursor `to`: the ghost view stays, the log is
+/// cut at `to`; and a probe view that confirmed `ring[lo - 1]` and holds
+/// `[start, ring[lo - 1]]` agrees with the ghost view up to `to`.
 proof fn lemma_rollback_t7<F: ?Sized, S, E, Er>(
     e: EngineView,
     f: EngineView,
@@ -3904,7 +3909,7 @@ proof fn lemma_rollback_t7<F: ?Sized, S, E, Er>(
     }
 }
 
-/// A checkpoint keeps the T7 invariant: the new slot's cursor is the cursor.
+/// A checkpoint keeps `dinv`: the new slot's cursor is the cursor.
 proof fn lemma_checkpoint_dinv<F: ?Sized, S, E, Er>(
     pre: EngineView,
     init: int,
@@ -3938,7 +3943,8 @@ proof fn lemma_checkpoint_dinv<F: ?Sized, S, E, Er>(
     }
 }
 
-/// T6b through apply: the cursor does not move back and a dead slot stays dead.
+/// The durable floor through apply: the cursor does not move back and a dead slot stays
+/// dead.
 proof fn lemma_apply_floor<F: ?Sized, E, Er>(v: EngineView, post: EngineView, b: BatchView<E>, w: int, off: Set<Position>)
     requires
         v.wf(),

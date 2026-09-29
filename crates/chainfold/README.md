@@ -216,7 +216,7 @@ dependency stack that a guest or wasm build has no use for.
 ### verification
 
 [Verus](https://github.com/verus-lang/verus) proves the core invariants in place, in
-attribute mode (ethsystems/pm#423). The proofs cover the
+attribute mode. The proofs cover the
 `no_std + alloc + wincode` build. Normal builds do not need Verus: every annotation
 is behind `cfg(verus_keep_ghost)`. The spec model is in `src/verus/model.rs`. The
 trusted items are in `src/verus/tcb.rs`.
@@ -252,7 +252,7 @@ trusted items are in `src/verus/tcb.rs`.
   trust in the codec or the checksum. `encode_durable_snapshot` returns the durable
   point, and its envelope encodes the durable snapshot. A decoded envelope gives back
   the durable snapshot view, except for the fold (A5). `Driver::status` reports
-  `durable_cursor <= cursor` while the driver state is `durable_ok` (T6b). Every
+  `durable_cursor <= cursor` while the driver state is `durable_ok`. Every
   driver method keeps `durable_ok`.
 - **T7, driver end to end.** Under A1, A2, and A3, `Driver::tick` keeps the ghost
   invariant `dinv`, and a new driver starts in it. After a tick that returns
@@ -262,7 +262,7 @@ trusted items are in `src/verus/tcb.rs`.
   confirmed the probed ring entry.
 
 Verus checks every exec fn in the in-scope files for panics and overflow. The only
-exceptions are the fns listed as out of scope or pending in `Cargo.toml`.
+exceptions are the fns listed as out of scope in `Cargo.toml`.
 
 #### assumptions
 
@@ -275,8 +275,8 @@ exceptions are the fns listed as out of scope or pending in `Cargo.toml`.
   empty windows are unchanged in the last `events_in` view of the same scan. (iii) No
   ABA: a cursor block that is canonical at the boundary fetch was canonical during the
   last `events_in`.
-- **A2′, one bisection view.** All probes of one bisection see one view. Only T4c
-  optimality needs it. Optimality also takes `down_closed(V)` as a hypothesis: `V`
+- **A2′, one bisection view.** All probes of one bisection see one view. Only the
+  optimality of `canonical_prefix` needs it. Optimality also takes `down_closed(V)` as a hypothesis: `V`
   holds every height below each height it holds. `a1` does not include this, because
   a pruned source answers `None` below its horizon. T7 takes the weaker
   `holds(V, start_block, n)` for each view a tick uses.

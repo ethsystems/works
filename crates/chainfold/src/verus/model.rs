@@ -1,5 +1,4 @@
-//! Spec model of the chain, the fold and the engine (plan section 3). Reference with
-//! signatures and the theorem that uses each item: cookbook section 15.
+//! Spec model of the chain, the fold and the engine.
 
 use vstd::prelude::*;
 
@@ -16,14 +15,14 @@ use crate::{
 
 verus! {
 
-/// Canonical header per height at one instant (plan `View`, renamed so it does not
-/// shadow vstd's `View` trait).
+/// Canonical header per height at one instant (named so it does not shadow vstd's
+/// `View` trait).
 pub type ChainView = Map<u64, BlockRef>;
 
-/// Ancestor at height `m` that block hash `h` commits to (A1).
+/// Ancestor at height `m` that block hash `h` commits to.
 pub uninterp spec fn anc(h: [u8; 32], m: u64) -> BlockRef;
 
-/// Logs block hash `h` commits to, as source type `S` decodes them into `E` (A1).
+/// Logs block hash `h` commits to, as source type `S` decodes them into `E`.
 pub uninterp spec fn logs<S: ?Sized, E>(h: [u8; 32]) -> Seq<(u32, E)>;
 
 /// Every block of `v` sits at its own height and commits to the others below it.
@@ -38,7 +37,8 @@ pub open spec fn logs_ascending<E>(l: Seq<(u32, E)>) -> bool {
     forall|i: int, j: int| #![trigger l[i], l[j]] 0 <= i < j < l.len() ==> l[i].0 < l[j].0
 }
 
-/// A1 for one view a source of type `S` presents: `chain` plus strictly ascending logs.
+/// Hash commitment for one view a source of type `S` presents: `chain` plus strictly
+/// ascending logs.
 pub open spec fn a1<S: ?Sized, E>(v: ChainView) -> bool {
     &&& chain(v)
     &&& forall|n: u64| v.contains_key(n) ==> logs_ascending(#[trigger] logs::<S, E>(v[n].hash))
@@ -85,7 +85,7 @@ pub open spec fn before(n: u64) -> Option<Position> {
     }
 }
 
-/// Logs of `v`'s blocks with `a < pos <= c`, ascending (T6c, T7).
+/// Logs of `v`'s blocks with `a < pos <= c`, ascending.
 pub open spec fn canon<S: ?Sized, E>(v: ChainView, a: Option<Position>, c: Option<Position>) -> Seq<
     (Position, E),
 > {
@@ -103,14 +103,14 @@ pub open spec fn canon<S: ?Sized, E>(v: ChainView, a: Option<Position>, c: Optio
     }
 }
 
-/// `ring[i]` is the ancestor that every later entry commits to (T4c, T7).
+/// `ring[i]` is the ancestor that every later entry commits to.
 pub open spec fn ring_chain(r: Seq<BlockRef>) -> bool {
     forall|i: int, j: int|
         #![trigger r[i], r[j]]
         0 <= i < j < r.len() ==> r[i] == anc(r[j].hash, r[i].number)
 }
 
-/// Every ring entry is `v`'s block at its height (T7).
+/// Every ring entry is `v`'s block at its height.
 pub open spec fn ring_in(r: Seq<BlockRef>, v: ChainView) -> bool {
     forall|i: int|
         0 <= i < r.len() ==> v.contains_key(#[trigger] r[i].number) && v[r[i].number] == r[i]
@@ -125,7 +125,7 @@ pub open spec fn observes(r: Seq<BlockRef>, n: u64) -> bool {
     exists|i: int| 0 <= i < r.len() && #[trigger] r[i].number == n
 }
 
-/// Position order: block, then log index (T1).
+/// Position order: block, then log index.
 pub open spec fn lt(a: Position, b: Position) -> bool {
     a.block < b.block || (a.block == b.block && a.log_index < b.log_index)
 }
@@ -147,14 +147,14 @@ pub open spec fn opt_le(a: Option<Position>, b: Option<Position>) -> bool {
     opt_lt(a, b) || a == b
 }
 
-/// T1: `lt` is irreflexive.
+/// `lt` is irreflexive.
 pub proof fn lemma_lt_irreflexive(a: Position)
     ensures
         !lt(a, a),
 {
 }
 
-/// T1: `lt` is transitive.
+/// `lt` is transitive.
 pub proof fn lemma_lt_transitive(a: Position, b: Position, c: Position)
     requires
         lt(a, b),
@@ -164,7 +164,7 @@ pub proof fn lemma_lt_transitive(a: Position, b: Position, c: Position)
 {
 }
 
-/// T1: exactly one of `lt(a, b)`, `a == b`, `lt(b, a)`.
+/// Exactly one of `lt(a, b)`, `a == b`, `lt(b, a)`.
 pub proof fn lemma_lt_trichotomous(a: Position, b: Position)
     ensures
         lt(a, b) || a == b || lt(b, a),
@@ -173,7 +173,7 @@ pub proof fn lemma_lt_trichotomous(a: Position, b: Position)
 {
 }
 
-/// T1 lifted: `opt_lt` is a strict total order too.
+/// `opt_lt` is a strict total order too.
 pub proof fn lemma_opt_lt_order(a: Option<Position>, b: Option<Position>, c: Option<Position>)
     ensures
         !opt_lt(a, a),
@@ -183,21 +183,21 @@ pub proof fn lemma_opt_lt_order(a: Option<Position>, b: Option<Position>, c: Opt
 {
 }
 
-/// Positions strictly `lt`-ascending (T2, T3c).
+/// Positions strictly `lt`-ascending.
 pub open spec fn lt_sorted<E>(s: Seq<(Position, E)>) -> bool {
     forall|i: int, j: int| #![trigger s[i], s[j]] 0 <= i < j < s.len() ==> lt(s[i].0, s[j].0)
 }
 
-/// Entries strictly after cursor `c` (T3b dedup).
+/// Entries strictly after cursor `c`.
 pub open spec fn newer<E>(c: Option<Position>, s: Seq<(Position, E)>) -> Seq<(Position, E)> {
     s.filter(|x: (Position, E)| opt_lt(c, Some(x.0)))
 }
 
-/// Abstract state view of a fold (A3). `int` stands in for the fold's state space, which
+/// Abstract state view of a fold. `int` stands in for the fold's state space, which
 /// is countable; Clone, Halt, and `fold_mut` edits preserve it.
 pub uninterp spec fn fview<F: ?Sized>(f: &F) -> int;
 
-/// Transition of fold type `F` (A3); `Fold::apply` refines it.
+/// Transition of fold type `F`; `Fold::apply` refines it.
 pub uninterp spec fn step<F: ?Sized, E, Er>(v: int, pos: Position, e: E) -> (
     int,
     Result<(), FoldError<Er>>,
@@ -230,7 +230,7 @@ pub open spec fn run<F: ?Sized, E, Er>(s: (int, bool), log: Seq<(Position, E)>) 
     }
 }
 
-/// Plan `fold(f, log)`: the view after folding `log` into `v` (T3f, T5d, T6c, T7).
+/// The view after folding `log` into `v`.
 pub open spec fn fold<F: ?Sized, E, Er>(v: int, log: Seq<(Position, E)>) -> int {
     run::<F, E, Er>((v, false), log).0
 }
@@ -263,10 +263,10 @@ pub proof fn lemma_run_concat<F: ?Sized, E, Er>(
     }
 }
 
-/// The view source `S` presents at one instant (A1, A2).
+/// The view source `S` presents at one instant.
 pub uninterp spec fn sview<S: ?Sized>(s: &S) -> ChainView;
 
-/// Points of the offers sink `K` has taken since its last `reset` (A4).
+/// Points of the offers sink `K` has taken since its last `reset`.
 pub uninterp spec fn sink_offered<K: ?Sized>(k: &K) -> Set<Position>;
 
 pub struct SlotView {
@@ -282,7 +282,7 @@ pub open spec fn live(s: SlotView, ring: Seq<BlockRef>) -> bool {
     }
 }
 
-/// Plan `EngineView`; `slots` has one entry per slot (K), oldest stored first, None
+/// `slots` has one entry per slot (K), oldest stored first, None
 /// where nothing is stored.
 pub struct EngineView {
     pub fold: int,
@@ -296,7 +296,7 @@ pub struct EngineView {
 }
 
 impl EngineView {
-    /// The view-level clauses of plan `wf(Engine)`; `Engine::wf` adds the ring and
+    /// The view-level clauses of `Engine::wf`, which adds the ring and
     /// slot representation.
     pub open spec fn wf(self) -> bool {
         &&& ring_ascending(self.ring)
@@ -334,7 +334,7 @@ impl EngineView {
         }
     }
 
-    /// `Engine::durable_point` (T6a).
+    /// `Engine::durable_point`.
     pub open spec fn durable_point(self) -> Option<Position> {
         match self.oldest_live_from(0) {
             Some(k) => self.slots[k].unwrap().cursor,
@@ -342,7 +342,7 @@ impl EngineView {
         }
     }
 
-    /// Plan wf clause "a live slot's ring entry is unchanged since the slot was stored",
+    /// A live slot's ring entry is unchanged since the slot was stored,
     /// over ghost `anchors`: the ring entry of each slot's cursor block when it was stored.
     pub open spec fn anchored(self, anchors: Seq<Option<BlockRef>>) -> bool {
         &&& anchors.len() == self.slots.len()
@@ -396,7 +396,7 @@ impl<E> BatchView<E> {
         BlockRef { number: self.blocks[i], hash: self.hashes[i] }
     }
 
-    /// T2: what `validate` accepts.
+    /// What `validate` accepts.
     pub open spec fn shaped(self) -> bool {
         &&& forall|i: int, j: int|
             #![trigger self.blocks[i], self.blocks[j]]
@@ -439,13 +439,13 @@ impl<E> BatchView<E> {
         }
     }
 
-    /// Plan `positions(b)`, with the events: every event of the batch in lane order.
+    /// Every position of the batch with its event: of the batch in lane order.
     pub open spec fn flat(self) -> Seq<(Position, E)> {
         self.flat_upto(self.ends.len() as int)
     }
 }
 
-/// `BlockRing::push` (T4a): append `b`, evicting the oldest entry when `r` holds `w`.
+/// `BlockRing::push`: append `b`, evicting the oldest entry when `r` holds `w`.
 pub open spec fn ring_push(r: Seq<BlockRef>, w: int, b: BlockRef) -> Seq<BlockRef> {
     if r.len() < w {
         r.push(b)
@@ -455,25 +455,25 @@ pub open spec fn ring_push(r: Seq<BlockRef>, w: int, b: BlockRef) -> Seq<BlockRe
 }
 
 /// `k` is the length of `r`'s prefix numbered at or below `n`; with `ring_ascending(r)`
-/// it is unique (T4a `truncate_above`/`len_at_or_below`, T5c `ring|<=t.block`).
+/// it is unique.
 pub open spec fn prefix_at_or_below(r: Seq<BlockRef>, n: u64, k: int) -> bool {
     &&& 0 <= k <= r.len()
     &&& forall|i: int| 0 <= i < k ==> #[trigger] r[i].number <= n
     &&& forall|i: int| k <= i < r.len() ==> #[trigger] r[i].number > n
 }
 
-/// View `v` holds block `b` at its height (T4c: a probe confirms a ring entry).
+/// View `v` holds block `b` at its height: a probe confirms a ring entry.
 pub open spec fn confirms(v: ChainView, b: BlockRef) -> bool {
     header(v, b.number) == Some(b)
 }
 
 /// `v` holds every height below each height it holds, as a chain from genesis does
-/// (T4c hypothesis; `chain` alone does not force it).
+/// (a bisection optimality hypothesis; `chain` alone does not force it).
 pub open spec fn down_closed(v: ChainView) -> bool {
     forall|n: u64, m: u64| #[trigger] v.contains_key(n) && m <= n ==> #[trigger] v.contains_key(m)
 }
 
-/// `k` is the longest prefix of `r` that `v` confirms entry by entry (T4c optimality).
+/// `k` is the longest prefix of `r` that `v` confirms entry by entry.
 pub open spec fn confirmed_prefix(r: Seq<BlockRef>, v: ChainView, k: int) -> bool {
     &&& 0 <= k <= r.len()
     &&& forall|i: int| 0 <= i < k ==> confirms(v, #[trigger] r[i])
@@ -481,10 +481,10 @@ pub open spec fn confirmed_prefix(r: Seq<BlockRef>, v: ChainView, k: int) -> boo
 }
 
 /// The views that answered each call on source `S` so far, oldest first; every `Source`
-/// call appends `sview` of its post-state (A2 bookkeeping, T4c).
+/// call appends `sview` of its post-state.
 pub uninterp spec fn sview_log<S: ?Sized>(s: &S) -> Seq<ChainView>;
 
-/// Entries of log `l` at or below cursor `c`: the prefix a checkpoint at `c` folded (T5d).
+/// Entries of log `l` at or below cursor `c`: the prefix a checkpoint at `c` folded.
 /// Drops from the end while the last entry is after `c`.
 pub open spec fn upto<E>(l: Seq<(Position, E)>, c: Option<Position>) -> Seq<(Position, E)>
     decreases l.len(),
@@ -561,7 +561,7 @@ pub proof fn lemma_upto_upto<E>(l: Seq<(Position, E)>, c: Option<Position>, t: O
     }
 }
 
-/// Appending entries after `c` leaves `upto(_, c)` alone (P5: apply keeps slot folds).
+/// Appending entries after `c` leaves `upto(_, c)` alone, so apply keeps slot folds.
 pub proof fn lemma_upto_append<E>(l: Seq<(Position, E)>, m: Seq<(Position, E)>, c: Option<Position>)
     requires
         forall|i: int| 0 <= i < m.len() ==> opt_lt(c, Some(#[trigger] m[i].0)),
@@ -586,7 +586,7 @@ pub proof fn lemma_upto_append<E>(l: Seq<(Position, E)>, m: Seq<(Position, E)>, 
     }
 }
 
-/// Slot `s` can serve a rollback to block `a` (T5b).
+/// Slot `s` can serve a rollback to block `a`.
 pub open spec fn qualifies(s: SlotView, a: u64) -> bool {
     match s.cursor {
         Some(c) => c.block <= a,
@@ -610,7 +610,7 @@ pub open spec fn live_count(slots: Seq<Option<SlotView>>, ring: Seq<BlockRef>, n
 }
 
 /// The engine a snapshot of `(fold, cursor, ring)` decodes to with `slots` empty slots:
-/// `Engine::decode_snapshot`'s `restored` shape (T6c).
+/// `Engine::decode_snapshot`'s `restored` shape.
 pub open spec fn snapshot_view(fold: int, cursor: Option<Position>, ring: Seq<BlockRef>, slots: nat) -> EngineView {
     EngineView {
         fold,
@@ -625,7 +625,7 @@ pub open spec fn snapshot_view(fold: int, cursor: Option<Position>, ring: Seq<Bl
 }
 
 impl EngineView {
-    /// Plan T5d `Inv`, over ghost `init` (the fold view at the last rewind) and `log` (the
+    /// `Inv`, over ghost `init` (the fold view at the last rewind) and `log` (the
     /// entries `F::apply` ran on since, in call order). While Active the log is at or
     /// below the cursor and has not stopped; each stored slot folded `upto(log, cursor)`.
     pub open spec fn inv<F: ?Sized, E, Er>(self, init: int, log: Seq<(Position, E)>) -> bool {
@@ -642,7 +642,7 @@ impl EngineView {
             ) == (self.slots[k].unwrap().fold, false)
     }
 
-    /// T5b: slot `k` is the one `rollback_at_or_below(a)` restores: live and qualifying,
+    /// Slot `k` is the one `rollback_at_or_below(a)` restores: live and qualifying,
     /// and the newest stored such slot.
     pub open spec fn rollback_target(self, a: u64, k: int) -> bool {
         &&& self.live_at(k)
@@ -707,7 +707,7 @@ impl EngineView {
         self.slots[self.oldest_live_from(0).unwrap()].unwrap()
     }
 
-    /// T6c: what `encode_durable_snapshot` writes, as the engine it decodes to: the
+    /// What `encode_durable_snapshot` writes, as the engine it decodes to: the
     /// oldest live slot's fold and cursor, and the ring prefix of length `k` at or below
     /// the cursor block (`len_at_or_below`'s ensures give `k`).
     pub open spec fn durable_snapshot(self, k: int, slots: nat) -> EngineView {
@@ -732,7 +732,7 @@ pub proof fn lemma_oldest_live_from(v: EngineView, j: int)
     }
 }
 
-/// T6a: the durable point never passes the cursor.
+/// The durable point never passes the cursor.
 pub proof fn lemma_durable_point_le_cursor(v: EngineView)
     requires
         v.wf(),
@@ -745,7 +745,7 @@ pub proof fn lemma_durable_point_le_cursor(v: EngineView)
     }
 }
 
-/// T6c, encode side: the durable snapshot of a `wf` engine is `wf`, its cursor is the
+/// The durable snapshot of a `wf` engine is `wf`, its cursor is the
 /// durable point, and its ring is a prefix of the engine's (so it fits the window).
 pub proof fn lemma_durable_snapshot(v: EngineView, k: int, slots: nat)
     requires
@@ -778,8 +778,8 @@ pub proof fn lemma_durable_snapshot(v: EngineView, k: int, slots: nat)
     assert(ring_ascending(snap.ring));
 }
 
-/// T6c, encode side, `Inv`: the durable snapshot satisfies `Inv` from the same `init`
-/// over `upto(log, d)`, the log prefix its slot folded (clause 4 at the oldest live slot).
+/// The durable snapshot satisfies `Inv` from the same `init` over `upto(log, d)`, the log
+/// prefix its slot folded (the slot clause of `inv` at the oldest live slot).
 pub proof fn lemma_durable_snapshot_inv<F: ?Sized, E, Er>(
     v: EngineView,
     k: int,
@@ -809,7 +809,7 @@ pub proof fn lemma_durable_snapshot_inv<F: ?Sized, E, Er>(
 }
 
 impl<E> BatchView<E> {
-    /// Span `i` as source entries `(block, log_index, event)`, in lane order (P8).
+    /// Span `i` as source entries `(block, log_index, event)`, in lane order.
     pub open spec fn span_triples(self, i: int) -> Seq<(BlockRef, u32, E)> {
         let start = self.start(i);
         if self.ends[i] < start {
@@ -840,9 +840,9 @@ impl<E> BatchView<E> {
 }
 
 
-// P5: engine apply (T3).
+// Engine apply.
 
-/// Prefix of `s` through its first stopping step: the entries `F::apply` runs on (T3b).
+/// Prefix of `s` through its first stopping step: the entries `F::apply` runs on.
 pub open spec fn applied<F: ?Sized, E, Er>(v: int, s: Seq<(Position, E)>) -> Seq<(Position, E)>
     decreases s.len(),
 {
@@ -894,7 +894,7 @@ pub open spec fn accepted<E>(v: EngineView, b: BatchView<E>) -> bool {
     &&& !forked(v, b)
 }
 
-/// T3b: the entries `apply_batch` runs `F::apply` on, in call order.
+/// The entries `apply_batch` runs `F::apply` on, in call order.
 pub open spec fn calls<F: ?Sized, E, Er>(v: EngineView, b: BatchView<E>) -> Seq<(Position, E)> {
     if accepted(v, b) {
         applied::<F, E, Er>(v.fold, newer(v.cursor, b.flat()))
@@ -1276,7 +1276,7 @@ pub open spec fn checked_freshness<E>(v: EngineView, b: BatchView<E>) -> Option<
     }
 }
 
-/// T3e ring: the ring gains exactly the blocks of the spans above the old cursor block
+/// The ring gains exactly the blocks of the spans above the old cursor block
 /// and at or below the new one; freshness is the newest gained block, or the checked
 /// boundary when none was gained.
 pub open spec fn ring_after<E>(v: EngineView, post: EngineView, b: BatchView<E>, w: int) -> bool {
@@ -1295,7 +1295,7 @@ pub open spec fn ring_after<E>(v: EngineView, post: EngineView, b: BatchView<E>,
         }
 }
 
-/// T3d: when no position of `b` is after the cursor, applying `b` calls the fold zero
+/// When no position of `b` is after the cursor, applying `b` calls the fold zero
 /// times; with `lemma_split_unique`, `apply_batch` then keeps fold, cursor and ring.
 pub proof fn lemma_idempotent<F: ?Sized, E, Er>(v: EngineView, b: BatchView<E>)
     requires
@@ -1310,9 +1310,9 @@ pub proof fn lemma_idempotent<F: ?Sized, E, Er>(v: EngineView, b: BatchView<E>)
 }
 
 
-// P8c: driver end-to-end (T7).
+// Driver end to end.
 
-/// View `v` holds every height in `[lo, hi]` (T7; weaker than `down_closed`).
+/// View `v` holds every height in `[lo, hi]` (weaker than `down_closed`).
 pub open spec fn holds(v: ChainView, lo: u64, hi: u64) -> bool {
     forall|n: u64| lo <= n <= hi ==> #[trigger] v.contains_key(n)
 }
@@ -1542,7 +1542,7 @@ pub proof fn lemma_re_agree<S: ?Sized, E>(v: ChainView, u: ChainView, lo: int, h
     }
 }
 
-/// Under A1 the entries of a range are strictly ascending by position.
+/// Under `a1` the entries of a range are strictly ascending by position.
 pub proof fn lemma_re_sorted<S: ?Sized, E>(v: ChainView, lo: int, hi: int)
     requires
         a1::<S, E>(v),
@@ -1642,7 +1642,7 @@ pub proof fn lemma_sorted_unique<E>(s: Seq<(BlockRef, u32, E)>, t: Seq<(BlockRef
     }
 }
 
-/// Positioned entries of a range are `lt_sorted` under A1.
+/// Positioned entries of a range are `lt_sorted` under `a1`.
 pub proof fn lemma_pe_sorted<S: ?Sized, E>(v: ChainView, lo: int, hi: int)
     requires
         a1::<S, E>(v),
@@ -1797,7 +1797,7 @@ pub proof fn lemma_canon_upto<S: ?Sized, E>(v: ChainView, a: Option<Position>, c
 }
 
 
-/// T7 apply step: extending a complete cursor `co` (or the anchor) to a complete `cn`
+/// Apply step: extending a complete cursor `co` (or the anchor) to a complete `cn`
 /// appends the positioned entries of the heights between.
 pub proof fn lemma_canon_extend<S: ?Sized, E>(
     v: ChainView,
@@ -1949,7 +1949,7 @@ pub proof fn lemma_newer_after<E>(c: Option<Position>, s: Seq<(Position, E)>)
     }
 }
 
-/// Apply never moves the cursor back (T6b floor through apply).
+/// Apply never moves the cursor back.
 pub proof fn lemma_cursor_advances<F: ?Sized, E, Er>(v: EngineView, b: BatchView<E>)
     ensures
         opt_le(v.cursor, cursor_after(v.cursor, ok_calls::<F, E, Er>(v, b))),

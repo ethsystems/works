@@ -354,13 +354,13 @@ impl<F: Fold> Engine<F> {
         ensures
             final(self).wf(),
             final(self).window() == old(self).window(),
-            // T3a: a rejection changes nothing but the checked freshness.
+            // A rejection changes nothing but the checked freshness.
             r matches Err(e) && !(e is Halted || e is Poisoned) ==> !accepted(old(self)@, batch@)
                 && final(self)@ == (EngineView {
                 last_verified: checked_freshness(old(self)@, batch@),
                 ..old(self)@
             }),
-            // T3e: unreachable under wf.
+            // Unreachable under wf.
             !(r matches Err(ApplyError::CursorBlockUnobserved { .. })),
             r matches Err(ApplyError::NotActive { .. }) ==> !(old(self)@.status is Active),
             r is Ok ==> accepted(old(self)@, batch@) && final(self)@.status == old(self)@.status,
@@ -374,7 +374,7 @@ impl<F: Fold> Engine<F> {
                 final(self)@.status,
                 calls::<F, F::Event, F::Error>(old(self)@, batch@).last().0,
             )),
-            // T3b, T3f: the fold ran on `calls`, and the counts split the batch.
+            // The fold ran on `calls`, and the counts split the batch.
             final(self)@.fold == fold::<F, F::Event, F::Error>(
                 old(self)@.fold,
                 calls::<F, F::Event, F::Error>(old(self)@, batch@),
@@ -383,7 +383,7 @@ impl<F: Fold> Engine<F> {
                 old(self)@.cursor,
                 batch@.flat(),
             ).len() && s.applied + s.skipped == newer(old(self)@.cursor, batch@.flat()).len(),
-            // T3e: cursor and ring.
+            // Cursor and ring.
             final(self)@.cursor == cursor_after(
                 old(self)@.cursor,
                 ok_calls::<F, F::Event, F::Error>(old(self)@, batch@),
@@ -397,9 +397,9 @@ impl<F: Fold> Engine<F> {
             final(self)@.slots == old(self)@.slots,
             final(self)@.resets == old(self)@.resets,
             old(self)@.status is Unrecoverable ==> final(self)@.status == old(self)@.status,
-            // T3d: after Ok nothing of the batch is newer than the cursor.
+            // After Ok nothing of the batch is newer than the cursor.
             r is Ok ==> newer(final(self)@.cursor, batch@.flat()).len() == 0,
-            // T5a/T5d threading.
+            // `Inv` and the slot anchors carry over.
             forall|init: int, log: Seq<(Position, F::Event)>|
                 #[trigger] old(self)@.inv::<F, F::Event, F::Error>(init, log) ==> final(self)@.inv::<F, F::Event, F::Error>(init, log + calls::<F, F::Event, F::Error>(old(self)@, batch@)),
             forall|a: Seq<Option<BlockRef>>|
@@ -701,8 +701,8 @@ impl<F: Fold> Engine<F> {
             r matches Err(RollbackError::Unrecoverable { .. }) ==> old(self)@.status is Unrecoverable,
             // Unrecoverable is left only by `reset`: rollback refuses it.
             old(self)@.status is Unrecoverable ==> r is Err,
-            // T5b: the target is the newest stored qualifying live slot, whose cursor is the
-            // maximum over them; T5c: the post-state.
+            // The target is the newest stored qualifying live slot, whose cursor is the
+            // maximum over them, and the post-state.
             r matches Ok(t) ==> exists|k: int|
                 #[trigger] old(self)@.rollback_target(block, k) && {
                     let (pre, post) = (old(self)@, final(self)@);
@@ -727,7 +727,7 @@ impl<F: Fold> Engine<F> {
             r matches Ok(t) ==> forall|j: int|
                 #[trigger] old(self)@.live_at(j) && qualifies(old(self)@.slots[j].unwrap(), block)
                     ==> opt_le(old(self)@.slots[j].unwrap().cursor, t),
-            // T5d: `Inv` holds over the log truncated at the restored cursor.
+            // `Inv` holds over the log truncated at the restored cursor.
             r is Ok ==> forall|init: int, log: Seq<(Position, F::Event)>|
                 #[trigger] old(self)@.inv::<F, F::Event, F::Error>(init, log) ==> final(self)@.inv::<F, F::Event, F::Error>(init, upto::<F::Event>(log, final(self)@.cursor)),
             forall|a: Seq<Option<BlockRef>>|
@@ -2287,7 +2287,7 @@ impl<F> Engine<F> {
         self.ring.cap()
     }
 
-    /// Plan `wf(Engine)`: ring and slot representation plus the view-level clauses.
+    /// Ring and slot representation plus the view-level clauses.
     pub closed spec fn wf(&self) -> bool {
         &&& self.ring.wf()
         &&& self.checkpoints.wf()
@@ -2306,7 +2306,7 @@ impl<F> Engine<F> {
         self.ring.lemma_wf();
     }
 
-    /// T6a: in a `wf` engine the durable point never passes the cursor.
+    /// In a `wf` engine the durable point never passes the cursor.
     pub(crate) proof fn lemma_durable_point_le_cursor(&self)
         requires
             self.wf(),
@@ -2953,7 +2953,7 @@ proof fn lemma_post_ring<E>(v0: EngineView, bv: BatchView<E>, w: int, i0: int, p
     }
 }
 
-/// T5d `Inv` across an apply that ran the fold on `c`.
+/// `Inv` across an apply that ran the fold on `c`.
 proof fn lemma_post_inv<F: Fold>(v0: EngineView, post: EngineView, c: Seq<(Position, F::Event)>)
     requires
         v0.wf(),
@@ -3065,7 +3065,8 @@ proof fn lemma_post_anchors(v0: EngineView, post: EngineView)
     }
 }
 
-/// The final clauses of an accepted batch: ring, `Inv`, anchors and T3d.
+/// The final clauses of an accepted batch: ring, `Inv`, anchors and no entry newer than
+/// the cursor.
 proof fn lemma_apply_post<F: Fold>(
     v0: EngineView,
     bv: BatchView<F::Event>,
@@ -3141,7 +3142,7 @@ spec fn dropped(s: Option<SlotView>, t: Option<Position>) -> Option<SlotView> {
     }
 }
 
-/// T5a and T5d for `checkpoint`: storing the cursor keeps `wf`, `Inv` over the same log,
+/// `checkpoint` over the views: storing the cursor keeps `wf`, `Inv` over the same log,
 /// and the anchors with the new slot anchored at the ring tip.
 proof fn lemma_checkpoint_view<F: Fold>(pre: EngineView, post: EngineView)
     requires
@@ -3231,7 +3232,7 @@ proof fn lemma_checkpoint_view<F: Fold>(pre: EngineView, post: EngineView)
     }
 }
 
-/// T5a, T5b and T5d for `rollback_at_or_below`, over the views.
+/// `wf`, the rollback target and `Inv` for `rollback_at_or_below`, over the views.
 proof fn lemma_rollback_view<F: Fold>(pre: EngineView, post: EngineView, block: u64, k: int)
     requires
         pre.wf(),
@@ -3273,7 +3274,8 @@ proof fn lemma_rollback_view<F: Fold>(pre: EngineView, post: EngineView, block: 
         == pre.slots[j] && opt_le(post.slots[j].unwrap().cursor, t) by {
         lemma_opt_lt_order(t, pre.slots[j].unwrap().cursor, None);
     }
-    // T5b max: newer qualifying slots are excluded, older ones are ordered below slot k.
+    // The target is the maximum: newer qualifying slots are excluded, older ones are
+    // ordered below slot k.
     assert forall|j: int| #[trigger] pre.live_at(j) && qualifies(pre.slots[j].unwrap(), block) implies opt_le(
         pre.slots[j].unwrap().cursor,
         t,

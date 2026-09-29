@@ -98,7 +98,7 @@ pub const SNAPSHOT_VERSION: u16 = 1;
 
 /// Fold state with a canonical byte encoding and an identity tag.
 // No spec: decode checks the bytes it gets from `decode_state`'s caller, and treats the
-// decoded fold as opaque (its view is whatever `decode_state` returns; A5).
+// decoded fold as opaque (its view is whatever `decode_state` returns).
 #[cfg_attr(verus_keep_ghost, verus_verify)]
 pub trait Persist: Fold + Sized {
     /// Identifies the fold type and its state format; mismatch refuses to load.
@@ -401,7 +401,7 @@ impl<F: Persist> Engine<F> {
     }
 
     /// The durable snapshot's envelope and point: the oldest live slot's fold and
-    /// cursor, and the ring entries at or below the cursor block (T6c).
+    /// cursor, and the ring entries at or below the cursor block.
     #[cfg_attr(verus_keep_ghost, verus_spec(r =>
         requires
             self.wf(),
@@ -428,7 +428,7 @@ impl<F: Persist> Engine<F> {
 #[cfg_attr(verus_keep_ghost, cfg_eval, verus_verify)]
 impl<F: Persist> Engine<F> {
     /// Rebuilds an engine from an envelope; checkpoints, skips, freshness start empty.
-    // T6c: any bytes that decode give a `wf` engine, with no trust in the codec or the
+    // Any bytes that decode give a `wf` engine, with no trust in the codec or the
     // checksum (both have empty contracts in tcb.rs). Every `Err` path is panic-free.
     #[cfg_attr(verus_keep_ghost, verus_spec(r =>
         ensures
@@ -625,7 +625,7 @@ pub open spec fn from_lanes(
     &&& ring_from_lanes(v.ring, numbers, hashes, numbers.len() as int)
 }
 
-/// T6c, decode side: what `decode_snapshot` returns. Nothing but the fold, cursor and
+/// What `decode_snapshot` returns. Nothing but the fold, cursor and
 /// ring comes from the bytes; the cursor and ring are some envelope's fields, and the
 /// ring fits the configured window.
 pub open spec fn restored(v: EngineView, config: EngineConfig) -> bool {
@@ -657,7 +657,7 @@ spec fn cursor_lanes(cursor: Option<Position>) -> (u8, u64, u64) {
 }
 
 /// `e` is the envelope encode builds for `cursor` and `ring`. Its state bytes are the
-/// fold's own encoding (A5).
+/// fold's own encoding, which is trusted.
 spec fn encodes<F: Persist, T: View<V = Seq<u8>>>(e: Envelope<T>, cursor: Option<Position>, ring: Seq<BlockRef>) -> bool {
     &&& e.magic == SNAPSHOT_MAGIC
     &&& e.version == SNAPSHOT_VERSION
@@ -666,7 +666,7 @@ spec fn encodes<F: Persist, T: View<V = Seq<u8>>>(e: Envelope<T>, cursor: Option
     &&& lanes(ring, e.ring_numbers@, e.ring_hashes@)
 }
 
-/// `e` encodes `v`'s durable snapshot (T6c): the durable point, and the ring prefix at or
+/// `e` encodes `v`'s durable snapshot: the durable point, and the ring prefix at or
 /// below its block, whose length is the lane length.
 spec fn durable_encodes<F: Persist, T: View<V = Seq<u8>>>(v: EngineView, e: Envelope<T>) -> bool {
     let k = e.ring_numbers@.len() as int;
@@ -731,8 +731,8 @@ proof fn lemma_envelope_round_trip<F: Persist, T: View<V = Seq<u8>>>(
     }
 }
 
-/// T6c round trip: decoding the envelope `encode_durable_snapshot` builds gives back the
-/// durable snapshot's view, bar the fold (A5), for a config whose window holds the ring.
+/// Round trip: decoding the envelope `encode_durable_snapshot` builds gives back the
+/// durable snapshot's view, bar the fold, for a config whose window holds the ring.
 proof fn lemma_durable_round_trip<F: Persist, T: View<V = Seq<u8>>>(v: EngineView, e: Envelope<T>, config: EngineConfig)
     requires
         v.wf(),

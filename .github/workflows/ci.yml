@@ -106,7 +106,7 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
 
-  # chainfold proofs (pm#423). CI uses the x86 release; see verus-gates.py for
+  # chainfold proofs. CI uses the x86 release; see verus-gates.py for
   # what the static gates catch that Verus itself does not. Never cache target/:
   # stale Verus artifacts can skip verification.
   verus:
@@ -115,7 +115,7 @@ jobs:
     env:
       VERUS_VERSION: 0.2026.09.20.aef82ed
       VERUS_SHA256: 7b870fa12bc589015c2fab60a8b3d9f07c7b1adb3444eb0fadffcbf7f0447b33
-      # Raise with each phase that adds proofs (P5, P8), so dropped proofs fail the job.
+      # Raise whenever proofs are added, so dropped proofs fail the job.
       VERUS_MIN_VERIFIED: 304
     steps:
       - uses: actions/checkout@v7

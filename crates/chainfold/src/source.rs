@@ -31,8 +31,8 @@ pub enum ReplayHorizon {
 }
 
 /// Random-access event supply over one chain.
-// A1/A2: each call answers from one view, `sview` of the source after the call, and every
-// view satisfies `a1`. `sview_log` records those views in call order. Implementations are
+// Each call answers from one view, `sview` of the source after the call, and every view
+// satisfies `a1`. `sview_log` records those views in call order. Implementations are
 // trusted to meet this spec.
 #[cfg_attr(verus_keep_ghost, verus_verify)]
 pub trait Source {

@@ -408,8 +408,7 @@ pub(crate) fn first_descent<T: Ord>(values: &[T]) -> Option<usize> {
         proof_decl! {
             let ghost before = ascending;
         }
-        // Verus rejects `&` on bool; this u8 spelling compiles to the same code as `&=`
-        // (tasks/chainfold-perf-p3.md).
+        // Verus rejects `&` on bool; this u8 spelling compiles to the same code as `&=`.
         let rises = values[i - 1] < values[i];
         ascending = (ascending as u8 & rises as u8) != 0;
         #[cfg(verus_keep_ghost)]
@@ -687,7 +686,7 @@ pub open spec fn ascending_upto<T: PartialOrd>(v: Seq<T>, n: int) -> bool {
 }
 
 /// `r` is what `first_descent(v)` returns: None when `v` ascends strictly, else the least
-/// `i >= 1` with `v[i] <= v[i-1]` (T2).
+/// `i >= 1` with `v[i] <= v[i-1]`.
 pub open spec fn descent_result<T: PartialOrd>(v: Seq<T>, r: Option<usize>) -> bool {
     match r {
         None => ascending_upto(v, v.len() as int),
@@ -780,7 +779,7 @@ pub open spec fn spans_ok_upto<E>(b: BatchView<E>, n: int) -> bool {
 }
 
 /// Each `validate` error names the first violation, checking blocks first and then
-/// spans in order (T2).
+/// spans in order.
 pub open spec fn validate_names_first<E>(b: BatchView<E>, r: Result<(), BatchShapeError>) -> bool {
     match r {
         Ok(()) => true,
@@ -1012,7 +1011,7 @@ pub(crate) proof fn lemma_span_of<E>(b: BatchView<E>, n: int, k: int) -> (i: int
     }
 }
 
-/// T2: a shaped batch's flattened positions are strictly `lt`-ascending.
+/// A shaped batch's flattened positions are strictly `lt`-ascending.
 pub(crate) proof fn lemma_shaped_sorted<E>(b: BatchView<E>)
     requires
         b.wf(),

@@ -69,32 +69,32 @@ required-features = ["tokio", "storage", "test-helpers"]
 verify = true
 
 # Read by .github/scripts/verus-gates.py: every fn in an in-scope file must be
-# verified or listed here with the phase that verifies it.
+# verified or listed here with the reason it is not.
 [package.metadata.verus-gates]
 in-scope = ["src/ring.rs", "src/position.rs", "src/batch.rs", "src/checkpoint.rs", "src/engine.rs", "src/snapshot.rs", "src/driver.rs", "src/error.rs", "src/fold.rs", "src/sink.rs", "src/source.rs"]
 
 [package.metadata.verus-gates.out-of-scope]
-"src/batch.rs::BatchShapeError::fmt" = "Display (plan section 5)"
-"src/engine.rs::Engine::fold_mut" = "A3: returns &mut F, edits must keep fview"
-"src/snapshot.rs::crc32c" = "A6"
-"src/error.rs::FoldError::fmt" = "Display (plan section 5)"
-"src/error.rs::EngineStatus::fmt" = "Display (plan section 5)"
-"src/error.rs::DivergenceCause::fmt" = "Display (plan section 5)"
-"src/error.rs::DurabilityLost::fmt" = "Display (plan section 5)"
-"src/error.rs::ConfigError::fmt" = "Display (plan section 5)"
-"src/error.rs::ApplyError::fmt" = "Display (plan section 5)"
-"src/error.rs::RollbackError::fmt" = "Display (plan section 5)"
-"src/error.rs::HexHash::fmt" = "Display (plan section 5)"
-"src/sink.rs::NoSink::offer" = "A4: sink impls are trusted; sink_offered is uninterpreted"
-"src/sink.rs::NoSink::durable_cursor" = "A4: sink impls are trusted; sink_offered is uninterpreted"
-"src/sink.rs::NoSink::reset" = "A4: sink impls are trusted; sink_offered is uninterpreted"
-"src/snapshot.rs::read_envelope" = "A6"
-"src/snapshot.rs::SnapshotError::fmt" = "Display (plan section 5)"
-"src/snapshot.rs::write_payload" = "A6"
-"src/snapshot.rs::trailer_bytes" = "A6"
+"src/batch.rs::BatchShapeError::fmt" = "Display impl"
+"src/engine.rs::Engine::fold_mut" = "user-maintained fold invariant (fold_mut): returns &mut F, edits must keep fview"
+"src/snapshot.rs::crc32c" = "trusted: checksum, empty contract in tcb.rs"
+"src/error.rs::FoldError::fmt" = "Display impl"
+"src/error.rs::EngineStatus::fmt" = "Display impl"
+"src/error.rs::DivergenceCause::fmt" = "Display impl"
+"src/error.rs::DurabilityLost::fmt" = "Display impl"
+"src/error.rs::ConfigError::fmt" = "Display impl"
+"src/error.rs::ApplyError::fmt" = "Display impl"
+"src/error.rs::RollbackError::fmt" = "Display impl"
+"src/error.rs::HexHash::fmt" = "Display impl"
+"src/sink.rs::NoSink::offer" = "trusted: sink impls; sink_offered is uninterpreted"
+"src/sink.rs::NoSink::durable_cursor" = "trusted: sink impls; sink_offered is uninterpreted"
+"src/sink.rs::NoSink::reset" = "trusted: sink impls; sink_offered is uninterpreted"
+"src/snapshot.rs::read_envelope" = "trusted: codec deserializer, empty contract in tcb.rs"
+"src/snapshot.rs::SnapshotError::fmt" = "Display impl"
+"src/snapshot.rs::write_payload" = "trusted: codec serializer, empty contract in tcb.rs"
+"src/snapshot.rs::trailer_bytes" = "trusted: trailer encoding, empty contract in tcb.rs"
 "src/driver.rs::DriverConfig::default" = "config constants, no claim"
 "src/driver.rs::DriverConfig::from_block" = "config constants, no claim"
-"src/driver.rs::Driver::next_delay" = "timing, no claim (plan section 5)"
+"src/driver.rs::Driver::next_delay" = "timing, no claim"
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = [
