@@ -68,10 +68,22 @@ required-features = ["tokio", "storage", "test-helpers"]
 [package.metadata.verus]
 verify = true
 
-# Read by .github/scripts/verus-gates.py: every fn in an in-scope file must be
-# verified or listed here with the reason it is not.
+# Read by .github/scripts/verus-gates.py: every file in src/ is in scope or out of
+# scope, and every fn in an in-scope file must be verified or listed here with the
+# reason it is not.
 [package.metadata.verus-gates]
-in-scope = ["src/ring.rs", "src/position.rs", "src/batch.rs", "src/checkpoint.rs", "src/engine.rs", "src/snapshot.rs", "src/driver.rs", "src/error.rs", "src/fold.rs", "src/sink.rs", "src/source.rs"]
+in-scope = ["src/ring.rs", "src/position.rs", "src/batch.rs", "src/checkpoint.rs", "src/engine.rs", "src/snapshot.rs", "src/driver.rs", "src/error.rs", "src/fold.rs", "src/sink.rs", "src/source.rs", "src/lib.rs", "src/verus/mod.rs", "src/verus/model.rs"]
+# Each spec is assumed for every impl Verus does not check (A1 to A5).
+trusted-traits = ["Fold", "Source", "SnapshotSink", "Persist"]
+
+[package.metadata.verus-gates.out-of-scope-files]
+"src/harness.rs" = "threads and async runtime"
+"src/storage.rs" = "module wiring for storage"
+"src/storage/flusher.rs" = "fsync thread; trusted as a sink (A4)"
+"src/storage/manifest.rs" = "manifest codec"
+"src/storage/store.rs" = "fsync and file layout"
+"src/storage/vfs.rs" = "filesystem calls"
+"src/test_util.rs" = "test helpers"
 
 [package.metadata.verus-gates.out-of-scope]
 "src/batch.rs::BatchShapeError::fmt" = "Display impl"
@@ -85,9 +97,6 @@ in-scope = ["src/ring.rs", "src/position.rs", "src/batch.rs", "src/checkpoint.rs
 "src/error.rs::ApplyError::fmt" = "Display impl"
 "src/error.rs::RollbackError::fmt" = "Display impl"
 "src/error.rs::HexHash::fmt" = "Display impl"
-"src/sink.rs::NoSink::offer" = "trusted: sink impls; sink_offered is uninterpreted"
-"src/sink.rs::NoSink::durable_cursor" = "trusted: sink impls; sink_offered is uninterpreted"
-"src/sink.rs::NoSink::reset" = "trusted: sink impls; sink_offered is uninterpreted"
 "src/snapshot.rs::read_envelope" = "trusted: codec deserializer, round trip in tcb.rs"
 "src/snapshot.rs::SnapshotError::fmt" = "Display impl"
 "src/snapshot.rs::write_payload" = "trusted: codec serializer, appends its bytes (tcb.rs)"

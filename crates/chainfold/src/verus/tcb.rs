@@ -1,5 +1,6 @@
 //! Trusted base. Every item here is assumed, not proved, and carries its
-//! justification. `verus-gates.py` rejects trusted constructs anywhere else.
+//! justification. `verus-gates.py` rejects trusted constructs anywhere else, and
+//! `verus-manifest.txt` pins each item here by hash.
 
 #[cfg(not(feature = "std"))]
 use alloc::{

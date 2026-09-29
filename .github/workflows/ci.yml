@@ -115,8 +115,6 @@ jobs:
     env:
       VERUS_VERSION: 0.2026.09.20.aef82ed
       VERUS_SHA256: 7b870fa12bc589015c2fab60a8b3d9f07c7b1adb3444eb0fadffcbf7f0447b33
-      # Raise whenever proofs are added, so dropped proofs fail the job.
-      VERUS_MIN_VERIFIED: 304
     steps:
       - uses: actions/checkout@v7
       - name: Static gates
@@ -143,18 +141,15 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # stdout gets chainfold's JSON report; on a fresh target dir, vstd prints its own
+          # plain results line before it. Diagnostics go to stderr.
           cargo verus verify -p chainfold --features verus,wincode \
-            --check-toolchain --fwd-verus-args-to roots 2>&1 | tee "$RUNNER_TEMP/verus.log"
-          # A cached or skipped run prints no results line and proves nothing, so require
-          # exactly one "N verified, 0 errors" line with N at or above the floor.
-          n=$(sed -nE 's/^verification results:: ([0-9]+) verified, 0 errors$/\1/p' "$RUNNER_TEMP/verus.log")
-          case "$n" in
-            '' | *[!0-9]*) echo "::error::no single 'N verified, 0 errors' line"; exit 1 ;;
-          esac
-          if [ "$n" -lt "$VERUS_MIN_VERIFIED" ]; then
-            echo "::error::$n verified, below the floor of $VERUS_MIN_VERIFIED"
-            exit 1
-          fi
+            --check-toolchain --fwd-verus-args-to roots -- --output-json --time-expanded \
+            > "$RUNNER_TEMP/verus.out"
+          # A cached or skipped run prints no report and proves nothing. The report must
+          # show 0 errors, and its verified count and verified fns must match
+          # crates/chainfold/verus-manifest.txt exactly.
+          python3 .github/scripts/verus-gates.py --results crates/chainfold "$RUNNER_TEMP/verus.out"
 
   gate:
     name: CI Gate
