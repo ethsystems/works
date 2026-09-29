@@ -535,6 +535,10 @@ pub open spec fn confirmed_prefix(r: Seq<BlockRef>, v: ChainView, k: int) -> boo
 /// call appends `sview` of its post-state.
 pub uninterp spec fn sview_log<S: ?Sized>(s: &S) -> Seq<ChainView>;
 
+/// Source `S` answers every call from this state on: `Source`'s specs keep it across a
+/// call and rule out an error under it.
+pub uninterp spec fn infallible<S: ?Sized>(s: &S) -> bool;
+
 /// Entries of log `l` at or below cursor `c`: the prefix a checkpoint at `c` folded.
 /// Drops from the end while the last entry is after `c`.
 pub open spec fn upto<E>(l: Seq<(Position, E)>, c: Option<Position>) -> Seq<(Position, E)>

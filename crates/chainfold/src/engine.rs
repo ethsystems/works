@@ -374,6 +374,9 @@ impl<F: Fold> Engine<F> {
             }),
             // Unreachable under wf.
             !(r matches Err(ApplyError::CursorBlockUnobserved { .. })),
+            r matches Err(ApplyError::Shape(_)) ==> !batch@.shaped(),
+            r matches Err(ApplyError::BoundaryNumberMismatch { .. }) ==> old(self)@.cursor is Some
+                && batch@.boundary is Some && batch@.boundary.unwrap().number != old(self)@.cursor.unwrap().block,
             r matches Err(ApplyError::NotActive { .. }) ==> !(old(self)@.status is Active),
             r is Ok ==> accepted(old(self)@, batch@) && final(self)@.status == old(self)@.status,
             accepted(old(self)@, batch@) ==> (r is Ok <==> !stopped::<F, F::Event, F::Error>(

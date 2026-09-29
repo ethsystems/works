@@ -57,10 +57,10 @@ pub assume_specification<T, A: core::alloc::Allocator>[ Vec::<T, A>::into_boxed_
         b@ == v@,
 ;
 
-// Trusted: `sort_unstable_by_key` permutes the slice (std docs; vstd has no spec). Claims
-// nothing about order, because `Batch::validate` checks it. std may call the key fn on
-// any element and may panic on an `Ord` that is not a total order, so the caller must
-// show both. Used by `group_into`.
+// Trusted: `sort_unstable_by_key` permutes the slice and leaves it in key order (std
+// docs; vstd has no spec): for two elements in order, some keys the key fn may return
+// for them are in order. std may call the key fn on any element and may panic on an
+// `Ord` that is not a total order, so the caller must show both. Used by `group_into`.
 pub assume_specification<T, K: Ord, F: FnMut(&T) -> K>[ <[T]>::sort_unstable_by_key::<K, F> ](
     v: &mut [T],
     f: F,
@@ -70,6 +70,12 @@ pub assume_specification<T, K: Ord, F: FnMut(&T) -> K>[ <[T]>::sort_unstable_by_
         vstd::laws_cmp::obeys_cmp::<K>(),
     ensures
         final(v)@.to_multiset() == old(v)@.to_multiset(),
+        forall|i: int, j: int|
+            #![trigger final(v)@[i], final(v)@[j]]
+            0 <= i < j < final(v)@.len() ==> exists|a: K, b: K|
+                #![trigger f.ensures((&final(v)@[i],), a), f.ensures((&final(v)@[j],), b)]
+                f.ensures((&final(v)@[i],), a) && f.ensures((&final(v)@[j],), b) && vstd::std_specs::cmp::OrdSpec::cmp_spec(&a, &b)
+                    != core::cmp::Ordering::Greater,
 ;
 
 // Trusted: the checksum is a function of the bytes (`crc32c_spec` is uninterpreted, so

@@ -288,6 +288,11 @@ trusted items are in `src/verus/tcb.rs`.
   from `start_block` to that entry. `dinv` also covers the scan tip: the chain it commits
   to holds nothing to fold between the cursor and the tip.
 
+  A tick returns `SourceError` only if a source call failed or the chain changed during
+  the tick: some call answered from a view other than the first call's. The engine never
+  rejects the batch a scan builds, since the batch is shaped and its boundary is at the
+  cursor block. This needs no A2. `infallible` names a source whose calls all succeed.
+
   No proof shows that a decoded snapshot is in `dinv`: that rests on the driver that
   wrote it having been in it, on the state codec (A5), and on the source still holding
   the chain its ring names. So a resumed driver has T7 only as far as its engine is in
@@ -356,10 +361,10 @@ lagging node at the cursor block resyncs from the start block.
 
 1. `axiom_clone_preserves_fview`: a clone has the same fold view (A3).
 2. `Vec::into_boxed_slice` keeps the elements in order (std docs).
-3. `<[T]>::sort_unstable_by_key` permutes the slice (std docs). It claims no order,
-   because `Batch::validate` checks the order. The caller must show that the key fn
-   accepts every element and that the key's `Ord` is a total order (`obeys_cmp`).
-   `group_into` uses it.
+3. `<[T]>::sort_unstable_by_key` permutes the slice and leaves it in key order (std
+   docs): for two elements in order, some keys the key fn may return for them are in
+   order. The caller must show that the key fn accepts every element and that the key's
+   `Ord` is a total order (`obeys_cmp`). `group_into` uses it.
 4. `snapshot::crc32c`: the checksum is a function of the bytes (`crc32c_spec` is
    uninterpreted, so no value is assumed).
 5. `wincode::ReadError`: an opaque type, it asserts nothing.
@@ -417,8 +422,9 @@ code can meet. Most are `wf()` of a value that only verified constructors build.
 iterator laws and has a decreasing measure. An unverified caller cannot show this. The
 call stays safe, because it only pushes, but it does not return on an infinite iterator.
 
-Also out of scope: liveness beyond loop termination, performance beyond the probe
-bounds, and the authenticity of snapshot files (see durability).
+Also out of scope: liveness beyond loop termination and the `SourceError` bound in T7,
+performance beyond the probe bounds, and the authenticity of snapshot files (see
+durability).
 
 #### running it
 

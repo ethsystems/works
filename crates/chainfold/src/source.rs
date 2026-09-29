@@ -10,6 +10,7 @@ use {
         a1,
         anc,
         header,
+        infallible,
         range_entries,
         sview,
         sview_log,
@@ -43,8 +44,9 @@ pub struct Head {
 
 /// Random-access event supply over one chain.
 // Each call answers from one view, `sview` of the source after the call, and every view
-// satisfies `a1`. `sview_log` records those views in call order. Implementations are
-// trusted to meet this spec.
+// satisfies `a1`. `sview_log` records those views in call order. A source in an
+// `infallible` state answers every call and stays in one. Implementations are trusted to
+// meet this spec.
 #[cfg_attr(verus_keep_ghost, verus_verify)]
 pub trait Source {
     /// Consumer event the source decodes its wire format into.
@@ -59,6 +61,7 @@ pub trait Source {
             sview_log::<Self>(final(self)) == sview_log::<Self>(old(self)).push(
                 sview::<Self>(final(self)),
             ),
+            infallible::<Self>(old(self)) ==> r is Ok && infallible::<Self>(final(self)),
             r matches Ok(h) ==> header(sview::<Self>(final(self)), h.block.number) == Some(h.block)
                 && (h.block.number > 0 ==> anc(h.block.hash, (h.block.number - 1) as u64).hash == h.parent),
     ))]
@@ -71,6 +74,7 @@ pub trait Source {
             sview_log::<Self>(final(self)) == sview_log::<Self>(old(self)).push(
                 sview::<Self>(final(self)),
             ),
+            infallible::<Self>(old(self)) ==> r is Ok && infallible::<Self>(final(self)),
             r matches Ok(h) ==> h == header(sview::<Self>(final(self)), number),
     ))]
     fn header_at(&mut self, number: u64) -> Result<Option<BlockRef>, Self::Error>;
@@ -83,6 +87,7 @@ pub trait Source {
             sview_log::<Self>(final(self)) == sview_log::<Self>(old(self)).push(
                 sview::<Self>(final(self)),
             ),
+            infallible::<Self>(old(self)) ==> r is Ok && infallible::<Self>(final(self)),
             r is Ok ==> {
                 let (pre, post) = (old(out)@, final(out)@);
                 &&& pre.len() <= post.len()

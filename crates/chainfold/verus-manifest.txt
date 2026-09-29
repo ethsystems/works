@@ -1,6 +1,6 @@
 # Checked by .github/scripts/verus-gates.py; regenerate it with `--update` (see there).
 # tcb and spec lines: hash of the normalized text, then the item. fn lines: from Verus.
-verified 339
+verified 345
 fn exec chainfold::batch::Batch::clear
 fn exec chainfold::batch::Batch::clone
 fn exec chainfold::batch::Batch::default
@@ -68,6 +68,7 @@ fn exec chainfold::driver::DriverStatus::is_terminal
 fn exec chainfold::driver::Tick::clone
 fn exec chainfold::driver::all_in
 fn exec chainfold::driver::clamp
+fn exec chainfold::driver::descending
 fn exec chainfold::driver::due
 fn exec chainfold::driver::group_into
 fn exec chainfold::driver::take_floor
@@ -179,8 +180,12 @@ fn proof chainfold::driver::lemma_fresh_dinv
 fn proof chainfold::driver::lemma_from_start
 fn proof chainfold::driver::lemma_grew_next
 fn proof chainfold::driver::lemma_grew_refl
+fn proof chainfold::driver::lemma_lost_moved
 fn proof chainfold::driver::lemma_parent
+fn proof chainfold::driver::lemma_push_desc
 fn proof chainfold::driver::lemma_push_triples
+fn proof chainfold::driver::lemma_re_ascending
+fn proof chainfold::driver::lemma_re_one_view
 fn proof chainfold::driver::lemma_recover_one
 fn proof chainfold::driver::lemma_recover_t7
 fn proof chainfold::driver::lemma_ring_after_in
@@ -190,6 +195,7 @@ fn proof chainfold::driver::lemma_rung_next
 fn proof chainfold::driver::lemma_rung_same
 fn proof chainfold::driver::lemma_rung_walk
 fn proof chainfold::driver::lemma_scan_t7
+fn proof chainfold::driver::lemma_sorted_desc
 fn proof chainfold::driver::lemma_step_canon
 fn proof chainfold::driver::lemma_tip_grew
 fn proof chainfold::driver::lemma_tip_step
@@ -315,7 +321,7 @@ fn spec chainfold::verus::model::upto
 tcb 7ebdfa63aa20 axiom_clone_preserves_fview
 tcb 7a2dc6fca3ce axiom_no_sink_offers_nothing
 tcb b43a193e820c Vec::<T,A>::into_boxed_slice
-tcb fd60bc6b3802 <[T]>::sort_unstable_by_key::<K,F>
+tcb 6453e2e4863f <[T]>::sort_unstable_by_key::<K,F>
 tcb 9cbfa0a92579 crate::snapshot::crc32c
 tcb 20c0e407d1c2 ExReadError
 tcb ba245e2fecc7 crate::snapshot::read_envelope
@@ -428,22 +434,23 @@ spec 28bcd4d3c406 src/driver.rs::Driver::resync_or_terminal
 spec b933d47806de src/driver.rs::Driver::resync
 spec 460f2c103d7b src/driver.rs::Driver::reconcile_reset
 spec 9ba9a901eb78 src/driver.rs::Driver::reconcile_reset_slow
-spec 3a877ebbfbe0 src/driver.rs::Driver::step
-spec 00df465425d9 src/driver.rs::Driver::poll_apply
-spec 69d31b6c0a27 src/driver.rs::Driver::scan
-spec f38527922c8b src/driver.rs::Driver::next_block
-spec ec20b7d4a2c0 src/driver.rs::Driver::above_tip
-spec a0a79c2bea05 src/driver.rs::Driver::cursor_walk
-spec 4170bbcc8f60 src/driver.rs::Driver::cursor_block
-spec 6df3800946c9 src/driver.rs::Driver::walk
-spec e17e757dbb7f src/driver.rs::Driver::recover_via_bisection
-spec 3a877ebbfbe0 src/driver.rs::Driver::tick
+spec b7e64aa96e72 src/driver.rs::Driver::step
+spec 45740e7f822c src/driver.rs::Driver::poll_apply
+spec 43ad2ab04639 src/driver.rs::Driver::scan
+spec c697caa50518 src/driver.rs::Driver::next_block
+spec 5e5300ba0a01 src/driver.rs::Driver::above_tip
+spec 0cffb3f6894a src/driver.rs::Driver::cursor_walk
+spec e2f66518c0ca src/driver.rs::Driver::cursor_block
+spec 5f76f3af0677 src/driver.rs::Driver::walk
+spec fe304b98d969 src/driver.rs::Driver::recover_via_bisection
+spec c863359fe242 src/driver.rs::Driver::tick
 spec f4cdf96e984a src/driver.rs::Driver::checkpoint
 spec c32330a2b384 src/driver.rs::Driver::status
 spec 9c80f78786c8 src/driver.rs::all_in
 spec 88f30a0d6a49 src/driver.rs::walk_calls
 spec 4f9ec250540c src/driver.rs::take_floor
-spec 65ebaaf9ef07 src/driver.rs::group_into
+spec 022f3f9b64d1 src/driver.rs::descending
+spec ed2cd9830c07 src/driver.rs::group_into
 spec 70d5b0f602c9 src/driver.rs::clamp_spec
 spec c5c8e113698e src/driver.rs::floor_ok
 spec eac4e894af9e src/driver.rs::resynced
@@ -465,6 +472,10 @@ spec 658c2efa7708 src/driver.rs::tip_vouched
 spec 6b1ebd49174f src/driver.rs::tip_seen
 spec 13cf9f9e0d77 src/driver.rs::no_aba
 spec 1faa90f9766b src/driver.rs::from_start
+spec 6edb90192ccb src/driver.rs::lost
+spec 09f4e02d1cf3 src/driver.rs::moved
+spec 258eda9d9fed src/driver.rs::shaped_at
+spec 496d8593712d src/driver.rs::lemma_lost_moved
 spec f86ab4bed873 src/driver.rs::grew
 spec f2b74f8ec8a8 src/driver.rs::lemma_grew_refl
 spec 13347b985481 src/driver.rs::lemma_grew_next
@@ -497,6 +508,7 @@ spec a9e2391a6821 src/driver.rs::Driver::durable_ok
 spec fb1356efa474 src/driver.rs::Driver::init_view
 spec 47ae6825c6d2 src/driver.rs::Driver::start_block
 spec 46d9001d8ce5 src/driver.rs::Driver::source_log
+spec fe83048f5e5d src/driver.rs::Driver::source_infallible
 spec f405ac92a1f1 src/driver.rs::Driver::batch_view
 spec 41e94f949a52 src/driver.rs::Driver::tip_view
 spec 84848d467906 src/driver.rs::Driver::dinv
@@ -519,6 +531,14 @@ spec f77a6b6edebb src/driver.rs::lemma_rollback_t7
 spec a401ddd3e258 src/driver.rs::lemma_checkpoint_dinv
 spec 47c1bea872ea src/driver.rs::lemma_apply_floor
 spec bfcdb0bf7c8c src/driver.rs::lemma_triples_upto_kept
+spec f80f551e1f95 src/driver.rs::one_view
+spec 3826a8353bcb src/driver.rs::key_le
+spec ee1bd31c45e7 src/driver.rs::desc
+spec a12257db319a src/driver.rs::popped_desc
+spec c4bcd3cf55b9 src/driver.rs::lemma_re_ascending
+spec d754365eb3fc src/driver.rs::lemma_re_one_view
+spec 5d30445bc76f src/driver.rs::lemma_sorted_desc
+spec 23d3c9be702c src/driver.rs::lemma_push_desc
 spec 59215a6d0b49 src/driver.rs::lemma_push_triples
 spec f3a0421f5ca4 src/driver.rs::lemma_triples_len
 spec 37fff955d923 src/engine.rs::EngineConfig::validate
@@ -535,7 +555,7 @@ spec 44bd4a141049 src/engine.rs::Engine::oldest_checkpoint
 spec 12ec425a59f4 src/engine.rs::Engine::fold
 spec 8d9c4278f9f6 src/engine.rs::Engine::observed
 spec d72aca3f4ba0 src/engine.rs::Engine::ring
-spec 47f88f509efb src/engine.rs::Engine::apply_batch
+spec 3c7143b97254 src/engine.rs::Engine::apply_batch
 spec 50d1cb2cdb97 src/engine.rs::Engine::checkpoint
 spec ce2556cedc48 src/engine.rs::Engine::rollback_at_or_below
 spec 8e8ed0ca68bc src/engine.rs::Engine::reset
@@ -611,7 +631,7 @@ spec 448c363d6a77 src/ring.rs::BlockRing::iter
 spec c9d43a64dd24 src/ring.rs::BlockRing::len
 spec 53e65560dc87 src/ring.rs::BlockRing::len_at_or_below
 spec 51dd6a8a82df src/ring.rs::BlockRing::observes
-spec b46b3eae7f15 src/ring.rs::BlockRing::canonical_prefix
+spec c1b3bfefcd44 src/ring.rs::BlockRing::canonical_prefix
 spec a9978f8d8ee6 src/ring.rs::Observed::next
 spec 920b780888f3 src/ring.rs::lemma_mask_is_mod
 spec bc617a95a168 src/ring.rs::lemma_mask_wraps
@@ -668,9 +688,9 @@ spec 6281bb9d13c5 src/snapshot.rs::accepted
 spec d09427ad08d8 src/snapshot.rs::decoded
 spec e9425a9ee4a5 src/snapshot.rs::lemma_envelope_round_trip
 spec dedb1dcce647 src/snapshot.rs::lemma_durable_round_trip
-spec c0bf348f4a78 src/source.rs::Source::head
-spec 0e8ca7f029f2 src/source.rs::Source::header_at
-spec a3e10375dcfa src/source.rs::Source::events_in
+spec 2d0ebce5bf1c src/source.rs::Source::head
+spec 60e9745c28c5 src/source.rs::Source::header_at
+spec 4b22afee78c2 src/source.rs::Source::events_in
 spec 5096f455b429 src/verus/model.rs::ChainView
 spec c1082d47113e src/verus/model.rs::anc
 spec a94a5426cd1d src/verus/model.rs::logs
@@ -730,6 +750,7 @@ spec 162d560cf6d9 src/verus/model.rs::confirms
 spec 8de706252bfc src/verus/model.rs::down_closed
 spec 162b3c27506d src/verus/model.rs::confirmed_prefix
 spec fd25bf8203a7 src/verus/model.rs::sview_log
+spec 816d9cff8abe src/verus/model.rs::infallible
 spec 41acd2190109 src/verus/model.rs::upto
 spec 94950681e4fc src/verus/model.rs::lemma_upto
 spec 9a260dfc0a40 src/verus/model.rs::lemma_upto_upto

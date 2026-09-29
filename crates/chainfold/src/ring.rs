@@ -17,6 +17,7 @@ use {
         confirmed_prefix,
         confirms,
         down_closed,
+        infallible,
         observes,
         prefix_at_or_below,
         ring_chain,
@@ -605,6 +606,7 @@ impl BlockRing {
                 // Probe bound, unconditional: at most floor(log2 len) + 1 calls.
                 &&& hist.len() - from <= log(2, self@.len() as int) + 1
                 &&& forall|k: int| from <= k < hist.len() ==> a1::<S, S::Event>(#[trigger] hist[k])
+                &&& infallible::<S>(old(source)) ==> r is Ok && infallible::<S>(final(source))
                 &&& r matches Ok(lo) ==> {
                     &&& lo <= self@.len()
                     // Safety: a probe's view held `ring[lo - 1]`, so by `ring_chain` it
@@ -672,6 +674,7 @@ impl BlockRing {
                 sview_log::<S>(source).len() > from ==> pow2(
                     (sview_log::<S>(source).len() - from - 1) as nat,
                 ) <= self.len,
+                infallible::<S>(old(source)) ==> infallible::<S>(source),
             decreases hi - lo,
         ))]
         while lo < hi {

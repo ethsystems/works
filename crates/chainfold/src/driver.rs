@@ -815,6 +815,10 @@ where
             forall|log: Seq<(Position, F::Event)>, h: ChainView|
                 #[trigger] old(self).dinv(log, h) ==> t7_tick(*old(self), *final(self), r, log, h),
             r is Resynced ==> final(self).dinv(Seq::empty(), Map::empty()),
+            r is SourceError ==> !infallible::<S>(&old(self).source) || moved(
+                sview_log::<S>(&final(self).source),
+                sview_log::<S>(&old(self).source).len() as int,
+            ),
     ))]
     fn step(&mut self) -> Tick {
         self.reconcile_reset();
@@ -873,6 +877,10 @@ where
             forall|log: Seq<(Position, F::Event)>, h: ChainView|
                 #[trigger] old(self).dinv(log, h) ==> t7_tick(*old(self), *final(self), r, log, h),
             r is Resynced ==> final(self).dinv(Seq::empty(), Map::empty()),
+            r is SourceError ==> !infallible::<S>(&old(self).source) || moved(
+                sview_log::<S>(&final(self).source),
+                sview_log::<S>(&old(self).source).len() as int,
+            ),
     ))]
     #[cfg_attr(verus_keep_ghost, verifier::spinoff_prover)]
     #[cfg_attr(verus_keep_ghost, verifier::rlimit(20))]
@@ -1092,16 +1100,15 @@ where
                 }
                 tick
             }
+            // Unreachable: `scan` hands over a shaped batch whose boundary is at the cursor
+            // block.
             Err(ApplyError::Shape(_) | ApplyError::BoundaryNumberMismatch { .. }) => {
-                self.tip = None;
-                self.consecutive_errors = self.consecutive_errors.saturating_add(1);
                 #[cfg(verus_keep_ghost)]
                 proof! {
-                    assert forall|log: Seq<(Position, F::Event)>, h: ChainView|
-                        #[trigger] old(self).dinv(log, h) implies t7_tick(*old(self), *self, Tick::SourceError, log, h) by {
-                        assert(self.dinv(log, h));
-                    }
+                    assert(false);
                 }
+                self.tip = None;
+                self.consecutive_errors = self.consecutive_errors.saturating_add(1);
                 Tick::SourceError
             }
             Err(ApplyError::NotActive { .. }) => {
@@ -1145,6 +1152,9 @@ where
                 &&& l0 < hist.len()
                 &&& grew::<S, S::Event>(sview_log::<S>(&old(self).source), hist)
                 &&& !(r matches Ok(true)) ==> final(self).tip is None
+                &&& infallible::<S>(&old(self).source) ==> r is Ok && infallible::<S>(&final(self).source)
+                &&& r matches Ok(false) ==> moved(hist, l0)
+                &&& r matches Ok(true) ==> shaped_at(final(self).batch@, old(self).engine@.cursor)
                 &&& r matches Ok(true) ==> scanned::<S, S::Event>(
                     hist,
                     l0,
@@ -1214,6 +1224,12 @@ where
                     < walk_calls(from, head.block.number, window)
             {
                 if let Some(read) = self.above_tip(tip, head.block, window)? {
+                    #[cfg(verus_keep_ghost)]
+                    proof! {
+                        if !read {
+                            lemma_lost_moved(sview_log::<S>(&self.source), l0, l0 + 1, head.block);
+                        }
+                    }
                     return Ok(read);
                 }
             }
@@ -1224,7 +1240,14 @@ where
             lemma_grew_next::<S, S::Event>(sview_log::<S>(&old(self).source), hw);
             assert(hw[l0] == h1[l0]);
         }
-        self.cursor_walk(head.block, window, from)
+        let read = self.cursor_walk(head.block, window, from);
+        #[cfg(verus_keep_ghost)]
+        proof! {
+            if read matches Ok(false) {
+                lemma_lost_moved(sview_log::<S>(&self.source), l0, hw.len() as int, head.block);
+            }
+        }
+        read
     }
 
     /// `scan` with the head one block on top of the tip: reads the head block alone, and
@@ -1252,6 +1275,8 @@ where
             grew::<S, S::Event>(sview_log::<S>(&old(self).source), sview_log::<S>(&final(self).source)),
             !(r matches Ok(true)) ==> final(self).tip is None && final(self).batch@.ends.len() == 0
                 && final(self).batch@.boundary is None,
+            infallible::<S>(&old(self).source) ==> r is Ok && infallible::<S>(&final(self).source),
+            r matches Ok(true) ==> shaped_at(final(self).batch@, old(self).engine@.cursor),
             r matches Ok(true) ==> forall|tip: BlockRef|
                 tip.hash == head.parent && tip.number + 1 == head.block.number ==> #[trigger] scanned::<S, S::Event>(
                     sview_log::<S>(&final(self).source),
@@ -1281,6 +1306,7 @@ where
             let ghost got = self.scratch@;
             let ghost h2 = sview_log::<S>(&self.source);
             assert(got == got.subrange(0, got.len() as int));
+            lemma_re_one_view::<S, S::Event>(h2.last(), head.block.number as int, head.block.number as int);
         }
         if !self.scratch.is_empty() {
             group_into(&mut self.batch, &mut self.scratch);
@@ -1333,6 +1359,13 @@ where
             grew::<S, S::Event>(sview_log::<S>(&old(self).source), sview_log::<S>(&final(self).source)),
             !(r matches Ok(Some(true))) ==> final(self).tip is None,
             r matches Ok(None) ==> final(self).batch@.ends.len() == 0 && final(self).batch@.boundary is None,
+            infallible::<S>(&old(self).source) ==> r is Ok && infallible::<S>(&final(self).source),
+            r matches Ok(Some(false)) ==> lost(
+                sview_log::<S>(&final(self).source),
+                sview_log::<S>(&old(self).source).len() as int,
+                head,
+            ),
+            r matches Ok(Some(true)) ==> shaped_at(final(self).batch@, old(self).engine@.cursor),
             r matches Ok(Some(true)) ==> forall|l0: int|
                 0 <= l0 && l0 + 1 == sview_log::<S>(&old(self).source).len() && header(
                     sview_log::<S>(&old(self).source)[l0],
@@ -1399,6 +1432,11 @@ where
         }
         if reads > 1 && self.source.header_at(head.number)? != Some(head) {
             self.batch.clear();
+            #[cfg(verus_keep_ghost)]
+            proof! {
+                let hist = sview_log::<S>(&self.source);
+                assert(header(hist[hist.len() - 1], head.number) != Some(head));
+            }
             return Ok(Some(false));
         }
         self.batch.boundary = self.cursor_block();
@@ -1471,6 +1509,13 @@ where
             }),
             grew::<S, S::Event>(sview_log::<S>(&old(self).source), sview_log::<S>(&final(self).source)),
             !(r matches Ok(true)) ==> final(self).tip is None,
+            infallible::<S>(&old(self).source) ==> r is Ok && infallible::<S>(&final(self).source),
+            r matches Ok(false) ==> lost(
+                sview_log::<S>(&final(self).source),
+                sview_log::<S>(&old(self).source).len() as int,
+                head,
+            ),
+            r matches Ok(true) ==> shaped_at(final(self).batch@, old(self).engine@.cursor),
             r matches Ok(true) ==> forall|l0: int, t0: Option<BlockRef>|
                 0 <= l0 < sview_log::<S>(&old(self).source).len() && header(
                     sview_log::<S>(&old(self).source)[l0],
@@ -1545,6 +1590,11 @@ where
             && self.source.header_at(head.number)? != Some(head)
         {
             self.batch.clear();
+            #[cfg(verus_keep_ghost)]
+            proof! {
+                let hist = sview_log::<S>(&self.source);
+                assert(header(hist[hist.len() - 1], head.number) != Some(head));
+            }
             return Ok(false);
         }
         self.batch.boundary = boundary;
@@ -1604,6 +1654,7 @@ where
                 Some(_) => Some(self.engine@.ring.last()),
                 None => None,
             },
+            r is Some ==> r.unwrap().number == self.engine@.cursor.unwrap().block,
     ))]
     fn cursor_block(&self) -> Option<BlockRef> {
         let cursor = self.engine.cursor()?;
@@ -1642,6 +1693,8 @@ where
             grew::<S, S::Event>(sview_log::<S>(&old(self).source), sview_log::<S>(&final(self).source)),
             r matches Ok(p) ==> (p.0 matches Some(b) ==> floor),
             r matches Ok(p) ==> p.1 <= 2,
+            r is Ok ==> final(self).batch@.shaped(),
+            infallible::<S>(&old(self).source) ==> r is Ok && infallible::<S>(&final(self).source),
             r matches Ok(p) ==> exists|wins: Seq<(int, int)>|
                 #[trigger] walked::<S, S::Event>(
                     sview_log::<S>(&final(self).source),
@@ -1688,12 +1741,14 @@ where
                 d1.batch@.ends.len() == 0,
                 *self == (Driver { source: self.source, scratch: self.scratch, batch: self.batch, ..d1 }),
                 self.batch@.wf(),
+                self.batch@.shaped(),
                 self.batch@.boundary is None,
                 sview_log::<S>(&self.source).len() == l0 + wins.len(),
                 sview_log::<S>(&self.source).subrange(0, l0) == sview_log::<S>(&old(self).source),
                 forall|k: int| l0 <= k < sview_log::<S>(&self.source).len()
                     ==> a1::<S, S::Event>(#[trigger] sview_log::<S>(&self.source)[k]),
                 grew::<S, S::Event>(sview_log::<S>(&old(self).source), sview_log::<S>(&self.source)),
+                infallible::<S>(&old(self).source) ==> infallible::<S>(&self.source),
                 window >= 1,
                 scan_windows(wins, from as int, window, hi),
                 reads as int == if wins.len() < 2 { wins.len() as int } else { 2 },
@@ -1721,6 +1776,7 @@ where
                 ).to_multiset(),
             ensures
                 self.batch@.wf(),
+                self.batch@.shaped(),
                 self.batch@.boundary is None,
                 *self == (Driver { source: self.source, scratch: self.scratch, batch: self.batch, ..d1 }),
                 sview_log::<S>(&self.source).len() == l0 + wins.len(),
@@ -1728,6 +1784,7 @@ where
                 forall|k: int| l0 <= k < sview_log::<S>(&self.source).len()
                     ==> a1::<S, S::Event>(#[trigger] sview_log::<S>(&self.source)[k]),
                 grew::<S, S::Event>(sview_log::<S>(&old(self).source), sview_log::<S>(&self.source)),
+                infallible::<S>(&old(self).source) ==> infallible::<S>(&self.source),
                 scan_windows(wins, from as int, window, hi),
                 reads as int == if wins.len() < 2 { wins.len() as int } else { 2 },
                 reached == (wins.len() > 0 && wins.last().1 == hi),
@@ -1796,6 +1853,7 @@ where
                     wlo(wins, floor, wins.len() - 1),
                     to as int,
                 ));
+                lemma_re_one_view::<S, S::Event>(v, wlo(wins, floor, wins.len() - 1), to as int);
             }
             if reads < 2 {
                 reads += 1;
@@ -1863,6 +1921,7 @@ where
             old(self).synced(),
         ensures
             recovered(*old(self), *final(self), r),
+            r is SourceError ==> !infallible::<S>(&old(self).source),
     ))]
     #[cold]
     fn recover_via_bisection(&mut self) -> Tick {
@@ -1916,6 +1975,10 @@ where
             forall|log: Seq<(Position, F::Event)>, h: ChainView|
                 #[trigger] old(self).dinv(log, h) ==> t7_tick(*old(self), *final(self), r, log, h),
             r is Resynced ==> final(self).dinv(Seq::empty(), Map::empty()),
+            r is SourceError ==> !old(self).source_infallible() || moved(
+                final(self).source_log(),
+                old(self).source_log().len() as int,
+            ),
     ))]
     pub fn tick(&mut self) -> Tick {
         self.step()
@@ -2141,11 +2204,24 @@ fn take_floor<E>(entries: &mut Vec<(BlockRef, u32, E)>, floor: u64) -> Option<Bl
     at
 }
 
+/// `group_into`'s sort key. `MAX - x` reverses each lane, so the sort is descending
+/// without `Reverse`.
+#[cfg_attr(verus_keep_ghost, verus_verify)]
+#[cfg_attr(verus_keep_ghost, verus_spec(r =>
+    ensures
+        r.0 == u64::MAX - e.0.number,
+        r.1 == u32::MAX - e.1,
+))]
+fn descending<E>(e: &(BlockRef, u32, E)) -> (u64, u32) {
+    (u64::MAX - e.0.number, u32::MAX - e.1)
+}
+
 /// Moves `entries` into `batch`, one span per run of equal `BlockRef`s, so two hashes
 /// at one height become two equal-number spans that `Batch::validate` rejects.
 ///
 /// Sorted by descending position and popped from the tail, the entries leave in
-/// ascending order with no intermediate buffer; the sort is in place.
+/// ascending order with no intermediate buffer; the sort is in place. Entries one view
+/// could answer give a batch `validate` accepts.
 #[cfg_attr(verus_keep_ghost, verus_verify)]
 #[cfg_attr(verus_keep_ghost, verus_spec(
     requires
@@ -2156,16 +2232,24 @@ fn take_floor<E>(entries: &mut Vec<(BlockRef, u32, E)>, floor: u64) -> Option<Bl
         final(batch)@.boundary == old(batch)@.boundary,
         final(entries)@.len() == 0,
         final(batch)@.triples().to_multiset() == old(entries)@.to_multiset(),
+        one_view(old(entries)@.to_multiset()) ==> final(batch)@.shaped(),
 ))]
 // `loop` + `match`, not `while let`: Verus keeps no facts after a `while let` loop.
 #[allow(clippy::while_let_loop)]
 fn group_into<E>(batch: &mut Batch<E>, entries: &mut Vec<(BlockRef, u32, E)>) {
-    // `MAX - x` reverses each key lane, so the sort is descending without `Reverse`.
-    entries.sort_unstable_by_key(|e| (u64::MAX - e.0.number, u32::MAX - e.1));
+    entries.sort_unstable_by_key(descending);
     #[cfg(verus_keep_ghost)]
     proof_decl! {
         let ghost s = entries@;
+        let ghost ok = one_view(old(entries)@.to_multiset());
         assert(batch@.triples() =~= Seq::empty());
+        if ok {
+            assert forall|i: int, j: int| 0 <= i < j < s.len() implies #[trigger] key_le(s[i], s[j]) by {
+                let (a, b) = choose|a: (u64, u32), b: (u64, u32)| descending::<E>.ensures((&s[i],), a)
+                    && descending::<E>.ensures((&s[j],), b) && vstd::std_specs::cmp::OrdSpec::cmp_spec(&a, &b) != core::cmp::Ordering::Greater;
+            }
+            lemma_sorted_desc(s);
+        }
     }
     #[cfg_attr(verus_keep_ghost, verus_spec(
         invariant
@@ -2176,11 +2260,13 @@ fn group_into<E>(batch: &mut Batch<E>, entries: &mut Vec<(BlockRef, u32, E)>) {
             batch@.triples().len() == s.len() - entries@.len(),
             forall|j: int|
                 0 <= j < s.len() - entries@.len() ==> #[trigger] batch@.triples()[j] == s[s.len() - 1 - j],
+            ok ==> popped_desc(batch@, s, entries@.len() as int),
         ensures
             batch@.wf(),
             batch@.boundary == old(batch)@.boundary,
             entries@.len() == 0,
             batch@.triples() =~= s.reverse(),
+            ok ==> batch@.shaped(),
         decreases entries@.len(),
     ))]
     loop {
@@ -2210,6 +2296,9 @@ fn group_into<E>(batch: &mut Batch<E>, entries: &mut Vec<(BlockRef, u32, E)>) {
                         } else {
                             assert(pre.triples()[j] == s[s.len() - 1 - j]);
                         }
+                    }
+                    if ok {
+                        lemma_push_desc(pre, batch@, before, entries@, block, s);
                     }
                 }
             }
@@ -4063,6 +4152,36 @@ pub open spec fn from_start(v: ChainView, start: u64) -> bool {
     forall|n: u64, m: u64| #[trigger] v.contains_key(n) && start <= m <= n ==> #[trigger] v.contains_key(m)
 }
 
+/// A view of `hist` from `l0` lacks block `b`: the chain moved under the calls.
+pub open spec fn lost(hist: Seq<ChainView>, l0: int, b: BlockRef) -> bool {
+    exists|k: int| l0 <= k < hist.len() && #[trigger] header(hist[k], b.number) != Some(b)
+}
+
+/// The source log `hist` from `l0` holds a view other than its first.
+pub open spec fn moved(hist: Seq<ChainView>, l0: int) -> bool {
+    exists|k: int| l0 <= k < hist.len() && #[trigger] hist[k] != hist[l0]
+}
+
+/// A batch `validate` accepts, whose boundary, if any, is at cursor `c`'s block.
+pub open spec fn shaped_at<E>(b: BatchView<E>, c: Option<Position>) -> bool {
+    &&& b.shaped()
+    &&& c is Some && b.boundary is Some ==> b.boundary.unwrap().number == c.unwrap().block
+}
+
+/// A view that lacks block `b`, which view `l0` holds, differs from view `l0`.
+proof fn lemma_lost_moved(hist: Seq<ChainView>, l0: int, from: int, b: BlockRef)
+    requires
+        0 <= l0 <= from,
+        l0 < hist.len(),
+        header(hist[l0], b.number) == Some(b),
+        lost(hist, from, b),
+    ensures
+        moved(hist, l0),
+{
+    let k = choose|k: int| from <= k < hist.len() && #[trigger] header(hist[k], b.number) != Some(b);
+    assert(hist[k] != hist[l0]);
+}
+
 /// `post` is the source log `pre` followed by more views, each satisfying `a1`.
 pub open spec fn grew<S, E>(pre: Seq<ChainView>, post: Seq<ChainView>) -> bool {
     &&& pre.len() <= post.len()
@@ -4912,6 +5031,11 @@ impl<F: Fold, S: Source<Event = F::Event>, K: SnapshotSink<F>> Driver<F, S, K> {
     /// The views that answered the source so far.
     pub closed spec fn source_log(&self) -> Seq<ChainView> {
         sview_log::<S>(&self.source)
+    }
+
+    /// The source answers every call from here on.
+    pub closed spec fn source_infallible(&self) -> bool {
+        infallible::<S>(&self.source)
     }
 
     pub closed spec fn batch_view(&self) -> BatchView<F::Event> {
@@ -5811,6 +5935,220 @@ proof fn lemma_triples_upto_kept<E>(pre: BatchView<E>, post: BatchView<E>, block
             assert(post.events.subrange(0, len)[x] == post.events[x]);
         }
         assert(post.span_triples(i) =~= pre.span_triples(i));
+    }
+}
+
+/// Entries one view could answer: one block per height, and no position twice.
+pub open spec fn one_view<E>(m: vstd::multiset::Multiset<(BlockRef, u32, E)>) -> bool {
+    forall|x: (BlockRef, u32, E), y: (BlockRef, u32, E)|
+        #![trigger m.count(x), m.count(y)]
+        m.count(x) > 0 && m.count(y) > 0 && x.0.number == y.0.number ==> x.0 == y.0 && (x.1 == y.1 ==> x == y
+            && m.count(x) == 1)
+}
+
+/// `descending(x) <= descending(y)`: `y` is not above `x` by position.
+pub open spec fn key_le<E>(x: (BlockRef, u32, E), y: (BlockRef, u32, E)) -> bool {
+    y.0.number < x.0.number || (y.0.number == x.0.number && y.1 <= x.1)
+}
+
+/// `s` descends strictly by position, with one block per height.
+pub open spec fn desc<E>(s: Seq<(BlockRef, u32, E)>) -> bool {
+    forall|i: int, j: int|
+        #![trigger s[i], s[j]]
+        0 <= i < j < s.len() ==> s[j].0.number < s[i].0.number || (s[j].0 == s[i].0 && s[j].1 < s[i].1)
+}
+
+/// `group_into`'s loop over the descending `s` with `m` entries left: the batch so far is
+/// shaped, its last span is `s[m]`'s block, and the next entry is in another block.
+pub open spec fn popped_desc<E>(b: BatchView<E>, s: Seq<(BlockRef, u32, E)>, m: int) -> bool {
+    &&& desc(s)
+    &&& b.shaped()
+    &&& b.ends.len() > 0 ==> 0 <= m < s.len() && b.blocks.last() == s[m].0.number && (m > 0 ==> s[m - 1].0
+        != s[m].0)
+}
+
+/// Entries one view answers for a range have ascending positions.
+proof fn lemma_re_ascending<S, E>(v: ChainView, lo: int, hi: int)
+    requires
+        a1::<S, E>(v),
+    ensures
+        forall|i: int, j: int|
+            #![trigger range_entries::<S, E>(v, lo, hi)[i], range_entries::<S, E>(v, lo, hi)[j]]
+            0 <= i < j < range_entries::<S, E>(v, lo, hi).len() ==> {
+                let (x, y) = (range_entries::<S, E>(v, lo, hi)[i], range_entries::<S, E>(v, lo, hi)[j]);
+                x.0.number < y.0.number || (x.0.number == y.0.number && x.1 < y.1)
+            },
+    decreases hi - lo + 1,
+{
+    if !(hi < lo || hi < 0 || hi > u64::MAX) {
+        lemma_re_ascending::<S, E>(v, lo, hi - 1);
+        lemma_re_facts::<S, E>(v, lo, hi - 1);
+        let (t, r0, b) = (
+            range_entries::<S, E>(v, lo, hi),
+            range_entries::<S, E>(v, lo, hi - 1),
+            block_entries::<S, E>(v, hi as u64),
+        );
+        assert(t == r0 + b);
+        if v.contains_key(hi as u64) {
+            assert(logs_ascending(logs::<S, E>(v[hi as u64].hash)));
+        }
+        assert forall|i: int, j: int| 0 <= i < j < t.len() implies #[trigger] t[i].0.number < #[trigger] t[j].0.number
+            || (t[i].0.number == t[j].0.number && t[i].1 < t[j].1) by {
+            if j < r0.len() {
+                assert(t[i] == r0[i] && t[j] == r0[j]);
+            } else if i < r0.len() {
+                assert(t[i] == r0[i] && t[j] == b[j - r0.len()]);
+            } else {
+                let l = logs::<S, E>(v[hi as u64].hash);
+                assert(t[i] == b[i - r0.len()] && t[j] == b[j - r0.len()]);
+                assert(l[i - r0.len()].0 < l[j - r0.len()].0);
+            }
+        }
+    }
+}
+
+/// A range one view answers is `one_view`.
+proof fn lemma_re_one_view<S, E>(v: ChainView, lo: int, hi: int)
+    requires
+        a1::<S, E>(v),
+    ensures
+        one_view(range_entries::<S, E>(v, lo, hi).to_multiset()),
+{
+    let t = range_entries::<S, E>(v, lo, hi);
+    let m = t.to_multiset();
+    lemma_re_facts::<S, E>(v, lo, hi);
+    lemma_re_ascending::<S, E>(v, lo, hi);
+    assert forall|i: int, j: int| 0 <= i < t.len() && 0 <= j < t.len() && i != j implies t[i] != t[j] by {
+        if i < j {
+            assert(t[i].0.number < t[j].0.number || t[i].1 < t[j].1);
+        } else {
+            assert(t[j].0.number < t[i].0.number || t[j].1 < t[i].1);
+        }
+    }
+    assert(t.no_duplicates());
+    t.lemma_multiset_has_no_duplicates();
+    assert forall|x: (BlockRef, u32, E), y: (BlockRef, u32, E)|
+        m.count(x) > 0 && m.count(y) > 0 && x.0.number == y.0.number implies #[trigger] m.count(x) > 0
+            && #[trigger] m.count(y) > 0 && x.0 == y.0 && (x.1 == y.1 ==> x == y && m.count(x) == 1) by {
+        vstd::seq_lib::to_multiset_contains(t, x);
+        vstd::seq_lib::to_multiset_contains(t, y);
+        let i = choose|i: int| 0 <= i < t.len() && t[i] == x;
+        let j = choose|j: int| 0 <= j < t.len() && t[j] == y;
+        if i < j {
+            assert(t[i].0.number < t[j].0.number || t[i].1 < t[j].1);
+        } else if j < i {
+            assert(t[j].0.number < t[i].0.number || t[j].1 < t[i].1);
+        }
+    }
+}
+
+/// Keys in order over `one_view` entries give a strictly descending `s`.
+proof fn lemma_sorted_desc<E>(s: Seq<(BlockRef, u32, E)>)
+    requires
+        one_view(s.to_multiset()),
+        forall|i: int, j: int| 0 <= i < j < s.len() ==> #[trigger] key_le(s[i], s[j]),
+    ensures
+        desc(s),
+{
+    let m = s.to_multiset();
+    assert forall|x: (BlockRef, u32, E)| m.contains(x) implies m.count(x) == 1 by {
+        assert(m.count(x) > 0 && m.count(x) > 0 && x.0.number == x.0.number);
+    }
+    s.lemma_multiset_has_no_duplicates_conv();
+    assert forall|i: int, j: int|
+        #![trigger s[i], s[j]]
+        0 <= i < j < s.len() implies s[j].0.number < s[i].0.number || (s[j].0 == s[i].0 && s[j].1 < s[i].1) by {
+        assert(key_le(s[i], s[j]));
+        vstd::seq_lib::to_multiset_contains(s, s[i]);
+        vstd::seq_lib::to_multiset_contains(s, s[j]);
+        assert(s.contains(s[i]) && s.contains(s[j]));
+        if s[i].0.number == s[j].0.number {
+            assert(m.count(s[i]) > 0 && m.count(s[j]) > 0);
+            assert(s[i] != s[j]);
+        }
+    }
+}
+
+/// One `push_block_from_tail` over the descending `s` keeps `popped_desc`.
+proof fn lemma_push_desc<E>(
+    pre: BatchView<E>,
+    post: BatchView<E>,
+    before: Seq<(BlockRef, u32, E)>,
+    after: Seq<(BlockRef, u32, E)>,
+    block: BlockRef,
+    s: Seq<(BlockRef, u32, E)>,
+)
+    requires
+        pre.wf(),
+        pushed_block(pre, post, block),
+        popped_tail(pre, post, before, after, block),
+        before.len() > 0,
+        before.last().0 == block,
+        before.len() <= s.len(),
+        before == s.subrange(0, before.len() as int),
+        popped_desc(pre, s, before.len() as int),
+    ensures
+        popped_desc(post, s, after.len() as int),
+{
+    let (n, bl, m) = (pre.ends.len() as int, before.len() as int, after.len() as int);
+    if m == bl {
+        assert(after.last() == before.last());
+    }
+    let k = bl - m;
+    let p = pre.events.len() as int;
+    assert(appended_at(pre, post, before, k - 1, block));
+    assert(s[m] == before[m] && s[bl - 1] == before[bl - 1]);
+    if n > 0 {
+        assert(s[bl].0.number < s[bl - 1].0.number || s[bl].0 == s[bl - 1].0);
+        assert(pre.blocks.last() < block.number);
+    }
+    assert(p == if n == 0 { 0 } else { pre.ends[n - 1] as int });
+    assert forall|i: int, j: int| 0 <= i < j < post.blocks.len() implies #[trigger] post.blocks[i]
+        < #[trigger] post.blocks[j] by {
+        if j < n {
+            assert(pre.blocks[i] < pre.blocks[j]);
+        } else if i < n - 1 {
+            assert(pre.blocks[i] < pre.blocks[n - 1]);
+        }
+    }
+    assert forall|i: int| 0 <= i < post.ends.len() implies post.start(i) < #[trigger] post.ends[i] by {
+        if i < n {
+            assert(pre.start(i) < pre.ends[i]);
+            if i > 0 {
+                assert(post.ends[i - 1] == pre.ends[i - 1]);
+            }
+        } else if n > 0 {
+            assert(post.ends[n - 1] == pre.ends[n - 1]);
+        }
+    }
+    assert forall|i: int, j: int, q: int|
+        #![trigger post.ends[i], post.log_indices[j], post.log_indices[q]]
+        0 <= i < post.ends.len() && post.start(i) <= j < q < post.ends[i] implies post.log_indices[j]
+            < post.log_indices[q] by {
+        if i < n {
+            assert(post.ends[i] == pre.ends[i] && post.start(i) == pre.start(i)) by {
+                if i > 0 {
+                    assert(post.ends[i - 1] == pre.ends[i - 1]);
+                }
+            }
+            assert(pre.ends[i] <= pre.ends[n - 1]);
+            assert(post.log_indices.subrange(0, p)[j] == pre.log_indices[j]);
+            assert(post.log_indices.subrange(0, p)[q] == pre.log_indices[q]);
+            assert(pre.log_indices[j] < pre.log_indices[q]);
+        } else {
+            if n > 0 {
+                assert(post.ends[n - 1] == pre.ends[n - 1]);
+            }
+            let (a, b) = (j - p, q - p);
+            assert(appended_at(pre, post, before, a, block));
+            assert(appended_at(pre, post, before, b, block));
+            assert(s[bl - 1 - a] == before[bl - 1 - a] && s[bl - 1 - b] == before[bl - 1 - b]);
+            assert(s[bl - 1 - a].0.number < s[bl - 1 - b].0.number || (s[bl - 1 - a].0 == s[bl - 1 - b].0
+                && s[bl - 1 - a].1 < s[bl - 1 - b].1));
+        }
+    }
+    if m > 0 {
+        assert(after.last() == s[m - 1]);
     }
 }
 
