@@ -483,9 +483,9 @@ spec 8fd9fa6b13bb src/driver.rs::lemma_from_start
 spec c257faeaa987 src/driver.rs::lemma_wins_bounds
 spec 23714cb7aec1 src/driver.rs::lemma_walk_empty
 spec 410bd12809cc src/driver.rs::lemma_floor
-spec 4c82bdc5dc12 src/driver.rs::lemma_walk_core
-spec e772ca1ed73c src/driver.rs::lemma_rung_walk
-spec 0ae2c1cc716b src/driver.rs::lemma_rung_gap
+spec 8caef140d8f1 src/driver.rs::lemma_walk_core
+spec 28db473bd015 src/driver.rs::lemma_rung_walk
+spec 8c53b3aab297 src/driver.rs::lemma_rung_gap
 spec 24551f307d06 src/driver.rs::lemma_rung_same
 spec d267e8f9c624 src/driver.rs::lemma_parent
 spec 96d5452eca84 src/driver.rs::lemma_rung_next
@@ -538,7 +538,7 @@ spec a12257db319a src/driver.rs::popped_desc
 spec c4bcd3cf55b9 src/driver.rs::lemma_re_ascending
 spec d754365eb3fc src/driver.rs::lemma_re_one_view
 spec 5d30445bc76f src/driver.rs::lemma_sorted_desc
-spec 23d3c9be702c src/driver.rs::lemma_push_desc
+spec bbdd8fc65a3c src/driver.rs::lemma_push_desc
 spec 59215a6d0b49 src/driver.rs::lemma_push_triples
 spec f3a0421f5ca4 src/driver.rs::lemma_triples_len
 spec 37fff955d923 src/engine.rs::EngineConfig::validate

@@ -1120,8 +1120,8 @@ where
     }
 
     /// Fills `batch` with the blocks strictly after the cursor, plus the cursor block's
-    /// header. `Ok(false)` when the head block moved during a walk of more than one call;
-    /// the batch is then empty.
+    /// header. `Ok(false)` when the head block moved during a walk; the batch is then
+    /// empty.
     ///
     /// Cheapest first: a head equal to the tip is one call; a head whose parent is the tip
     /// reads its own block; a gap past the tip, when that costs fewer calls than the
@@ -1129,9 +1129,9 @@ where
     /// cursor block, whose header the first answer carries.
     // One answer is one view. A tip is a head a scan covered: the chain its hash commits
     // to holds nothing left to fold above the cursor up to it (A1), so a view that holds
-    // the tip needs no events or boundary read below it. A walk of more calls than one
-    // window ends by reading the head block again, so under no ABA every call between the
-    // two reads saw the head's chain.
+    // the tip needs no events or boundary read below it. Every walk ends by reading the
+    // head block again, so under no ABA every call between the two reads saw the head's
+    // chain.
     #[cfg_attr(verus_keep_ghost, verus_spec(r =>
         requires
             old(self).wf(),
@@ -1336,8 +1336,8 @@ where
         Ok(true)
     }
 
-    /// `scan` with a gap past the tip: walks above the tip, then reads the tip back, and
-    /// the head block again after more than one window. `Ok(None)` when the tip is gone;
+    /// `scan` with a gap past the tip: walks above the tip, then reads the tip back and the
+    /// head block again. `Ok(None)` when the tip is gone;
     /// the batch is then empty.
     #[cfg_attr(verus_keep_ghost, verus_spec(r =>
         requires
@@ -1395,7 +1395,7 @@ where
             lemma_grew_refl::<S, S::Event>(h1);
             lemma_grew_next::<S, S::Event>(h1, h1);
         }
-        let (_at, reads, reached) =
+        let (_at, _reads, reached) =
             self.walk(tip.number + 1, head.number, window, false)?;
         #[cfg(verus_keep_ghost)]
         proof_decl! {
@@ -1411,7 +1411,7 @@ where
                 wins,
                 d2.batch@.triples(),
                 _at,
-                reads,
+                _reads,
                 reached,
             );
             lemma_grew_next::<S, S::Event>(h1, h2);
@@ -1430,7 +1430,7 @@ where
             lemma_grew_refl::<S, S::Event>(h3);
             lemma_grew_next::<S, S::Event>(h3, h3);
         }
-        if reads > 1 && self.source.header_at(head.number)? != Some(head) {
+        if self.source.header_at(head.number)? != Some(head) {
             self.batch.clear();
             #[cfg(verus_keep_ghost)]
             proof! {
@@ -1476,7 +1476,7 @@ where
                     head,
                     window,
                     wins,
-                    reads,
+                    _reads,
                     reached,
                 );
             }
@@ -1485,7 +1485,7 @@ where
     }
 
     /// `scan` from the cursor block: the first window's answer carries that block's header,
-    /// else `header_at` reads it; a walk of more than one call ends by reading the head block
+    /// else `header_at` reads it; a walk of one window or more ends by reading the head block
     /// again. `Ok(false)` when the head block moved; the batch is then empty.
     #[cfg_attr(verus_keep_ghost, verus_spec(r =>
         requires
@@ -1586,9 +1586,7 @@ where
             lemma_grew_refl::<S, S::Event>(h3);
             lemma_grew_next::<S, S::Event>(h3, h3);
         }
-        if (reads > 1 || (reads == 1 && cursor.is_some() && at.is_none()))
-            && self.source.header_at(head.number)? != Some(head)
-        {
+        if reads > 0 && self.source.header_at(head.number)? != Some(head) {
             self.batch.clear();
             #[cfg(verus_keep_ghost)]
             proof! {
@@ -2085,8 +2083,7 @@ fn all_in<E>(entries: &[(BlockRef, u32, E)], block: BlockRef) -> bool {
     true
 }
 
-/// `events_in` calls a walk over `from..=hi` makes, plus the head read that follows more
-/// than one.
+/// `events_in` calls a walk over `from..=hi` makes, plus the head read that follows.
 #[cfg_attr(verus_keep_ghost, verus_spec(
     requires
         window >= 1,
@@ -2095,12 +2092,7 @@ fn walk_calls(from: u64, hi: u64, window: u64) -> u64 {
     if from > hi {
         return 0;
     }
-    let windows = ((hi - from) / window).saturating_add(1);
-    if windows > 1 {
-        windows.saturating_add(1)
-    } else {
-        windows
-    }
+    ((hi - from) / window).saturating_add(2)
 }
 
 /// Drops the entries at or below block `floor`, in place and out of order, and returns the
@@ -3710,7 +3702,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "a torn answer of a one-window scan is folded"]
     fn torn_single_window_is_dropped_then_folded() {
         // given a driver caught up on block 1, then blocks 2..=6 with events at 4 and 6,
         // all in the one window [1, 6] from the cursor block
@@ -4757,9 +4748,8 @@ proof fn lemma_floor<S, E>(
 
 /// A walk's windows over `h2` from `w0`, inside a tick over `hist` from `l0` whose first
 /// view read the head `hd`. Its last window's view holds the batch as the window's
-/// entries. With one window, or with the head read again last (`pinned`), that view also
-/// holds nothing from the floor to the window; with the head read again, every view of the
-/// tick agrees with it up to the head.
+/// entries. With the head read again last, that view also holds nothing from the floor to
+/// the window, and every view of the tick agrees with it up to the head.
 proof fn lemma_walk_core<S, E>(
     hist: Seq<ChainView>,
     h2: Seq<ChainView>,
@@ -4775,7 +4765,6 @@ proof fn lemma_walk_core<S, E>(
     at: Option<BlockRef>,
     n: u8,
     reached: bool,
-    pinned: bool,
 )
     requires
         0 <= l0,
@@ -4784,8 +4773,7 @@ proof fn lemma_walk_core<S, E>(
         header(hist[l0], hd.number) == Some(hd),
         forall|q: int| l0 <= q < hist.len() ==> a1::<S, E>(#[trigger] hist[q]),
         walked::<S, E>(h2, w0, from, hd.number, w, floor, wins, t, at, n, reached),
-        pinned ==> hist.len() > h2.len() && header(hist.last(), hd.number) == Some(hd),
-        !pinned ==> n <= 1,
+        n > 0 ==> hist.len() > h2.len() && header(hist.last(), hd.number) == Some(hd),
     ensures
         ({
             let m = wins.len() as int;
@@ -4808,7 +4796,7 @@ proof fn lemma_walk_core<S, E>(
                     lo,
                     wlo(wins, floor, m - 1) - 1,
                 ).len() == 0
-                &&& views_ok(hist, l0, start) && from >= start && pinned ==> forall|q: int, x: u64|
+                &&& views_ok(hist, l0, start) && from >= start ==> forall|q: int, x: u64|
                     l0 <= q < hist.len() && start <= x <= hd.number ==> #[trigger] header(hist[q], x) == header(
                         hist[k],
                         x,
@@ -4819,7 +4807,6 @@ proof fn lemma_walk_core<S, E>(
 {
     let m = wins.len() as int;
     let k = w0 + m - 1;
-    let lo = from + if floor { 1int } else { 0int };
     lemma_grew_next::<S, E>(h2, hist);
     if m > 0 {
         lemma_wins_bounds(wins, from as int, w, hd.number, 0);
@@ -4828,38 +4815,34 @@ proof fn lemma_walk_core<S, E>(
         if views_ok(hist, l0, start) && from >= start {
             reveal(views_ok);
             let vk = hist[k];
-            if pinned {
-                let last = hist.len() - 1;
-                assert(no_aba(hist, l0, hd));
-                assert forall|q: int| l0 <= q < hist.len() implies header(#[trigger] hist[q], hd.number) == Some(hd) by {
-                    if l0 < q && q < last {
-                        assert(header(hist[l0], hd.number) == Some(hd));
-                        assert(header(hist[last], hd.number) == Some(hd));
-                    }
+            let last = hist.len() - 1;
+            assert(no_aba(hist, l0, hd));
+            assert forall|q: int| l0 <= q < hist.len() implies header(#[trigger] hist[q], hd.number) == Some(hd) by {
+                if l0 < q && q < last {
+                    assert(header(hist[l0], hd.number) == Some(hd));
+                    assert(header(hist[last], hd.number) == Some(hd));
                 }
-                assert forall|q: int, x: u64| l0 <= q < hist.len() && start <= x <= hd.number implies #[trigger] header(
-                    hist[q],
-                    x,
-                ) == header(vk, x) by {
-                    assert(header(hist[q], hd.number) == Some(hd));
-                    assert(header(vk, hd.number) == Some(hd));
-                    assert(from_start(hist[q], start) && from_start(vk, start));
-                    lemma_from_start(hist[q], start, hd.number);
-                    lemma_from_start(vk, start, hd.number);
-                    lemma_view_agree(hist[q], vk, start, hd.number);
-                }
-                assert forall|q: int, x: u64| 0 <= q < m - 1 && wins[q].0 <= x <= wins[q].1 implies #[trigger] header(
-                    h2[w0 + q],
-                    x,
-                ) == header(vk, x) by {
-                    lemma_wins_bounds(wins, from as int, w, hd.number, q);
-                    assert(h2[w0 + q] == hist[w0 + q]);
-                    assert(header(hist[w0 + q], x) == header(vk, x));
-                }
-                lemma_walk_empty::<S, E>(h2, w0, from, hd.number, w, floor, wins, vk, m - 1);
-            } else {
-                assert(range_entries::<S, E>(vk, lo, wlo(wins, floor, 0) - 1) =~= Seq::empty());
             }
+            assert forall|q: int, x: u64| l0 <= q < hist.len() && start <= x <= hd.number implies #[trigger] header(
+                hist[q],
+                x,
+            ) == header(vk, x) by {
+                assert(header(hist[q], hd.number) == Some(hd));
+                assert(header(vk, hd.number) == Some(hd));
+                assert(from_start(hist[q], start) && from_start(vk, start));
+                lemma_from_start(hist[q], start, hd.number);
+                lemma_from_start(vk, start, hd.number);
+                lemma_view_agree(hist[q], vk, start, hd.number);
+            }
+            assert forall|q: int, x: u64| 0 <= q < m - 1 && wins[q].0 <= x <= wins[q].1 implies #[trigger] header(
+                h2[w0 + q],
+                x,
+            ) == header(vk, x) by {
+                lemma_wins_bounds(wins, from as int, w, hd.number, q);
+                assert(h2[w0 + q] == hist[w0 + q]);
+                assert(header(hist[w0 + q], x) == header(vk, x));
+            }
+            lemma_walk_empty::<S, E>(h2, w0, from, hd.number, w, floor, wins, vk, m - 1);
         }
     }
 }
@@ -4867,7 +4850,7 @@ proof fn lemma_walk_core<S, E>(
 /// `scan`'s walk from the cursor block assembles into `scanned`: the head's view `h1[l0]`,
 /// the walk's windows over `h2` from `w0`, the cursor block's view `h3.last()` when the
 /// walk had no entry there, and the head block's view `hist.last()` read again when the
-/// scan took more than one call after the head.
+/// walk read a window.
 proof fn lemma_rung_walk<S, E>(
     hist: Seq<ChainView>,
     h2: Seq<ChainView>,
@@ -4907,8 +4890,8 @@ proof fn lemma_rung_walk<S, E>(
             },
             None => None,
         },
-        hist.len() == h3.len() + if n > 1 || (n == 1 && c is Some && at is None) { 1int } else { 0int },
-        n > 1 || (n == 1 && c is Some && at is None) ==> header(hist.last(), hd.number) == Some(hd),
+        hist.len() == h3.len() + if n > 0 { 1int } else { 0int },
+        n > 0 ==> header(hist.last(), hd.number) == Some(hd),
         t1 == if reached { Some(hd) } else { None },
         t0 != Some(hd),
     ensures
@@ -4917,10 +4900,9 @@ proof fn lemma_rung_walk<S, E>(
     let m = wins.len() as int;
     let floor = c is Some;
     let lo = scan_floor(c, start);
-    let br = n > 1 || (n == 1 && c is Some && at is None);
     lemma_grew_next::<S, E>(h2, h3);
     lemma_grew_next::<S, E>(h3, hist);
-    lemma_walk_core::<S, E>(hist, h2, l0, w0, start, hd, from, w, floor, wins, b.triples(), at, n, reached, br);
+    lemma_walk_core::<S, E>(hist, h2, l0, w0, start, hd, from, w, floor, wins, b.triples(), at, n, reached);
     let k = if m > 0 { w0 + m - 1 } else { hist.len() - 1 };
     let (wl, wh) = if m > 0 { (wlo(wins, floor, m - 1), wins[m - 1].1) } else { (lo, lo - 1) };
     let vk = hist[k];
@@ -4964,7 +4946,7 @@ proof fn lemma_rung_walk<S, E>(
 
 /// `scan`'s walk above the tip assembles into `scanned`: the head's view `h1[l0]`, the
 /// walk's windows over `h2` from `l0 + 1`, the tip's view `h3.last()`, and the head block's
-/// view `hist.last()` read again after more than one window.
+/// view `hist.last()` read again.
 proof fn lemma_rung_gap<S, E>(
     hist: Seq<ChainView>,
     h2: Seq<ChainView>,
@@ -4993,8 +4975,8 @@ proof fn lemma_rung_gap<S, E>(
         walked::<S, E>(h2, w0, (tip.number + 1) as u64, hd.number, w, false, wins, b.triples(), None, n, reached),
         h3.len() == h2.len() + 1,
         header(h3.last(), tip.number) == Some(tip),
-        hist.len() == h3.len() + if n > 1 { 1int } else { 0int },
-        n > 1 ==> header(hist.last(), hd.number) == Some(hd),
+        hist.len() == h3.len() + 1,
+        header(hist.last(), hd.number) == Some(hd),
         t1 == if reached { Some(hd) } else { None },
         tip != hd,
     ensures
@@ -5005,7 +4987,7 @@ proof fn lemma_rung_gap<S, E>(
     let t0 = Some(tip);
     lemma_grew_next::<S, E>(h2, h3);
     lemma_grew_next::<S, E>(h3, hist);
-    lemma_walk_core::<S, E>(hist, h2, l0, w0, start, hd, from, w, false, wins, b.triples(), None, n, reached, n > 1);
+    lemma_walk_core::<S, E>(hist, h2, l0, w0, start, hd, from, w, false, wins, b.triples(), None, n, reached);
     let k = w0 + m - 1;
     let (wl, wh) = (wlo(wins, false, m - 1), wins[m - 1].1);
     let vk = hist[k];
@@ -6467,6 +6449,7 @@ proof fn lemma_sorted_desc<E>(s: Seq<(BlockRef, u32, E)>)
 }
 
 /// One `push_block_from_tail` over the descending `s` keeps `popped_desc`.
+#[verifier::rlimit(20)]
 proof fn lemma_push_desc<E>(
     pre: BatchView<E>,
     post: BatchView<E>,

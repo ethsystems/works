@@ -215,9 +215,10 @@ mod tests {
 
     #[tokio::test]
     async fn wait_caught_up_after_transition_returns_immediately() {
-        // given a spawned driver over an empty chain, so the first tick is already caught up,
-        // with a poll interval longer than this test's own wait bound
-        let chain = ScriptedChain::new(1);
+        // given a spawned driver over one empty block, so the first tick is already caught
+        // up, with a poll interval longer than this test's own wait bound
+        let mut chain = ScriptedChain::new(1);
+        chain.push_block(&[]);
         let config = DriverConfig {
             poll_interval: WAIT_TIMEOUT.saturating_mul(10),
             ..DriverConfig::default()

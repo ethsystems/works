@@ -66,8 +66,8 @@ and recovery), and the adapters (`std`: tokio harness, snapshot store, flusher).
 - `Source` is three reads: `head` (the head block and its parent's hash), `header_at`,
   and `events_in`. The driver owns the window walk, the boundary read, and the grouping
   into spans, so a source cannot get the batch shape wrong and every source gets fork
-  detection. A walk of more than one window reads the head block again after the events
-  and drops the batch when it moved, so a reorg that lands between two windows is
+  detection. Every walk reads the head block again after the events and drops the batch
+  when it moved, so a reorg that lands between two windows, or inside one answer, is
   retried, not folded. Two hashes at one height are a source error. `Ok(None)` from a
   probe means suspected fork.
 - rollback is bounded to K retained checkpoints. Over-rollback past still-canonical but
@@ -310,8 +310,8 @@ exceptions are the fns listed as out of scope in `Cargo.toml`.
   (`logs::<S, E>`).
 - **A2, source answers.** (i) Each `head`, `header_at`, and `events_in` call answers
   from one view. The source spec records that view in `sview_log`. A node that tears
-  one range answer across a reorg breaks this: a scan of one window can fold such an
-  answer, and a scan of more windows drops it when the head block moved under it.
+  one range answer across a reorg breaks this, and a scan drops such an answer when the
+  head block moved under it.
   (ii) `events_in` appends every event of its range in that view and no other, in any
   order. Nothing in the crate checks an answer against the block: a dropped or an
   invented log is folded as given, and nothing reports it. A1 then also needs the source
@@ -352,7 +352,7 @@ exceptions are the fns listed as out of scope in `Cargo.toml`.
 A source that breaks A1 or A2 has no guarantee, and the faults the driver notices loop
 without a signal of their own. A source that repeats every log returns `SourceError` on
 every tick, because the batch fails `validate`. One whose `head` hash never matches its
-`header_at` for that height returns `SourceError` on every walk of more than one window.
+`header_at` for that height returns `SourceError` on every walk.
 One whose `header_at` disagrees with the hashes its `events_in` answers carry keeps
 falling back to the walk or rolling back and refolding. With K = 0, one `None` from a
 lagging node at the cursor block resyncs from the start block.
