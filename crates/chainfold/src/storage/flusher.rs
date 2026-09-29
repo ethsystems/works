@@ -145,7 +145,7 @@ impl Shared {
     }
 }
 
-/// Shared cell one durability token waits on.
+/// One submitted snapshot's durability outcome, shared with its job.
 #[derive(Default)]
 struct TokenState {
     result: Mutex<Option<Result<(), FlushError>>>,
@@ -161,29 +161,16 @@ impl TokenState {
             self.ready.notify_all();
         }
     }
-}
 
-/// One submitted snapshot's durability outcome.
-#[derive(Clone)]
-pub struct DurabilityToken {
-    state: Arc<TokenState>,
-}
-
-impl DurabilityToken {
     /// Blocks until the flush completes or fails.
-    pub fn wait(&self) -> Result<(), FlushError> {
-        let guard = lock_recovering(&self.state.result);
+    #[cfg(test)]
+    fn wait(&self) -> Result<(), FlushError> {
+        let guard = lock_recovering(&self.result);
         let guard = self
-            .state
             .ready
             .wait_while(guard, |result| result.is_none())
             .unwrap_or_else(|error| error.into_inner());
         (*guard).expect("condvar wakes only after the result is set")
-    }
-
-    /// Non-blocking read of the flush outcome, if it has completed.
-    pub fn try_result(&self) -> Option<Result<(), FlushError>> {
-        *lock_recovering(&self.state.result)
     }
 }
 
@@ -257,11 +244,32 @@ impl<V: Vfs + Send + 'static> Flusher<V> {
     }
 
     /// Fails fast once a prior flush failed; the watermark never moves after that.
-    pub fn submit(
+    ///
+    /// Private: only `offer` submits, so after a `reset` the watermark moves only onto
+    /// points the driver offered. `Driver::sink` hands out `&Flusher`, and a public
+    /// `submit` would let any caller move it past the engine's cursor:
+    ///
+    /// ```compile_fail,E0624
+    /// use chainfold::{
+    ///     Position,
+    ///     storage::{
+    ///         Flusher,
+    ///         RealVfs,
+    ///     },
+    /// };
+    ///
+    /// // given the shared borrow `Driver::sink` returns
+    /// fn forge(flusher: &Flusher<RealVfs>) {
+    ///     // when submitting bytes at a cursor the driver never offered
+    ///     // then it does not compile: submit is private
+    ///     let _ = flusher.submit(Vec::new(), Some(Position::new(1_000_000, 0)));
+    /// }
+    /// ```
+    fn submit(
         &self,
         snapshot: Vec<u8>,
         cursor: Option<Position>,
-    ) -> Result<DurabilityToken, FlushError> {
+    ) -> Result<Arc<TokenState>, FlushError> {
         if self.shared.is_poisoned() {
             return Err(FlushError::Closed);
         }
@@ -277,7 +285,7 @@ impl<V: Vfs + Send + 'static> Flusher<V> {
         if self.sender.send(job).is_err() {
             return Err(FlushError::Closed);
         }
-        Ok(DurabilityToken { state: token })
+        Ok(token)
     }
 
     /// Cursor a reopen of the store would recover; None after a reset until a job

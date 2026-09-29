@@ -292,7 +292,11 @@ exceptions are the fns listed as out of scope in `Cargo.toml`.
   reason `fold_mut` is out of scope.
 - **A4, sink honesty.** `SnapshotSink::durable_cursor` is `None` or a point offered
   since the last `reset` (`sink_offered`). The sink given to a driver has offered
-  nothing past the engine's cursor and its live slots.
+  nothing past the engine's cursor and its live slots. The shipped sinks trusted for
+  this are `NoSink` (tcb item 12) and `storage::Flusher`. The flusher's watermark
+  changes behind `&self`, from its fsync thread, but only onto a point that `offer`
+  queued since the last `reset`. Its `submit` is private, so no other caller can queue
+  a point, even through `Driver::sink`.
 - **A5, state codec.** `Persist::decode_state` of `encode_state`'s bytes gives back
   the same fold view. Safety does not depend on this, only recovery of the same state.
 - **A6, trusted items.** Each item in `src/verus/tcb.rs`, listed below.
@@ -334,7 +338,8 @@ and is not on the out-of-scope list. The list is in `Cargo.toml`.
   does.
 - `Display` and `Debug` impls, and `next_delay` timing.
 - Liveness beyond loop termination, and performance beyond the probe bounds.
-- Implementations of the trusted traits: `NoSink` (A4) and every `Persist` fold (A5).
+- Implementations of the trusted traits: `NoSink` and `storage::Flusher` (A4), and
+  every `Persist` fold (A5).
 - `Engine::fold_mut` (A3).
 
 #### running it
