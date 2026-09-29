@@ -57,11 +57,16 @@ pub assume_specification<T, A: core::alloc::Allocator>[ Vec::<T, A>::into_boxed_
 ;
 
 // Trusted: `sort_unstable_by_key` permutes the slice (std docs; vstd has no spec). Claims
-// nothing about order, because `Batch::validate` checks it. Used by `group_into`.
+// nothing about order, because `Batch::validate` checks it. std may call the key fn on
+// any element and may panic on an `Ord` that is not a total order, so the caller must
+// show both. Used by `group_into`.
 pub assume_specification<T, K: Ord, F: FnMut(&T) -> K>[ <[T]>::sort_unstable_by_key::<K, F> ](
     v: &mut [T],
     f: F,
 )
+    requires
+        forall|t: &T| #[trigger] f.requires((t,)),
+        vstd::laws_cmp::obeys_cmp::<K>(),
     ensures
         final(v)@.to_multiset() == old(v)@.to_multiset(),
 ;

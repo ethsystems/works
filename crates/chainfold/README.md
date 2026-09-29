@@ -308,7 +308,9 @@ exceptions are the fns listed as out of scope in `Cargo.toml`.
 1. `axiom_clone_preserves_fview`: a clone has the same fold view (A3).
 2. `Vec::into_boxed_slice` keeps the elements in order (std docs).
 3. `<[T]>::sort_unstable_by_key` permutes the slice (std docs). It claims no order,
-   because `Batch::validate` checks the order. `group_into` uses it.
+   because `Batch::validate` checks the order. The caller must show that the key fn
+   accepts every element and that the key's `Ord` is a total order (`obeys_cmp`).
+   `group_into` uses it.
 4. `snapshot::crc32c`: the checksum is a function of the bytes (`crc32c_spec` is
    uninterpreted, so no value is assumed).
 5. `wincode::ReadError`: an opaque type, it asserts nothing.
