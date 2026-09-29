@@ -3634,6 +3634,191 @@ mod tests {
         assert_eq!(driver.engine().fold().applied, folded);
     }
 
+    /// Scripted chain whose events carry their log index in the high 32 bits, so a block's
+    /// indices can be any ascending set.
+    #[derive(Clone)]
+    struct Indexed(ScriptedChain);
+
+    impl Source for Indexed {
+        type Event = u64;
+        type Error = PollFailure;
+
+        fn head(&mut self) -> Result<Head, PollFailure> {
+            self.0.head()
+        }
+
+        fn header_at(&mut self, number: u64) -> Result<Option<BlockRef>, PollFailure> {
+            self.0.header_at(number)
+        }
+
+        fn events_in(
+            &mut self,
+            from: u64,
+            to: u64,
+            out: &mut Vec<(BlockRef, u32, u64)>,
+        ) -> Result<(), PollFailure> {
+            let at = out.len();
+            self.0.events_in(from, to, out)?;
+            for entry in &mut out[at..] {
+                entry.1 = u32::try_from(entry.2 >> 32).expect("index lane fits in u32");
+            }
+            Ok(())
+        }
+
+        fn window(&self) -> u64 {
+            self.0.window()
+        }
+    }
+
+    /// Splitmix64, so each seed replays the same run.
+    struct Rng(u64);
+
+    impl Rng {
+        fn below(&mut self, n: u64) -> u64 {
+            self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            let mut x = self.0;
+            x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            (x ^ (x >> 31)) % n
+        }
+
+        fn pick<T: Copy>(&mut self, options: &[T]) -> T {
+            options[self.below(options.len() as u64) as usize]
+        }
+    }
+
+    /// Up to four events with ascending random log indices, at times up to `u32::MAX`.
+    fn random_events(rng: &mut Rng) -> Vec<u64> {
+        let mut index = if rng.below(8) == 0 {
+            u64::from(u32::MAX) - 12
+        } else {
+            rng.below(1_000)
+        };
+        (0..rng.below(5))
+            .map(|_| {
+                index += 1 + rng.below(3);
+                (index << 32) | rng.below(1 << 32)
+            })
+            .collect()
+    }
+
+    /// Blocks `chain` can still push before its numbers run out.
+    fn room(chain: &ScriptedChain, first: u64) -> u64 {
+        chain
+            .tip()
+            .map_or(Some(first), |tip| tip.number.checked_add(1))
+            .map_or(0, |next| (u64::MAX - next).saturating_add(1))
+    }
+
+    /// The fold of `chain`'s logs from `start` through `cursor`, from scratch.
+    fn from_scratch(
+        mut chain: Indexed,
+        start: u64,
+        cursor: Option<Position>,
+    ) -> Vec<(Position, u64)> {
+        let Some(cursor) = cursor else {
+            return Vec::new();
+        };
+        let mut entries = Vec::new();
+        chain.events_in(start, cursor.block, &mut entries).unwrap();
+        let mut folded: Vec<(Position, u64)> = entries
+            .into_iter()
+            .map(|(block, index, event)| {
+                (Position::new(block.number, u64::from(index)), event)
+            })
+            .filter(|(position, _)| *position <= cursor)
+            .collect();
+        folded.sort_unstable();
+        folded
+    }
+
+    #[test]
+    fn every_tick_folds_what_a_fold_from_scratch_does() {
+        for seed in 0..2_000 {
+            // given a well-behaved source: random log indices, windows from 1 block up,
+            // and at times heights near u64::MAX
+            let mut rng = Rng(seed);
+            let first = if rng.below(4) == 0 {
+                u64::MAX - rng.below(120)
+            } else {
+                rng.below(50)
+            };
+            let start = first + rng.below(3).min(u64::MAX - first);
+            // The chain always holds a block: an empty `ScriptedChain` reports a head it
+            // does not hold.
+            let mut chain = ScriptedChain::new(first);
+            chain.push_block(&random_events(&mut rng));
+            chain.set_window(rng.pick(&[1, 2, 3, 7, 64, u64::MAX]));
+            let engine = EngineConfig {
+                ring_capacity: rng.pick(&[2, 4, 8, 32]),
+                checkpoint_slots: rng.pick(&[0, 1, 2, 4]),
+            };
+            let config = DriverConfig {
+                checkpoint_interval: rng.pick(&[None, Some(1), Some(2), Some(5)]),
+                ..DriverConfig::from_block(start)
+            };
+            let mut driver =
+                Driver::new(RecordingFold::default(), Indexed(chain), engine, config)
+                    .unwrap();
+            for step in 0..400 {
+                // when blocks arrive or reorg away to a random depth between ticks, and
+                // the driver at times restarts from its snapshot
+                let chain = &mut driver.source_mut().0;
+                match rng.below(10) {
+                    0..=4 => {
+                        for _ in 0..rng.below(4).min(room(chain, first)) {
+                            chain.push_block(&random_events(&mut rng));
+                        }
+                    }
+                    5 | 6 => {
+                        let held = chain.tip().map_or(0, |tip| tip.number - first + 1);
+                        let reach = rng.pick(&[4, 40]);
+                        let depth = (1 + rng.below(reach)).min(held);
+                        let count = rng
+                            .below(depth + 2)
+                            .clamp(1, room(chain, first).saturating_add(depth));
+                        let blocks: Vec<Vec<u64>> =
+                            (0..count).map(|_| random_events(&mut rng)).collect();
+                        let slices: Vec<&[u64]> =
+                            blocks.iter().map(Vec::as_slice).collect();
+                        chain.reorg(depth as usize, &slices);
+                    }
+                    _ => {}
+                }
+                #[cfg(feature = "wincode")]
+                if rng.below(20) == 0 {
+                    let mut bytes = Vec::new();
+                    driver.engine().encode_snapshot(&mut bytes).unwrap();
+                    let restored = Engine::decode_snapshot(&bytes, engine).unwrap();
+                    let source = driver.source_mut().clone();
+                    driver = Driver::resume(
+                        restored,
+                        source,
+                        RecordingFold::default(),
+                        config,
+                    )
+                    .unwrap();
+                }
+                let tick = driver.tick();
+                // then no tick errs, and the fold is the fold from scratch up to the cursor
+                assert!(
+                    !matches!(tick, Tick::SourceError | Tick::Terminal(_)),
+                    "seed {seed} step {step}: {tick:?}"
+                );
+                let want = from_scratch(
+                    driver.source_mut().clone(),
+                    start,
+                    driver.engine().cursor(),
+                );
+                assert_eq!(
+                    driver.engine().fold().applied,
+                    want,
+                    "seed {seed} step {step}: {tick:?}"
+                );
+            }
+        }
+    }
+
     fn counted_driver(chain: ScriptedChain) -> Driver<RecordingFold, Counted> {
         Driver::new(
             RecordingFold::default(),
@@ -3742,6 +3927,28 @@ mod tests {
         assert_eq!(outcome, Tick::SourceError);
         assert_eq!(driver.engine().fold(), &before);
         assert_eq!(driver.engine().cursor(), Some(Position::new(5, 0)));
+    }
+
+    #[test]
+    fn a_dropped_log_is_folded_as_given() {
+        // given a driver caught up on five blocks, and a sixth with two events
+        let mut driver = adversary_driver(one_event_chain(5));
+        run_to_idle(&mut driver);
+        driver.source_mut().inner.push_block(&[6, 7]);
+        let six = driver.source_mut().inner.header(6).unwrap();
+        // when the source answers block 6 without its second log
+        driver.source_mut().torn = Some((6, vec![(six, 0, 6)]));
+        let outcome = driver.tick();
+        let settled = run_to_idle(&mut driver);
+        // then the answer is folded as given: no error, the engine stays Active, and the
+        // fold lacks the dropped event for good
+        assert!(matches!(outcome, Tick::Progressed(_)), "got {outcome:?}");
+        assert_eq!(settled, Tick::Idle);
+        assert!(driver.engine().status().is_active());
+        let folded = &driver.engine().fold().applied;
+        assert!(folded.contains(&(Position::new(6, 0), 6)));
+        assert!(!folded.contains(&(Position::new(6, 1), 7)));
+        assert_eq!(driver.engine().cursor(), Some(Position::new(6, 0)));
     }
 
     #[test]
