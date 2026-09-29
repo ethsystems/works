@@ -1085,6 +1085,27 @@ mod tests {
     }
 
     #[test]
+    fn oversized_slot_count_is_refused_before_any_slot_allocation() {
+        // given a valid envelope and a slot count whose vector would overflow
+        let engine = test_engine();
+        let mut encoded = Vec::new();
+        engine.encode_snapshot(&mut encoded).unwrap();
+        let bad_config = EngineConfig {
+            ring_capacity: 8,
+            checkpoint_slots: usize::MAX,
+        };
+        // when decoded with it
+        let result = Engine::<RecordingFold>::decode_snapshot(&encoded, bad_config);
+        // then Config carries the typed slot error, never a capacity-overflow panic
+        assert_eq!(
+            result.unwrap_err(),
+            SnapshotError::Config(ConfigError::CheckpointSlotsOutOfRange {
+                got: usize::MAX
+            })
+        );
+    }
+
+    #[test]
     fn wrong_tag_is_refused_before_state_decode() {
         // given an envelope encoded for a fold with a different STATE_TAG
         let bytes = encode_custom(b"some-other-fold-tag", None, &[], Vec::new());

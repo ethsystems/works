@@ -189,9 +189,9 @@ dependency stack that a guest or wasm build has no use for.
 - `EngineConfig::ring_capacity` (W): observed-block window, a power of two in `[2, 1 << 20]`.
   It bounds fork detection; a fork deeper than the oldest ring entry is
   `ForkBeyondWindow`.
-- `EngineConfig::checkpoint_slots` (K): retained rollback points. Zero disables rollback,
-  so `Halt` and `Poison` escalate straight to resync and anchor checks never fire. That is
-  the default shape of most consumers today, not an edge case.
+- `EngineConfig::checkpoint_slots` (K): retained rollback points, at most `1 << 16`. Zero
+  disables rollback, so `Halt` and `Poison` escalate straight to resync and anchor checks
+  never fire. That is the default shape of most consumers today, not an edge case.
 - `DriverConfig::checkpoint_interval`: blocks of cursor progress between automatic
   checkpoints. The reorg an offered snapshot survives without a resync is
   `checkpoint_slots * checkpoint_interval` blocks; size both against the deepest reorg
@@ -292,7 +292,10 @@ exceptions are the fns listed as out of scope in `Cargo.toml`.
   the same fold view. Safety does not depend on this, only recovery of the same state.
 - **A6, trusted items.** Each item in `src/verus/tcb.rs`, listed below.
 - **A7, tooling.** Verus, Z3, vstd's `std_specs`, and rustc codegen are correct.
-  Allocation succeeds (partial correctness). The `std` build differs from the proved
+  Allocation succeeds (partial correctness). vstd's `Vec` specs model neither
+  out-of-memory nor the capacity-overflow panic; `EngineConfig::valid` bounds every
+  vector `Engine::new` sizes up front (W <= 2^20, K <= 2^16), so that panic would need
+  an element type of more than 2^43 bytes. The `std` build differs from the proved
   build only in import paths and the CRC backend.
 
 #### trusted items (`src/verus/tcb.rs`)

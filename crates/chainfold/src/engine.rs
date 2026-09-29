@@ -94,6 +94,9 @@ const MIN_RING_CAPACITY: usize = 2;
 /// Largest allowed observed-block ring capacity.
 #[cfg_attr(verus_keep_ghost, verus_verify)]
 const MAX_RING_CAPACITY: usize = 1 << 20;
+/// Largest allowed checkpoint slot count.
+#[cfg_attr(verus_keep_ghost, verus_verify)]
+const MAX_CHECKPOINT_SLOTS: usize = 1 << 16;
 
 /// Fixed engine construction parameters.
 #[cfg_attr(verus_keep_ghost, verus_verify)]
@@ -101,7 +104,7 @@ const MAX_RING_CAPACITY: usize = 1 << 20;
 pub struct EngineConfig {
     /// Observed-block window W; power of two between 2 and 1 << 20.
     pub ring_capacity: usize,
-    /// Retained checkpoint slots K; zero disables rollback.
+    /// Retained checkpoint slots K, at most 1 << 16; zero disables rollback.
     pub checkpoint_slots: usize,
 }
 
@@ -116,7 +119,7 @@ impl Default for EngineConfig {
 }
 
 impl EngineConfig {
-    /// Accepts a power-of-two ring capacity within the allowed range.
+    /// Accepts a power-of-two ring capacity and a slot count within the allowed ranges.
     #[cfg_attr(verus_keep_ghost, verus_spec(r =>
         ensures
             r is Ok <==> self.valid(),
@@ -126,6 +129,7 @@ impl EngineConfig {
         proof! {
             assert(MIN_RING_CAPACITY == 2);
             assert(MAX_RING_CAPACITY == 0x10_0000) by (compute);
+            assert(MAX_CHECKPOINT_SLOTS == 0x1_0000) by (compute);
         }
         if !is_power_of_two(self.ring_capacity) {
             return Err(ConfigError::RingCapacityNotPowerOfTwo {
@@ -135,6 +139,11 @@ impl EngineConfig {
         if !(MIN_RING_CAPACITY..=MAX_RING_CAPACITY).contains(&self.ring_capacity) {
             return Err(ConfigError::RingCapacityOutOfRange {
                 got: self.ring_capacity,
+            });
+        }
+        if self.checkpoint_slots > MAX_CHECKPOINT_SLOTS {
+            return Err(ConfigError::CheckpointSlotsOutOfRange {
+                got: self.checkpoint_slots,
             });
         }
         Ok(())
@@ -1718,6 +1727,30 @@ mod tests {
     }
 
     #[test]
+    fn config_rejects_slot_counts_past_the_bound() {
+        for slots in [(1 << 16) + 1, 1 << 60, usize::MAX] {
+            // given a slot count whose vector would overflow or exhaust the allocator
+            let config = EngineConfig {
+                ring_capacity: 8,
+                checkpoint_slots: slots,
+            };
+            // when constructing
+            let result = Engine::new(RecordingFold::default(), config);
+            // then CheckpointSlotsOutOfRange, never a capacity-overflow panic
+            assert_eq!(
+                result.err(),
+                Some(ConfigError::CheckpointSlotsOutOfRange { got: slots })
+            );
+        }
+        // and the bound itself is accepted
+        let config = EngineConfig {
+            ring_capacity: 8,
+            checkpoint_slots: 1 << 16,
+        };
+        assert!(Engine::new(RecordingFold::default(), config).is_ok());
+    }
+
+    #[test]
     fn checkpoint_then_rollback_restores_view() {
         // given a checkpoint at block 3 and applies through block 6
         let mut engine = engine_with_checkpoints(4);
@@ -2259,10 +2292,13 @@ impl<F> View for Engine<F> {
 }
 
 impl EngineConfig {
-    /// What `validate` accepts: a power-of-two ring capacity in `[2, 2^20]`.
+    /// What `validate` accepts: a power-of-two ring capacity in `[2, 2^20]` and at most
+    /// `2^16` checkpoint slots. Both bound the vectors `Engine::new` allocates, so their
+    /// byte size never reaches the capacity-overflow panic that vstd's specs leave out.
     pub open spec fn valid(self) -> bool {
         &&& 2 <= self.ring_capacity <= 0x10_0000
         &&& self.ring_capacity & ((self.ring_capacity - 1) as usize) == 0
+        &&& self.checkpoint_slots <= 0x1_0000
     }
 }
 

@@ -63,7 +63,11 @@ fn empty_slot<F>(_index: usize) -> Option<Slot<F>> {
 
 #[cfg_attr(verus_keep_ghost, cfg_eval, verus_verify)]
 impl<F> CheckpointRing<F> {
+    // The bound (`EngineConfig::valid`) keeps the slot vector far from the capacity
+    // overflow that vstd's `collect` spec does not model.
     #[cfg_attr(verus_keep_ghost, verus_spec(r =>
+        requires
+            slots <= 0x1_0000,
         ensures
             r.wf(),
             r@ == Seq::new(slots as nat, |_i: int| None::<SlotView>),
