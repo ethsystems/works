@@ -19,7 +19,7 @@ durable, a reorg noticed only when a proof stops verifying.
   declares are not its own.
 - **poll**: the driver keeps the last head a scan covered, the tip. A poll whose head is
   the tip makes one call; a head one block on top of it makes two, the head and that
-  block's logs. Only a gap reads more.
+  block's logs by its hash. Only a gap reads more.
 - **detect**: each batch carries the current header of the cursor block, from the first
   window's answer, which starts at that block, or from the tip, which commits to it. A
   block hash commits to its whole ancestry, so a reorg touching anything at or below the
@@ -33,7 +33,7 @@ durable, a reorg noticed only when a proof stops verifying.
 
 ```mermaid
 flowchart LR
-  C[(chain)] -->|"head, header_at, events_in"| D[Driver]
+  C[(chain)] -->|"head, header_at, events_in, events_at"| D[Driver]
   D -->|apply_batch| E[Engine]
   E --> K["K checkpoint slots"]
   K -->|offer| F[Flusher]
@@ -63,13 +63,14 @@ and recovery), and the adapters (`std`: tokio harness, snapshot store, flusher).
   counted and stepped over), `Halt` (clean below this position, rollback or resync),
   `Poison` (partially mutated, untrusted until a restore). A panic out of `apply` that
   the caller catches leaves the engine `Poisoned` too, so no event is folded twice.
-- `Source` is three reads: `head` (the head block and its parent's hash), `header_at`,
-  and `events_in`. The driver owns the window walk, the boundary read, and the grouping
-  into spans, so a source cannot get the batch shape wrong and every source gets fork
-  detection. Every walk reads the head block again after the events and drops the batch
-  when it moved, so a reorg that lands between two windows, or inside one answer, is
-  retried, not folded. Two hashes at one height are a source error. `Ok(None)` from a
-  probe means suspected fork.
+- `Source` is four reads: `head` (the head block and its parent's hash), `header_at`,
+  `events_in` (a range of heights), and `events_at` (one block, by hash). The driver
+  owns the window walk, the boundary read, and the grouping into spans, so a source
+  cannot get the batch shape wrong and every source gets fork detection. Every walk
+  reads the head block again after the events and drops the batch when it moved, so a
+  reorg that lands between two windows, or inside one answer, is retried, not folded.
+  Two hashes at one height are a source error. `Ok(None)` from a probe means suspected
+  fork.
 - rollback is bounded to K retained checkpoints. Over-rollback past still-canonical but
   unobserved blocks is intended; the discarded events replay deterministically.
 - the recovery ladder is rollback, then resync from genesis, then a typed terminal state.
@@ -308,20 +309,26 @@ exceptions are the fns listed as out of scope in `Cargo.toml`.
   ancestry. Each view that a source presents satisfies `a1::<S, E>(V)`: `chain(V)`
   plus strictly ascending log indices. The decoded logs are per source type
   (`logs::<S, E>`).
-- **A2, source answers.** (i) Each `head`, `header_at`, and `events_in` call answers
-  from one view. The source spec records that view in `sview_log`. A node that tears
-  one range answer across a reorg breaks this, and a scan drops such an answer when the
-  head block moved under it.
+- **A2, source answers.** (i) Each `head`, `header_at`, `events_in`, and `events_at`
+  call answers from one view. The source spec records that view in `sview_log`. A node
+  that tears one range answer across a reorg breaks this, and a scan drops such an
+  answer when the head block moved under it.
   (ii) `events_in` appends every event of its range in that view and no other, in any
-  order. Nothing in the crate checks an answer against the block: a dropped or an
-  invented log is folded as given, and nothing reports it. A1 then also needs the source
-  to check logs against the receipts root, or to trust its node. (iii) No ABA: a view
-  between two views that hold a block holds it too. The proofs use this for the head
-  block within one tick, and for the scan tip from the tick that set it. A source behind
-  a load balancer whose nodes lag each other breaks it: a node without the new head
-  block answers `events_in` for it with nothing, the tip moves past the block, and its
-  events are skipped. Point such a source at one node, or at nodes that never answer
-  below a head another has reported. (iv) Each view holds every height from
+  order. `events_at` appends exactly the events of the block with that hash, in any
+  order, and errs on a hash the source does not know or has not executed (JSON-RPC:
+  `eth_getLogs` with `blockHash`). geth breaks this for a block it holds no receipts for
+  (it answers nothing), and erigon before 3.7.0 for a hash off its canonical chain (it
+  answers the canonical block at that height). Nothing in the crate checks an answer
+  against the block: a dropped or an invented log is folded as given, and nothing
+  reports it. A1 then also needs the source to check logs against the receipts root, or
+  to trust its node. (iii) No ABA: a view between two views that hold a block holds it
+  too. The proofs use this for the head block within one tick, and for the scan tip from
+  the tick that set it. The block on top of the tip is read by its hash, so a
+  load-balanced node without it errs and the tip stays below it. A range read can still
+  break this: behind a load balancer whose nodes lag each other, a node without the
+  newest blocks answers `events_in` for them with nothing, the tip moves past them, and
+  their events are skipped. Point such a source at one node, or at nodes that never
+  answer below a head another has reported. (iv) Each view holds every height from
   `start_block` up to each height it holds.
 - **A2′, one bisection view.** All probes of one bisection see one view. Only the
   optimality of `canonical_prefix` needs it. Optimality also takes `down_closed(V)` as a hypothesis: `V`

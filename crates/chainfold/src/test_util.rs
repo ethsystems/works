@@ -338,7 +338,9 @@ impl Source for ScriptedChain {
             usize::try_from(number.saturating_sub(self.first_block))
                 .map_or(self.blocks.len(), |i| i.min(self.blocks.len()))
         };
-        let (start, end) = (index(from), index(to.saturating_add(1)));
+        // A range up to `u64::MAX` ends at the tip: no block lies past it.
+        let end = to.checked_add(1).map_or(self.blocks.len(), index);
+        let start = index(from);
         for block in &self.blocks[start.min(end)..end] {
             let header = BlockRef {
                 number: block.number,

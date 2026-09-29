@@ -489,7 +489,7 @@ spec 28db473bd015 src/driver.rs::lemma_rung_walk
 spec 8c53b3aab297 src/driver.rs::lemma_rung_gap
 spec 24551f307d06 src/driver.rs::lemma_rung_same
 spec d267e8f9c624 src/driver.rs::lemma_parent
-spec 96d5452eca84 src/driver.rs::lemma_rung_next
+spec ec37bed053a4 src/driver.rs::lemma_rung_next
 spec d66bb1c01c56 src/driver.rs::lemma_tip_use
 spec 0d0a1ec25d53 src/driver.rs::lemma_tip_grew
 spec 5a2ba4be2dcf src/driver.rs::lemma_anchor

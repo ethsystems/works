@@ -1124,9 +1124,9 @@ where
     /// empty.
     ///
     /// Cheapest first: a head equal to the tip is one call; a head whose parent is the tip
-    /// reads its own block; a gap past the tip, when that costs fewer calls than the
-    /// cursor walk, reads above the tip and then the tip; otherwise the walk starts at the
-    /// cursor block, whose header the first answer carries.
+    /// reads its own block by hash; a gap past the tip, when that costs fewer calls than
+    /// the cursor walk, reads above the tip and then the tip; otherwise the walk starts at
+    /// the cursor block, whose header the first answer carries.
     // One answer is one view. A tip is a head a scan covered: the chain its hash commits
     // to holds nothing left to fold above the cursor up to it (A1), so a view that holds
     // the tip needs no events or boundary read below it. Every walk ends by reading the
@@ -1250,8 +1250,8 @@ where
         read
     }
 
-    /// `scan` with the head one block on top of the tip: reads the head block alone, and
-    /// takes it only when every entry carries the head's hash. `Ok(false)` when some entry
+    /// `scan` with the head one block on top of the tip: reads the head block by its hash,
+    /// and takes it only when every entry carries that hash. `Ok(false)` when some entry
     /// does not; the batch is then empty.
     #[cfg_attr(verus_keep_ghost, verus_spec(r =>
         requires
@@ -1296,8 +1296,7 @@ where
             lemma_grew_next::<S, S::Event>(sview_log::<S>(&old(self).source), sview_log::<S>(&self.source));
         }
         self.scratch.clear();
-        self.source
-            .events_in(head.block.number, head.block.number, &mut self.scratch)?;
+        self.source.events_at(&head.block, &mut self.scratch)?;
         if !all_in(self.scratch.as_slice(), head.block) {
             return Ok(false);
         }
@@ -1306,7 +1305,9 @@ where
             let ghost got = self.scratch@;
             let ghost h2 = sview_log::<S>(&self.source);
             assert(got == got.subrange(0, got.len() as int));
-            lemma_re_one_view::<S, S::Event>(h2.last(), head.block.number as int, head.block.number as int);
+            assert(h2[l0] == sview_log::<S>(&old(self).source).last());
+            lemma_hash_entries::<S, S::Event>(h2[l0], head.block);
+            lemma_re_one_view::<S, S::Event>(h2[l0], head.block.number as int, head.block.number as int);
         }
         if !self.scratch.is_empty() {
             group_into(&mut self.batch, &mut self.scratch);
@@ -1325,7 +1326,6 @@ where
             crate::batch::lemma_batch_view(b0);
             crate::batch::lemma_batch_view(self.batch);
             lemma_triples_ignore_boundary(self.batch@, b0@, b0@.ends.len() as int);
-            assert(h2[l0] == sview_log::<S>(&old(self).source).last());
             assert forall|tip: BlockRef| tip.hash == head.parent && tip.number + 1 == head.block.number implies #[trigger] scanned::<
                 S,
                 S::Event,
@@ -4207,7 +4207,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "a node that lags the head answers the new block without its events, and the tip moves past it"]
     fn lagging_backend_new_block_is_not_skipped() {
         let chain = one_event_chain(5);
         fold_past_a_lagging_node(
@@ -5143,8 +5142,8 @@ proof fn lemma_parent<S, E>(v: ChainView, hd: BlockRef, parent: [u8; 32], tip: B
     assert(v[tip.number] == anc(v[hd.number].hash, tip.number));
 }
 
-/// `scan` with the head one block on top of the tip: the head's view `hist[l0]` and the
-/// view `hist[l0 + 1]` that answered for the head block, whose entries `got` all carry it.
+/// `scan` with the head one block on top of the tip: the head's view `hist[l0]` holds the
+/// head block, and `got`, its entries read by hash, are that view's entries at the head.
 proof fn lemma_rung_next<S, E>(
     hist: Seq<ChainView>,
     l0: int,
@@ -5156,66 +5155,36 @@ proof fn lemma_rung_next<S, E>(
     got: Seq<(BlockRef, u32, E)>,
 )
     requires
-        0 <= l0,
-        hist.len() == l0 + 2,
+        0 <= l0 < hist.len(),
         header(hist[l0], head.block.number) == Some(head.block),
         head.block.number > 0 ==> anc(head.block.hash, (head.block.number - 1) as u64).hash == head.parent,
         head.parent == tip.hash,
         tip.number + 1 == head.block.number,
         a1::<S, E>(hist[l0]),
-        a1::<S, E>(hist[l0 + 1]),
         got.to_multiset() == range_entries::<S, E>(
-            hist[l0 + 1],
+            hist[l0],
             head.block.number as int,
             head.block.number as int,
         ).to_multiset(),
-        forall|i: int| 0 <= i < got.len() ==> #[trigger] got[i].0 == head.block,
         b.triples().to_multiset() == got.to_multiset(),
     ensures
         scanned::<S, E>(hist, l0, start, c, Some(tip), Some(head.block), b),
 {
     let hd = head.block;
     let n = hd.number as int;
-    let (v0, v1) = (hist[l0], hist[l0 + 1]);
-    vstd::seq_lib::to_multiset_len(got);
+    let v0 = hist[l0];
     vstd::seq_lib::to_multiset_len(b.triples());
-    vstd::seq_lib::to_multiset_len(range_entries::<S, E>(v1, n, n));
-    if got.len() > 0 {
-        vstd::seq_lib::to_multiset_contains(got, got[0]);
-        vstd::seq_lib::to_multiset_contains(range_entries::<S, E>(v1, n, n), got[0]);
-        let i = choose|i: int| 0 <= i < range_entries::<S, E>(v1, n, n).len() && range_entries::<S, E>(v1, n, n)[i]
-            == got[0];
-        lemma_re_facts::<S, E>(v1, n, n);
-        assert(header(v1, hd.number) == Some(hd));
-    }
-    let premise = a2_tick(hist, l0, start, Some(tip)) && (c matches Some(p) ==> p.block >= start) && tip.number + 1
-        >= start;
-    if premise && tip.number >= start {
-        reveal(views_ok);
-        assert(from_start(hist[l0], start) && from_start(hist[l0 + 1], start));
-        lemma_parent::<S, E>(v0, hd, head.parent, tip, start);
-        if header(v1, hd.number) == Some(hd) {
-            lemma_parent::<S, E>(v1, hd, head.parent, tip, start);
+    vstd::seq_lib::to_multiset_len(range_entries::<S, E>(v0, n, n));
+    if a2_tick(hist, l0, start, Some(tip)) && (c matches Some(p) ==> p.block >= start) && tip.number + 1 >= start {
+        if tip.number >= start {
+            reveal(views_ok);
+            assert(from_start(v0, start));
+            lemma_parent::<S, E>(v0, hd, head.parent, tip, start);
         }
+        assert(anchored(hist, l0, c, Some(tip), b.boundary, start, n));
     }
-    if got.len() > 0 {
-        let k = l0 + 1;
-        if premise {
-            assert(anchored(hist, k, c, Some(tip), b.boundary, start, n));
-        }
-        assert(range_entries::<S, E>(v1, n, n - 1) =~= Seq::empty());
-        assert(scan_view::<S, E>(hist, l0, start, c, Some(tip), Some(hd), b, (k, hd, n, n, n, k, n)));
-    } else {
-        if premise {
-            assert(anchored(hist, l0, c, Some(tip), b.boundary, start, n));
-            if header(v1, hd.number) == Some(hd) {
-                assert(anchored(hist, l0 + 1, c, Some(tip), b.boundary, start, n));
-            }
-        }
-        assert(range_entries::<S, E>(v0, n, n - 1) =~= Seq::empty());
-        assert(b.triples() =~= range_entries::<S, E>(v0, n, n - 1));
-        assert(scan_view::<S, E>(hist, l0, start, c, Some(tip), Some(hd), b, (l0, hd, n, n, n - 1, l0 + 1, n)));
-    }
+    assert(range_entries::<S, E>(v0, n, n - 1) =~= Seq::empty());
+    assert(scan_view::<S, E>(hist, l0, start, c, Some(tip), Some(hd), b, (l0, hd, n, n, n, l0, n)));
 }
 
 /// A later view that holds the tip agrees with the tip's vouching view up to the tip, so
