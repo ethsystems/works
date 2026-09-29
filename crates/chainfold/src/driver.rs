@@ -267,6 +267,9 @@ where
             engine.wf(),
         ensures
             r matches Ok(d) ==> d.wf() && d.synced() && d.engine_view() == engine@ && d.durable_ok(),
+            r matches Ok(d) ==> forall|log: Seq<(Position, F::Event)>, h: ChainView|
+                #[trigger] dinv::<F, S, F::Event, F::Error>(engine@, fview::<F>(&genesis), config.start_block, log, h)
+                    ==> d.dinv(log, h),
             r matches Err(e) ==> horizon_refused(e, config.start_block),
     ))]
     pub fn resume(
@@ -324,6 +327,9 @@ where
         ensures
             r matches Ok(d) ==> d.wf() && d.synced() && d.engine_view() == engine@
                 && (floor_ok(sink_offered::<K>(&sink), engine@) ==> d.durable_ok()),
+            r matches Ok(d) ==> forall|log: Seq<(Position, F::Event)>, h: ChainView|
+                #[trigger] dinv::<F, S, F::Event, F::Error>(engine@, fview::<F>(&genesis), config.start_block, log, h)
+                    ==> d.dinv(log, h),
             r matches Err(e) ==> horizon_refused(e, config.start_block),
     ))]
     pub fn resume_with_sink(
@@ -468,6 +474,9 @@ where
             old(self).wf() && final(r).wf() ==> final(self).wf(),
             old(self).synced() ==> (final(self).synced() <==> final(r)@.resets == r@.resets),
             old(self).durable_ok() && final(r)@ == r@ ==> final(self).durable_ok(),
+            // A reset leaves the driver out of sync, so `durable_ok` holds until the next
+            // tick reconciles the sink.
+            old(self).synced() && final(r)@.resets != r@.resets ==> final(self).durable_ok(),
     ))]
     pub fn engine_mut(&mut self) -> &mut Engine<F> {
         self.tip = None;
@@ -805,6 +814,7 @@ where
                     ==> tick_inv(*old(self), *final(self), r, init, log),
             forall|log: Seq<(Position, F::Event)>, h: ChainView|
                 #[trigger] old(self).dinv(log, h) ==> t7_tick(*old(self), *final(self), r, log, h),
+            r is Resynced ==> final(self).dinv(Seq::empty(), Map::empty()),
     ))]
     fn step(&mut self) -> Tick {
         self.reconcile_reset();
@@ -829,6 +839,10 @@ where
             assert(mid.source_log() == old(self).source_log());
             assert(pa.engine_view() == self.engine_view() && pa.source_log() == self.source_log()
                 && pa.batch_view() == self.batch_view() && pa.init_view() == self.init_view());
+            if tick is Resynced {
+                assert(pa.dinv(Seq::empty(), Map::empty()));
+                assert(self.dinv(Seq::empty(), Map::empty()));
+            }
             assert forall|log: Seq<(Position, F::Event)>, h: ChainView|
                 #[trigger] old(self).dinv(log, h) implies t7_tick(*old(self), *self, tick, log, h) by {
                 assert(mid.dinv(log, h));
@@ -858,6 +872,7 @@ where
                     ==> tick_inv(*old(self), *final(self), r, init, log),
             forall|log: Seq<(Position, F::Event)>, h: ChainView|
                 #[trigger] old(self).dinv(log, h) ==> t7_tick(*old(self), *final(self), r, log, h),
+            r is Resynced ==> final(self).dinv(Seq::empty(), Map::empty()),
     ))]
     #[cfg_attr(verus_keep_ghost, verifier::spinoff_prover)]
     #[cfg_attr(verus_keep_ghost, verifier::rlimit(20))]
@@ -1053,6 +1068,14 @@ where
                 #[cfg(verus_keep_ghost)]
                 proof! {
                     lemma_recover_t7(*old(self), pre, *self, tick);
+                    if tick is Resynced {
+                        self.engine.lemma_wf();
+                        lemma_fresh_dinv::<F, S, F::Event, F::Error>(
+                            self.engine@,
+                            fview::<F>(&self.initial),
+                            self.config.start_block,
+                        );
+                    }
                 }
                 tick
             }
@@ -1133,6 +1156,8 @@ where
                 )
             }),
     ))]
+    // A nested `if let`, not a `let` chain: Verus does not take `let` chains.
+    #[allow(clippy::collapsible_if)]
     fn scan(&mut self) -> Result<bool, S::Error> {
         self.batch.clear();
         let cursor = self.engine.cursor();
@@ -1199,7 +1224,7 @@ where
             lemma_grew_next::<S, S::Event>(sview_log::<S>(&old(self).source), hw);
             assert(hw[l0] == h1[l0]);
         }
-        self.from_cursor(head.block, window, from)
+        self.cursor_walk(head.block, window, from)
     }
 
     /// `scan` with the head one block on top of the tip: reads the head block alone, and
@@ -1248,7 +1273,7 @@ where
         self.scratch.clear();
         self.source
             .events_in(head.block.number, head.block.number, &mut self.scratch)?;
-        if !all_in(&self.scratch, head.block) {
+        if !all_in(self.scratch.as_slice(), head.block) {
             return Ok(false);
         }
         #[cfg(verus_keep_ghost)]
@@ -1464,7 +1489,7 @@ where
                 ),
     ))]
     #[cfg_attr(verus_keep_ghost, verifier::spinoff_prover)]
-    fn from_cursor(
+    fn cursor_walk(
         &mut self,
         head: BlockRef,
         window: u64,
@@ -1516,11 +1541,11 @@ where
             lemma_grew_refl::<S, S::Event>(h3);
             lemma_grew_next::<S, S::Event>(h3, h3);
         }
-        if reads > 1 || (reads == 1 && cursor.is_some() && at.is_none()) {
-            if self.source.header_at(head.number)? != Some(head) {
-                self.batch.clear();
-                return Ok(false);
-            }
+        if (reads > 1 || (reads == 1 && cursor.is_some() && at.is_none()))
+            && self.source.header_at(head.number)? != Some(head)
+        {
+            self.batch.clear();
+            return Ok(false);
         }
         self.batch.boundary = boundary;
         if reached {
@@ -1890,6 +1915,7 @@ where
                     ==> tick_inv(*old(self), *final(self), r, init, log),
             forall|log: Seq<(Position, F::Event)>, h: ChainView|
                 #[trigger] old(self).dinv(log, h) ==> t7_tick(*old(self), *final(self), r, log, h),
+            r is Resynced ==> final(self).dinv(Seq::empty(), Map::empty()),
     ))]
     pub fn tick(&mut self) -> Tick {
         self.step()
@@ -1979,7 +2005,7 @@ where
     ensures
         r == forall|i: int| 0 <= i < entries@.len() ==> #[trigger] entries@[i].0 == block,
 ))]
-fn all_in<E>(entries: &Vec<(BlockRef, u32, E)>, block: BlockRef) -> bool {
+fn all_in<E>(entries: &[(BlockRef, u32, E)], block: BlockRef) -> bool {
     let mut i = 0;
     #[cfg_attr(verus_keep_ghost, verus_spec(
         invariant
@@ -2368,6 +2394,9 @@ mod tests {
         chain.reorg(depth, &slices);
     }
 
+    /// One `events_in` answer: header, log index, event.
+    type Answer = Vec<(BlockRef, u32, u64)>;
+
     /// Scripted chain that misbehaves once, inside a single scan.
     struct Adversary {
         inner: ScriptedChain,
@@ -2378,7 +2407,7 @@ mod tests {
         before_window: Option<(u64, usize, Vec<Vec<u64>>)>,
         /// Answer served as is by the `events_in` call for the window starting at the
         /// given block.
-        torn: Option<(u64, Vec<(BlockRef, u32, u64)>)>,
+        torn: Option<(u64, Answer)>,
         /// Extra entry served whenever the queried range covers its block.
         rogue: Option<(BlockRef, u32, u64)>,
     }

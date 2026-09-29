@@ -17,9 +17,13 @@ durable, a reorg noticed only when a proof stops verifying.
 - **apply**: a poll fills one `Batch`; the `Engine` enforces the total order, drops
   everything at or below the cursor as already applied, and counts the events the fold
   declares are not its own.
-- **detect**: each batch carries the current header of the cursor block. A block hash
-  commits to its whole ancestry, so a reorg touching anything at or below the cursor
-  changes that one hash. One header per poll, one 40-byte compare.
+- **poll**: the driver keeps the last head a scan covered, the tip. A poll whose head is
+  the tip makes one call; a head one block on top of it makes two, the head and that
+  block's logs. Only a gap reads more.
+- **detect**: each batch carries the current header of the cursor block, from the first
+  window's answer, which starts at that block, or from the tip, which commits to it. A
+  block hash commits to its whole ancestry, so a reorg touching anything at or below the
+  cursor changes that one hash. One 40-byte compare per poll.
 - **recover**: on a mismatch, the driver bisects the ring of observed blocks with
   `header_at` for the deepest still-canonical block, rolls back to the newest checkpoint
   at or below it, and refolds forward. `O(log W)` probes, then deterministic replay.
@@ -59,12 +63,13 @@ and recovery), and the adapters (`std`: tokio harness, snapshot store, flusher).
   counted and stepped over), `Halt` (clean below this position, rollback or resync),
   `Poison` (partially mutated, untrusted until a restore). A panic out of `apply` that
   the caller catches leaves the engine `Poisoned` too, so no event is folded twice.
-- `Source` is three reads: `head`, `header_at`, `events_in`. The driver owns the window
-  walk, the boundary refetch, and the grouping into spans, so a source cannot get the
-  batch shape wrong and every source gets fork detection. The boundary is refetched
-  after the events, so a reorg at or below the cursor that lands mid-scan is caught by
-  that same poll. Two hashes at one height are a source error. `Ok(None)` from a probe
-  means suspected fork.
+- `Source` is three reads: `head` (the head block and its parent's hash), `header_at`,
+  and `events_in`. The driver owns the window walk, the boundary read, and the grouping
+  into spans, so a source cannot get the batch shape wrong and every source gets fork
+  detection. A walk of more than one window reads the head block again after the events
+  and drops the batch when it moved, so a reorg that lands between two windows is
+  retried, not folded. Two hashes at one height are a source error. `Ok(None)` from a
+  probe means suspected fork.
 - rollback is bounded to K retained checkpoints. Over-rollback past still-canonical but
   unobserved blocks is intended; the discarded events replay deterministically.
 - the recovery ladder is rollback, then resync from genesis, then a typed terminal state.
@@ -269,13 +274,25 @@ trusted items are in `src/verus/tcb.rs`.
   durable snapshot view except for the fold (A5), or the fold's `State` error. That
   direction trusts the codec round trip (tcb items 6 and 7). `Driver::status` reports
   `durable_cursor <= cursor` while the driver state is `durable_ok`. Every
-  driver method keeps `durable_ok`.
+  driver method keeps `durable_ok`, except `engine_mut`, which keeps it when the caller
+  leaves the engine unchanged or resets it. Its other edits are the caller's to keep in
+  line: the engine's own methods do by inspection, but no spec says so.
 - **T7, driver end to end.** Under A1, A2, and A3, `Driver::tick` keeps the ghost
-  invariant `dinv`, and a new driver starts in it. After a tick that returns
+  invariant `dinv`. `new` and `with_sink` start a driver in it, and every `Resynced`
+  tick restarts it. `resume` and `resume_with_sink` keep it for an engine that is in it
+  under the driver's genesis fold and start block. After a tick that returns
   `Progressed` or `Idle` with the engine `Active`, the fold equals the fold of the
-  canonical logs of that tick's view up to the cursor, and the ring is a hash chain in
-  that view. After `RolledBack`, `inv` holds over the canonical logs of a view that
-  confirmed the probed ring entry.
+  canonical logs, up to the cursor, of one view the tick's calls answered from, and the
+  ring is a hash chain in that view. After `RolledBack`, `inv` holds over the canonical
+  logs of a view that confirmed the probed ring entry, when that view holds every height
+  from `start_block` to that entry. `dinv` also covers the scan tip: the chain it commits
+  to holds nothing to fold between the cursor and the tip.
+
+  No proof shows that a decoded snapshot is in `dinv`: that rests on the driver that
+  wrote it having been in it, on the state codec (A5), and on the source still holding
+  the chain its ring names. So a resumed driver has T7 only as far as its engine is in
+  `dinv`, and outright from its first `Resynced` tick on. `engine_mut` clears the tip.
+  After an edit through it, T7 covers the driver again from its next `Resynced` tick.
 
 Verus checks every exec fn in the in-scope files for panics and overflow. The only
 exceptions are the fns listed as out of scope in `Cargo.toml`.
@@ -286,16 +303,25 @@ exceptions are the fns listed as out of scope in `Cargo.toml`.
   ancestry. Each view that a source presents satisfies `a1::<S, E>(V)`: `chain(V)`
   plus strictly ascending log indices. The decoded logs are per source type
   (`logs::<S, E>`).
-- **A2, scan-view stability.** (i) Each `header_at` and `events_in` call answers from
-  one view. The source spec records that view in `sview_log`. (ii) Blocks of earlier
-  empty windows are unchanged in the last `events_in` view of the same scan. (iii) No
-  ABA: a cursor block that is canonical at the boundary fetch was canonical during the
-  last `events_in`.
+- **A2, source answers.** (i) Each `head`, `header_at`, and `events_in` call answers
+  from one view. The source spec records that view in `sview_log`. A node that tears
+  one range answer across a reorg breaks this: a scan of one window can fold such an
+  answer, and a scan of more windows drops it when the head block moved under it.
+  (ii) `events_in` appends every event of its range in that view and no other, in any
+  order. Nothing in the crate checks an answer against the block: a dropped or an
+  invented log is folded as given, and nothing reports it. A1 then also needs the source
+  to check logs against the receipts root, or to trust its node. (iii) No ABA: a view
+  between two views that hold a block holds it too. The proofs use this for the head
+  block within one tick, and for the scan tip from the tick that set it. A source behind
+  a load balancer whose nodes lag each other breaks it: a node without the new head
+  block answers `events_in` for it with nothing, the tip moves past the block, and its
+  events are skipped. Point such a source at one node, or at nodes that never answer
+  below a head another has reported. (iv) Each view holds every height from
+  `start_block` up to each height it holds.
 - **A2′, one bisection view.** All probes of one bisection see one view. Only the
   optimality of `canonical_prefix` needs it. Optimality also takes `down_closed(V)` as a hypothesis: `V`
   holds every height below each height it holds. `a1` does not include this, because
-  a pruned source answers `None` below its horizon. T7 takes the weaker
-  `holds(V, start_block, n)` for each view a tick uses.
+  a pruned source answers `None` below its horizon. T7 takes the weaker A2 (iv).
 - **A3, fold determinism.** `Fold::apply` is a function of the state view, the
   position, and the event. The state view is `fview(&f)`, an uninterpreted `int`
   (`F: ?Sized`, so `Fold` has no `Sized` bound). A `Halt` keeps the view. `Clone`
@@ -317,6 +343,14 @@ exceptions are the fns listed as out of scope in `Cargo.toml`.
   vector `Engine::new` sizes up front (W <= 2^20, K <= 2^16), so that panic would need
   an element type of more than 2^43 bytes. The `std` build differs from the proved
   build only in import paths and the CRC backend.
+
+A source that breaks A1 or A2 has no guarantee, and the faults the driver notices loop
+without a signal of their own. A source that repeats every log returns `SourceError` on
+every tick, because the batch fails `validate`. One whose `head` hash never matches its
+`header_at` for that height returns `SourceError` on every walk of more than one window.
+One whose `header_at` disagrees with the hashes its `events_in` answers carry keeps
+falling back to the walk or rolling back and refolding. With K = 0, one `None` from a
+lagging node at the cursor block resyncs from the start block.
 
 #### trusted items (`src/verus/tcb.rs`)
 
