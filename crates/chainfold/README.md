@@ -168,6 +168,10 @@ survive a reorg, then restart from the durable cursor and converge on the same s
 cargo run -p chainfold --example replay --features tokio,storage,test-helpers
 ```
 
+The snapshot directory is trusted input. The checksums (CRC32C) catch corruption, not
+tampering. `decode_snapshot` returns a well-formed engine for any bytes (T6), but a file
+crafted with a valid checksum can set any cursor and fold state, and it is accepted.
+
 ### Features
 
 | feature | pulls in | notes |
@@ -329,24 +333,57 @@ exceptions are the fns listed as out of scope in `Cargo.toml`.
 10. `axiom_no_sink_offers_nothing`: `NoSink` stores nothing, so it holds no offers (A4).
 
 `.github/scripts/verus-gates.py` fails when a trusted construct appears outside
-`tcb.rs`. It also fails on a fn in an in-scope file that has no verifying attribute
-and is not on the out-of-scope list. The list is in `Cargo.toml`.
+`tcb.rs`, or a construct that hides code from its checks: `#[path]`, `include!`,
+`macro_rules!`, a build script, or a nightly feature that is not on its list. `Cargo.toml`
+lists every file in `src/` as in scope or out of scope, and an out-of-scope file has no
+Verus annotations. In an in-scope file, the script fails on a fn that has no verifying
+attribute and is not on the out-of-scope list. It also fails on a fn that a `cfg`
+removes from the Verus build, for example a second body under `cfg(not(verus_keep_ghost))`
+or `cfg(feature = "std")`. It reads attributes as rustc applies them with the CI features.
+Every trait that an in-scope file declares must be on `trusted-traits`, because Verus
+assumes its spec for each impl that it does not check.
+
+`verus-manifest.txt` records what the proofs cover. It has a hash of each tcb item, the
+dependency list, and a hash of each spec: each `verus_spec`, the contract of each fn in a
+`verus!` block, and the body of each spec fn. It also has the verified count and the name
+of each fn that Verus verified. The script compares the hashes with the sources. The CI
+job compares the Verus report with the count and the names. Thus a weaker spec, a new
+trusted item, or a dropped proof fails CI until the manifest changes too, and the
+manifest diff names each item. To update the manifest, run the command in the header of
+`verus-gates.py`, then review the diff.
 
 #### out of scope
 
-- `harness` and `storage/*`: threads and fsync. Fuzz tests cover them, and no proof
-  does.
-- `Display` and `Debug` impls, and `next_delay` timing.
-- Liveness beyond loop termination, and performance beyond the probe bounds.
+Verus checks no fn in these parts of the public API:
+
+- The `harness` module (`tokio` feature) and the `storage` module (`storage` feature):
+  `Flusher`, `SnapshotStore`, `RealVfs`, the `Vfs` trait, and their error types. They
+  hold the threads, fsync, and file I/O. Fuzz tests cover them, and no proof does.
+- The `test_util` module (`test-helpers` feature).
+- In the in-scope files, the fns on the out-of-scope list in `Cargo.toml`: each
+  `Display::fmt`, `DriverConfig::default` and `DriverConfig::from_block` (constants),
+  `Driver::next_delay` (timing), and `Engine::fold_mut` (A3). The snapshot codec
+  wrappers on that list are trusted items instead.
+- Derived impls (`Debug`, `Clone`, `PartialEq`, `Eq`, `Default`), the `serde` derives on
+  `Position` and `BlockRef`, and the CRC backend of the `std` build (`crc-fast`).
 - Implementations of the trusted traits: `NoSink` and `storage::Flusher` (A4), and
   every `Persist` fold (A5).
-- `Engine::fold_mut` (A3).
+
+Verus checks every other public fn. Some of them have preconditions that only verified
+code can meet. Most are `wf()` of a value that only verified constructors build.
+`Batch::push_block` also requires `finite_into_iter(events)`: the iterator obeys vstd's
+iterator laws and has a decreasing measure. An unverified caller cannot show this. The
+call stays safe, because it only pushes, but it does not return on an infinite iterator.
+
+Also out of scope: liveness beyond loop termination, performance beyond the probe
+bounds, and the authenticity of snapshot files (see durability).
 
 #### running it
 
 CI runs the `verus` job on x86 Linux with the release pinned in
-`.github/workflows/ci.yml`. The job fails unless Verus reports
-`N verified, 0 errors` with `N` at or above `VERUS_MIN_VERIFIED`. On x86 Linux:
+`.github/workflows/ci.yml`. The job fails unless the Verus JSON report shows 0 errors,
+and its verified count and set of verified fns are equal to `verus-manifest.txt`. On
+x86 Linux:
 
 1. Download the pinned `verus-<version>-x86-linux.zip` and put its directory on `PATH`.
 2. Read the toolchain from the zip:
@@ -359,10 +396,11 @@ python3 .github/scripts/verus-gates.py --self-test
 python3 .github/scripts/verus-gates.py crates/chainfold
 RUSTUP_TOOLCHAIN=<toolchain> cargo clean -p chainfold
 RUSTUP_TOOLCHAIN=<toolchain> cargo verus verify -p chainfold --features verus,wincode \
-    --check-toolchain --fwd-verus-args-to roots
+    --check-toolchain --fwd-verus-args-to roots -- --output-json --time-expanded > verus.out
+python3 .github/scripts/verus-gates.py --results crates/chainfold verus.out
 ```
 
-Clean before each run. A cached run prints no results line and verifies nothing.
+Clean before each run. A cached run prints no report and verifies nothing.
 There is no prebuilt Verus for aarch64 Linux. Build it from source there (Verus
 `BUILD.md`, Z3 4.16.0), or use CI.
 <!-- ANCHOR_END: verification -->
