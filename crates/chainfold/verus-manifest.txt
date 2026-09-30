@@ -359,6 +359,62 @@ resolved 213ca3e8a80925aec251d3f1952a213d6090156b58ad81dccc3a2f1fed77c99f verus_
 resolved bb7a36bbc0193492141eef73272853a5a8d73288bed1ea5344563b0382cdf7c9 vstd@0.0.0-2026-09-20-0158
 resolved 11d582d9fc9d813264407a9e16bfa16846ccf15ef032f9bbcd700741bdc00255 wincode-derive@0.5.1
 resolved bfc6339f1ba427bf7ad7c42403b28e524832ba2ddb5eef1bb2cc3b85db6b7b75 wincode@0.6.1
+feature [] default
+feature ["dep:include-utils"] docs
+feature ["dep:serde"] serde
+feature ["serde?/std","wincode?/std","dep:crc-fast","crc-fast/std"] std
+feature ["std","wincode"] storage
+feature [] test-helpers
+feature ["std","dep:tokio"] tokio
+feature ["dep:vstd"] verus
+feature ["dep:wincode","dep:crc"] wincode
+cfg feature="default"
+cfg feature="verus"
+cfg feature="wincode"
+cfg verus_keep_ghost
+cfg verus_keep_ghost_body
+scope in src/batch.rs
+scope in src/checkpoint.rs
+scope in src/driver.rs
+scope in src/engine.rs
+scope in src/error.rs
+scope in src/fold.rs
+scope in src/lib.rs
+scope in src/position.rs
+scope in src/ring.rs
+scope in src/sink.rs
+scope in src/snapshot.rs
+scope in src/source.rs
+scope in src/verus/mod.rs
+scope in src/verus/model.rs
+scope out src/batch.rs::BatchShapeError::fmt
+scope out src/driver.rs::Driver::next_delay
+scope out src/driver.rs::DriverConfig::default
+scope out src/driver.rs::DriverConfig::from_block
+scope out src/engine.rs::Engine::fold_mut
+scope out src/error.rs::ApplyError::fmt
+scope out src/error.rs::ConfigError::fmt
+scope out src/error.rs::DivergenceCause::fmt
+scope out src/error.rs::DurabilityLost::fmt
+scope out src/error.rs::EngineStatus::fmt
+scope out src/error.rs::FoldError::fmt
+scope out src/error.rs::HexHash::fmt
+scope out src/error.rs::RollbackError::fmt
+scope out src/harness.rs
+scope out src/snapshot.rs::SnapshotError::fmt
+scope out src/snapshot.rs::crc32c
+scope out src/snapshot.rs::read_envelope
+scope out src/snapshot.rs::write_payload
+scope out src/storage.rs
+scope out src/storage/flusher.rs
+scope out src/storage/manifest.rs
+scope out src/storage/store.rs
+scope out src/storage/vfs.rs
+scope out src/test_util.rs
+trusted-trait Fold
+trusted-trait Persist
+trusted-trait SnapshotSink
+trusted-trait Source
 spec 9ff22c8bfe3e src/batch.rs::SpanView::block
 spec 9e9bb413ec58 src/batch.rs::Batch::new
 spec aadd3a179956 src/batch.rs::Batch::clear

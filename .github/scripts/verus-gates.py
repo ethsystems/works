@@ -4,6 +4,7 @@
 Usage: verus-gates.py <crate-dir>
        verus-gates.py --results <crate-dir> <verus-stdout>
        verus-gates.py --update <crate-dir> [<verus-stdout>]
+       verus-gates.py --features <crate-dir>
        verus-gates.py --self-test
 
 (a) No trusted construct outside src/verus/tcb.rs. `--no-cheating` cannot do
@@ -15,7 +16,8 @@ Usage: verus-gates.py <crate-dir>
     in-scope file carries a verifying attribute, or sits in an impl/trait
     marked `verus_verify`, or is listed as out of scope. Attribute mode
     silently treats an unannotated fn as external (unverified). Attributes
-    are read the way rustc applies them under VERUS_CFG (the CI features), so
+    are read the way rustc applies them in the Verus run (VERUS_CFG, derived
+    from [features] and the config's `features`), so
     a fn that cfg drops from the Verus build, or that has a second body for
     another cfg, counts as unverified. Specs do not cover bodies, so in a body
     `cfg(verus_keep_ghost)` may gate only `proof!`, `proof_decl!` or
@@ -29,7 +31,8 @@ Usage: verus-gates.py <crate-dir>
     with its requirement and features, the version and checksum Cargo.lock
     gives each trusted crate, and a hash of every spec (each `verus_spec`, the
     signature and contract of each fn in a `verus!` block, each spec fn
-    body). `--results` checks a Verus run against the same file: the
+    body), and the gate config: every [features] entry, the Verus run's cfgs,
+    the scope lists and trusted-traits. `--results` checks a Verus run against the same file: the
     verified count and the exact set of fns Verus verified.
 
 Config lives in the crate's Cargo.toml:
@@ -39,6 +42,7 @@ Config lives in the crate's Cargo.toml:
     out-of-scope-files = { "src/storage.rs" = "why" }
     trusted-traits = ["Fold"]
     trusted-crates = ["crc"]
+    features = ["verus"]  # of the Verus run; `--features` prints them for CI
     out-of-scope = { "src/ring.rs::BlockRing::push" = "why" }
 
 Test code (items under an exact `#[cfg(test)]`) and `verus! { ... }` blocks
@@ -48,7 +52,8 @@ To update the manifest after a change to specs, tcb.rs, dependencies or the
 verified fns, run from the workspace root with the pinned Verus on PATH:
 
     cargo clean -p chainfold
-    cargo verus verify -p chainfold --features verus,wincode --check-toolchain \\
+    cargo verus verify -p chainfold --locked --check-toolchain \\
+        --features "$(python3 .github/scripts/verus-gates.py --features crates/chainfold)" \\
         --fwd-verus-args-to roots -- --output-json --time-expanded > verus.out
     python3 .github/scripts/verus-gates.py --update crates/chainfold verus.out
 
@@ -85,8 +90,9 @@ OPAQUE = [
     r"\bconcat_idents\b",
 ]
 FEATURES = {"proc_macro_hygiene", "cfg_eval", "allocator_api", "doc_cfg"}
-# The cfgs of `cargo verus verify --features verus,wincode`, the CI run.
-VERUS_CFG = {"verus_keep_ghost", "verus_keep_ghost_body", 'feature="verus"', 'feature="wincode"'}
+# The cfgs of the Verus run, `cargo verus verify --features <the crate's `features` list>`.
+# `load` derives them from the crate's [features].
+VERUS_CFG = {"verus_keep_ghost", "verus_keep_ghost_body"}
 VERIFYING = ("verus_spec", "verus_verify")
 USE = re.compile(r"\s*(pub(\s*\([^)]*\))?\s+)?use\b")
 # What a `verus!` item can start with; a `}` followed by one of these ends the item.
@@ -395,10 +401,30 @@ def parse(path: Path) -> tuple[str, str, dict]:
     return src, orig, items(src, orig)
 
 
+def verus_cfg(toml: dict, config: dict) -> set[str]:
+    """The cfgs rustc gets with the default features and the config's `features` on."""
+    features = dict(toml.get("features", {}))
+    named = {entry for entries in features.values() for entry in entries}
+    tables = [toml, *toml.get("target", {}).values()]
+    for name, spec in [d for t in tables for k in ("dependencies", "build-dependencies") for d in t.get(k, {}).items()]:
+        if isinstance(spec, dict) and spec.get("optional") and f"dep:{name}" not in named:
+            features.setdefault(name, [])  # an optional dep's implicit feature
+    on, todo = set(), ["default", *config.get("features", [])]
+    while todo:
+        feature = todo.pop()
+        if feature in features and feature not in on:
+            on.add(feature)
+            todo += [e.split("/")[0] for e in features[feature] if not e.startswith("dep:") and "?/" not in e]
+    return {"verus_keep_ghost", "verus_keep_ghost_body"} | {f'feature="{f}"' for f in on}
+
+
 def load(crate: Path) -> tuple[dict, dict]:
+    global VERUS_CFG
     with (crate / "Cargo.toml").open("rb") as fh:
         toml = tomllib.load(fh)
-    return toml, toml.get("package", {}).get("metadata", {}).get("verus-gates", {})
+    config = toml.get("package", {}).get("metadata", {}).get("verus-gates", {})
+    VERUS_CFG = verus_cfg(toml, config)
+    return toml, config
 
 
 def workspace(crate: Path) -> tuple[Path, dict]:
@@ -461,6 +487,11 @@ def static_manifest(crate: Path, config: dict, toml: dict) -> list[str]:
         pairs.append(("(outside-verus!)", "".join(rest)))
         lines += [f"tcb {digest(t)} {k}" for k, t in unique(pairs)]
     lines += dep_lines(crate, toml) + resolved_lines(crate, config)
+    lines += [f"feature {re.sub(r'\s+', '', json.dumps(v))} {k}" for k, v in sorted(toml.get("features", {}).items())]
+    lines += [f"cfg {c}" for c in sorted(VERUS_CFG)]
+    lines += [f"scope in {rel}" for rel in sorted(config.get("in-scope", []))]
+    lines += [f"scope out {key}" for key in sorted({**config.get("out-of-scope-files", {}), **config.get("out-of-scope", {})})]
+    lines += [f"trusted-trait {name}" for name in sorted(config.get("trusted-traits", []))]
     for rel in sorted(config.get("in-scope", [])):
         if not (crate / rel).is_file():
             continue
@@ -480,7 +511,7 @@ def read_manifest(crate: Path) -> list[str]:
 
 
 def is_static(line: str) -> bool:
-    return line.split(" ", 1)[0] in ("tcb", "dep", "resolved", "spec")
+    return line.split(" ", 1)[0] in ("tcb", "dep", "resolved", "feature", "cfg", "scope", "trusted-trait", "spec")
 
 
 def diff(want: list[str], have: list[str], what: str) -> list[str]:
@@ -771,9 +802,21 @@ mod tests { fn helper() {} }
             errors = check(crate)
             assert (not errors) == want_ok, f"self-test `{name}`: {errors}"
 
-    # The manifest pins the tcb.rs items, the specs and every dependency table.
+    # Cargo's feature rules: `dep:` and `?/` enable no feature, an optional dep without `dep:`
+    # has an implicit one, and default features are on.
+    cfg = verus_cfg(
+        tomllib.loads(
+            '[features]\ndefault = ["a"]\na = ["dep:x", "y/z", "w?/v", "c"]\nb = []\nc = []\nd = []\n'
+            '[dependencies]\nx = { version = "1", optional = true }\ny = { version = "1", optional = true }\n'
+        ),
+        {"features": ["b"]},
+    )
+    assert cfg == VERUS_CFG | {f'feature="{f}"' for f in ("default", "a", "b", "c", "y")}, f"self-test `verus_cfg`: {cfg}"
+
+    # The manifest pins the tcb.rs items, the specs, every dependency table and the gate config.
     toml = '[package]\nname = "t"\n[package.metadata.verus-gates]\nin-scope = ["src/a.rs"]\ntrusted-traits = ["T"]\n'
-    toml += 'trusted-crates = ["crc"]\n'
+    toml += 'trusted-crates = ["crc"]\nfeatures = ["verus"]\n'
+    toml += '[features]\nverus = []\nstd = []\n'
     toml += '[dependencies]\ncrc = { version = "3.4", default-features = false }\nwincode = { workspace = true }\n'
     root = '[workspace]\nmembers = ["c"]\n[workspace.dependencies]\nwincode = { version = "0.6", features = ["alloc"] }\n'
     lock = 'version = 4\n[[package]]\nname = "crc"\nversion = "3.4.0"\nchecksum = "5eb8"\n'
@@ -795,8 +838,28 @@ mod tests { fn helper() {} }
         "lock_bumped": ("../Cargo.lock", lock.replace("3.4.0", "3.4.1")),
         "lock_patched": ("../Cargo.lock", lock.replace('checksum = "5eb8"', 'source = "git+https://x"')),
         "lock_gone": ("../Cargo.lock", "version = 4\n"),
+        # The gate config: what is out of scope, which traits are trusted, the Verus cfgs.
+        "scope_fn_added": (
+            "src/a.rs",
+            body + "impl S { fn g(&self) {} }",
+            "Cargo.toml",
+            toml + '[package.metadata.verus-gates.out-of-scope]\n"src/a.rs::S::g" = "x"\n',
+        ),
+        "scope_file_added": (
+            "src/b.rs",
+            "fn h() {}",
+            "Cargo.toml",
+            toml + '[package.metadata.verus-gates.out-of-scope-files]\n"src/b.rs" = "x"\n',
+        ),
+        "trusted_trait_added": (
+            "src/a.rs",
+            body + "#[cfg_attr(verus_keep_ghost, verus_verify)]\ntrait O { fn o(&self); }",
+            "Cargo.toml",
+            toml.replace('["T"]', '["T", "O"]'),
+        ),
+        "feature_changed": ("Cargo.toml", toml.replace("verus = []", 'verus = ["std"]')),
     }
-    for name, (rel, text) in pinned.items():
+    for name, change in pinned.items():
         with tempfile.TemporaryDirectory() as tmp:
             crate = Path(tmp) / "c"
             (crate / "src/verus").mkdir(parents=True)
@@ -807,7 +870,8 @@ mod tests { fn helper() {} }
             (crate / "../Cargo.lock").write_text(lock)
             update(crate, None)
             assert not check(crate), f"self-test `{name}` before: {check(crate)}"
-            (crate / rel).write_text(text)
+            for rel, text in zip(change[::2], change[1::2]):
+                (crate / rel).write_text(text)
             assert check(crate), f"self-test `{name}`: not caught"
 
     def report(verified: int, errors: int, fns: list[str]) -> str:
@@ -846,6 +910,9 @@ def main() -> None:
     if args == ["--self-test"]:
         self_test()
         return
+    if args[:1] == ["--features"] and len(args) == 2:
+        print(",".join(load(Path(args[1]))[1].get("features", [])))
+        return
     if args[:1] == ["--update"] and len(args) in (2, 3):
         update(Path(args[1]), Path(args[2]).read_text() if len(args) == 3 else None)
         print(f"verus-gates: wrote {Path(args[1]) / MANIFEST}")
@@ -857,7 +924,7 @@ def main() -> None:
     else:
         sys.exit(
             "usage: verus-gates.py <crate-dir> | --results <crate-dir> <verus-stdout>"
-            " | --update <crate-dir> [<verus-stdout>] | --self-test"
+            " | --update <crate-dir> [<verus-stdout>] | --features <crate-dir> | --self-test"
         )
     for error in errors:
         print(f"verus-gates: {error}", file=sys.stderr)
