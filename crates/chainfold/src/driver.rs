@@ -7546,6 +7546,46 @@ proof fn lemma_push_desc<E>(
             assert(post.ends[n - 1] == pre.ends[n - 1]);
         }
     }
+    lemma_push_desc_indices(pre, post, before, after, block, s);
+    if m > 0 {
+        assert(after.last() == s[m - 1]);
+    }
+}
+
+/// One `push_block_from_tail` over the descending `s` leaves the log indices of each span
+/// ascending.
+proof fn lemma_push_desc_indices<E>(
+    pre: BatchView<E>,
+    post: BatchView<E>,
+    before: Seq<(BlockRef, u32, E)>,
+    after: Seq<(BlockRef, u32, E)>,
+    block: BlockRef,
+    s: Seq<(BlockRef, u32, E)>,
+)
+    requires
+        pre.wf(),
+        pushed_block(pre, post, block),
+        popped_tail(pre, post, before, after, block),
+        before.len() > 0,
+        before.last().0 == block,
+        before.len() <= s.len(),
+        before == s.subrange(0, before.len() as int),
+        popped_desc(pre, s, before.len() as int),
+    ensures
+        forall|i: int, j: int, q: int|
+            #![trigger post.ends[i], post.log_indices[j], post.log_indices[q]]
+            0 <= i < post.ends.len() && post.start(i) <= j < q < post.ends[i] ==> post.log_indices[j]
+                < post.log_indices[q],
+{
+    let (n, bl, m) = (pre.ends.len() as int, before.len() as int, after.len() as int);
+    if m == bl {
+        assert(after.last() == before.last());
+    }
+    let k = bl - m;
+    let p = pre.events.len() as int;
+    assert(appended_at(pre, post, before, k - 1, block));
+    assert(s[m] == before[m] && s[bl - 1] == before[bl - 1]);
+    assert(p == if n == 0 { 0 } else { pre.ends[n - 1] as int });
     assert forall|i: int, j: int, q: int|
         #![trigger post.ends[i], post.log_indices[j], post.log_indices[q]]
         0 <= i < post.ends.len() && post.start(i) <= j < q < post.ends[i] implies post.log_indices[j]
@@ -7571,9 +7611,6 @@ proof fn lemma_push_desc<E>(
             assert(s[bl - 1 - a].0.number < s[bl - 1 - b].0.number || (s[bl - 1 - a].0 == s[bl - 1 - b].0
                 && s[bl - 1 - a].1 < s[bl - 1 - b].1));
         }
-    }
-    if m > 0 {
-        assert(after.last() == s[m - 1]);
     }
 }
 

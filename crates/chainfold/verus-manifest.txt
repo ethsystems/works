@@ -1,6 +1,6 @@
 # Checked by .github/scripts/verus-gates.py; regenerate it with `--update` (see there).
 # tcb and spec lines: hash of the normalized text, then the item. fn lines: from Verus.
-verified 355
+verified 356
 fn exec chainfold::batch::Batch::blocks_within
 fn exec chainfold::batch::Batch::clear
 fn exec chainfold::batch::Batch::clone
@@ -190,6 +190,7 @@ fn proof chainfold::driver::lemma_grew_refl
 fn proof chainfold::driver::lemma_lost_moved
 fn proof chainfold::driver::lemma_parent
 fn proof chainfold::driver::lemma_push_desc
+fn proof chainfold::driver::lemma_push_desc_indices
 fn proof chainfold::driver::lemma_push_triples
 fn proof chainfold::driver::lemma_re_ascending
 fn proof chainfold::driver::lemma_re_one_view
@@ -622,6 +623,7 @@ spec 04e64c7f3801 src/driver.rs::lemma_triples_within
 spec d754365eb3fc src/driver.rs::lemma_re_one_view
 spec 5d30445bc76f src/driver.rs::lemma_sorted_desc
 spec bbdd8fc65a3c src/driver.rs::lemma_push_desc
+spec 9ddb21825649 src/driver.rs::lemma_push_desc_indices
 spec 59215a6d0b49 src/driver.rs::lemma_push_triples
 spec f3a0421f5ca4 src/driver.rs::lemma_triples_len
 spec 37fff955d923 src/engine.rs::EngineConfig::validate
