@@ -20,7 +20,8 @@ durable, a reorg noticed only when a proof stops verifying.
 - **poll**: the driver keeps a head that a scan read, the tip, and how far below it
   that scan covered. A poll whose head is the tip makes one call, and so does one whose
   head lags it; a head one block on top of it makes two, the head and that block's logs
-  by its hash. Only a gap reads more, at most 64 windows a poll.
+  by its hash. Only a gap reads more, at most 64 windows a walk. A poll walks twice only
+  when it walks above the tip and then finds the tip's block gone.
 - **detect**: each batch carries the current header of the cursor block, from the first
   window's answer, which starts at that block, or from the tip, which commits to it. A
   block hash commits to its whole ancestry, so a reorg touching anything at or below the
@@ -244,7 +245,7 @@ the fold and the tip stay. A failed call during the scan, or a head block that m
 during the walk, returns `SourceError` and keeps the tip too, so the next poll goes on
 from it.
 
-One tick reads at most 64 windows. A walk cut there with nothing found returns
+One walk reads at most 64 windows. A walk cut there with nothing found returns
 `Progressed` with nothing applied, leaves `is_caught_up` false and `next_delay` zero, and
 keeps a tip that covers only the heights it read; the next tick walks on from there.
 After a tick whose scan fails or sees the head block move, that limit halves, down to
@@ -254,7 +255,9 @@ call of a tick past a burst still lets the driver catch up, in walks that fit th
 
 A reorg that replaces the tip block leaves the scan no anchor above the cursor. The next
 poll walks from the cursor block again, about (head − cursor) / window `events_in` calls,
-64 windows a tick.
+64 windows a walk. When the head is far enough above the tip that a walk above it is
+cheaper, that poll walks above the tip first, reads the tip's header back, finds it gone,
+and then walks from the cursor block: up to 128 windows in that tick.
 
 Calls per scenario, counted with a counting source over `ScriptedChain`: window 10, the
 driver caught up at block 100. These are test sizes, not the defaults. One call is one

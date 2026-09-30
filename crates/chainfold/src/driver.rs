@@ -75,7 +75,7 @@ const DEFAULT_BACKOFF_BASE: Duration = Duration::from_millis(200);
 const DEFAULT_BACKOFF_MAX: Duration = Duration::from_secs(30);
 /// Default blocks between checkpoints.
 const DEFAULT_CHECKPOINT_INTERVAL: u64 = 64;
-/// Most `events_in` windows one tick reads.
+/// Most `events_in` windows one walk reads.
 #[cfg_attr(verus_keep_ghost, verus_verify)]
 const MAX_SPAN: u64 = 64;
 
@@ -5151,6 +5151,27 @@ mod tests {
         );
         assert_eq!(ticks, vec![capped, capped, capped, last]);
         assert_eq!(driver.engine().cursor(), Some(Position::new(1, 0)));
+    }
+
+    #[test]
+    fn a_lost_tip_under_a_far_head_walks_twice_in_one_tick() {
+        // given a driver caught up on block 1 with a tip at block 100, one block per window;
+        // then the tip block reorgs away and 200 empty blocks follow
+        let mut driver = counted_driver(one_event_chain(1));
+        run_to_idle(&mut driver);
+        for _ in 2..=100 {
+            driver.source.inner.push_block(&[]);
+        }
+        run_to_idle(&mut driver);
+        driver.source.inner.reorg(1, &[&[]]);
+        for _ in 0..200 {
+            driver.source.inner.push_block(&[]);
+        }
+        // when polled once
+        let tick = counted_tick(&mut driver);
+        // then it reads the head, 64 windows above the tip and the tip's header, which is
+        // gone, then 64 windows from the cursor block and the head block's header again
+        assert_eq!(tick, (Tick::Progressed(ApplySummary::default()), 131));
     }
 
     #[test]
