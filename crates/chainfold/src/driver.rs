@@ -240,6 +240,9 @@ where
     seen_resets: u64,
     /// Head a scan read, and how far the chain it commits to holds nothing left to fold.
     tip: Option<Mark>,
+    /// Windows the next walk reads at most: halved after a failed scan, doubled after an
+    /// applied one.
+    span: u64,
 }
 
 /// A head a scan read, and the height up to which the chain its hash commits to holds
@@ -460,6 +463,7 @@ where
             advanced: false,
             seen_resets,
             tip: None,
+            span: MAX_SPAN,
         })
     }
 }
@@ -973,6 +977,7 @@ where
         }
         if !matches!(read, Ok(Scan::Batch { .. })) {
             self.consecutive_errors = self.consecutive_errors.saturating_add(1);
+            self.span = (self.span / 2).max(1);
             #[cfg(verus_keep_ghost)]
             proof! {
                 assert forall|log: Seq<(Position, F::Event)>, h: ChainView|
@@ -1061,6 +1066,9 @@ where
                             sv,
                         );
                     }
+                }
+                if self.span < MAX_SPAN {
+                    self.span = (self.span * 2).min(MAX_SPAN);
                 }
                 // A walk cut at its cap is not caught up, though it found nothing.
                 self.caught_up = self.batch.is_empty() && !capped;
@@ -1196,8 +1204,8 @@ where
     /// Cheapest first: a head equal to the tip is one call; a head whose parent is the tip
     /// reads its own block by hash; a gap past the tip, when that costs fewer calls than
     /// the cursor walk, reads above the tip and then the tip; otherwise the walk starts at
-    /// the cursor block, whose header the first answer carries. A walk reads at most
-    /// `MAX_SPAN` windows; one cut there with nothing found leaves a tip short of its head, and the
+    /// the cursor block, whose header the first answer carries. A walk reads at most `span`
+    /// windows; one cut there with nothing found leaves a tip short of its head, and the
     /// next scan walks on from the tip's end, with no read of the tip when the head is the
     /// tip or its child.
     // One answer is one view. A tip is a head a scan covered: the chain its hash commits
@@ -1582,7 +1590,7 @@ where
             lemma_grew_refl::<S, S::Event>(h1);
             lemma_grew_next::<S, S::Event>(h1, h1);
         }
-        let end = capped(tip.done + 1, head.number, MAX_SPAN, window);
+        let end = capped(tip.done + 1, head.number, self.span, window);
         let Some((_at, _reads, reached)) = self.walk(tip.done + 1, end, window, false)?
         else {
             return Ok(Some(false));
@@ -1682,7 +1690,7 @@ where
         Ok(Some(true))
     }
 
-    /// `scan` from the cursor block, at most `MAX_SPAN` windows: the first window's answer carries
+    /// `scan` from the cursor block, at most `span` windows: the first window's answer carries
     /// that block's header, else `header_at` reads it; a walk of one window or more ends by
     /// reading the head block again. `Ok(false)` when the head block moved; the batch is then
     /// empty.
@@ -1753,7 +1761,7 @@ where
             lemma_grew_refl::<S, S::Event>(hw);
             lemma_grew_next::<S, S::Event>(hw, hw);
         }
-        let end = capped(from, head.number, MAX_SPAN, window);
+        let end = capped(from, head.number, self.span, window);
         let Some((at, reads, reached)) =
             self.walk(from, end, window, cursor.is_some())?
         else {
@@ -2703,10 +2711,36 @@ mod tests {
         }
     }
 
-    /// Wraps a scripted chain, counting every call.
+    /// Wraps a scripted chain, counting every call. With a `period`, every `period`-th call
+    /// fails; with a `budget`, every call past it fails until the budget is set again.
     struct Counted {
         inner: ScriptedChain,
         calls: u32,
+        period: Option<u32>,
+        budget: Option<u32>,
+    }
+
+    impl Counted {
+        /// Counts one call, and fails it when the period or the budget says so.
+        fn call(&mut self) -> Result<(), PollFailure> {
+            self.calls += 1;
+            let spent = match &mut self.budget {
+                Some(0) => true,
+                Some(left) => {
+                    *left -= 1;
+                    false
+                }
+                None => false,
+            };
+            if spent
+                || self
+                    .period
+                    .is_some_and(|period| self.calls.is_multiple_of(period))
+            {
+                return Err(PollFailure);
+            }
+            Ok(())
+        }
     }
 
     impl Source for Counted {
@@ -2714,12 +2748,12 @@ mod tests {
         type Error = PollFailure;
 
         fn head(&mut self) -> Result<Head, PollFailure> {
-            self.calls += 1;
+            self.call()?;
             self.inner.head()
         }
 
         fn header_at(&mut self, number: u64) -> Result<Option<BlockRef>, PollFailure> {
-            self.calls += 1;
+            self.call()?;
             self.inner.header_at(number)
         }
 
@@ -2729,7 +2763,7 @@ mod tests {
             to: u64,
             out: &mut Vec<(BlockRef, u32, u64)>,
         ) -> Result<(), PollFailure> {
-            self.calls += 1;
+            self.call()?;
             self.inner.events_in(from, to, out)
         }
 
@@ -2738,7 +2772,7 @@ mod tests {
             block: &BlockRef,
             out: &mut Vec<(BlockRef, u32, u64)>,
         ) -> Result<(), PollFailure> {
-            self.calls += 1;
+            self.call()?;
             self.inner.events_at(block, out)
         }
 
@@ -4318,9 +4352,24 @@ mod tests {
         folded
     }
 
+    /// The driver's source: through `source_mut`, which clears the tip, unless `keep_tip`.
+    fn indexed(
+        driver: &mut Driver<RecordingFold, Indexed>,
+        keep_tip: bool,
+    ) -> &mut Indexed {
+        if keep_tip {
+            &mut driver.source
+        } else {
+            driver.source_mut()
+        }
+    }
+
     /// Ticks random runs and checks every tick's fold against a fold from scratch; with
-    /// `older_views`, some ticks read a copy of the chain saved at an earlier step.
-    fn check_every_tick_against_a_fold_from_scratch(older_views: bool) {
+    /// `older_views`, some ticks read a copy of the chain saved at an earlier step. With
+    /// `capped`, a tick reads one or two windows, so most walks stop short of the head, and
+    /// the chain moves under the driver, so the tip carries to the next tick and blocks
+    /// arrive or reorg away above and below its end.
+    fn check_every_tick_against_a_fold_from_scratch(older_views: bool, capped: bool) {
         for seed in 0..2_000 {
             // given a well-behaved source: random log indices, windows from 1 block up,
             // and at times heights near u64::MAX
@@ -4353,9 +4402,9 @@ mod tests {
                 // driver at times restarts from its snapshot, and with `older_views` a
                 // tick at times reads a saved copy of the chain
                 if older_views && rng.below(4) == 0 {
-                    saved = Some(driver.source_mut().clone());
+                    saved = Some(indexed(&mut driver, capped).clone());
                 }
-                let chain = &mut driver.source_mut().0;
+                let chain = &mut indexed(&mut driver, capped).0;
                 match rng.below(10) {
                     0..=4 => {
                         for _ in 0..rng.below(4).min(room(chain, first)) {
@@ -4393,10 +4442,13 @@ mod tests {
                 }
                 let newer = match saved.clone() {
                     Some(view) if rng.below(4) == 0 => {
-                        Some(core::mem::replace(driver.source_mut(), view))
+                        Some(core::mem::replace(indexed(&mut driver, capped), view))
                     }
                     _ => None,
                 };
+                if capped {
+                    driver.span = 1 + rng.below(2);
+                }
                 let before = driver.engine().fold().applied.clone();
                 let tick = driver.tick();
                 // then no tick errs, and the fold is the fold from scratch over the chain
@@ -4410,7 +4462,7 @@ mod tests {
                     before
                 } else {
                     from_scratch(
-                        driver.source_mut().clone(),
+                        indexed(&mut driver, capped).clone(),
                         start,
                         driver.engine().cursor(),
                     )
@@ -4421,7 +4473,7 @@ mod tests {
                     "seed {seed} step {step}: {tick:?}"
                 );
                 if let Some(newer) = newer {
-                    *driver.source_mut() = newer;
+                    *indexed(&mut driver, capped) = newer;
                 }
             }
         }
@@ -4429,12 +4481,18 @@ mod tests {
 
     #[test]
     fn every_tick_folds_what_a_fold_from_scratch_does() {
-        check_every_tick_against_a_fold_from_scratch(false);
+        check_every_tick_against_a_fold_from_scratch(false, false);
     }
 
     #[test]
     fn a_tick_on_an_older_view_folds_what_a_fold_from_scratch_of_it_does() {
-        check_every_tick_against_a_fold_from_scratch(true);
+        check_every_tick_against_a_fold_from_scratch(true, false);
+    }
+
+    #[test]
+    fn a_walk_cut_at_its_cap_folds_what_a_fold_from_scratch_does() {
+        check_every_tick_against_a_fold_from_scratch(false, true);
+        check_every_tick_against_a_fold_from_scratch(true, true);
     }
 
     fn counted_driver(chain: ScriptedChain) -> Driver<RecordingFold, Counted> {
@@ -4443,6 +4501,8 @@ mod tests {
             Counted {
                 inner: chain,
                 calls: 0,
+                period: None,
+                budget: None,
             },
             engine_config(2),
             DriverConfig::from_block(1),
@@ -5017,6 +5077,45 @@ mod tests {
     }
 
     #[test]
+    fn an_error_mid_walk_does_not_livelock() {
+        // given a driver that folded block 0's event, over 1000 empty blocks and then an
+        // event at block 1001, ten blocks per window, on a source whose every 25th call fails
+        let mut chain = ScriptedChain::new(0);
+        chain.set_window(10);
+        chain.push_block(&[1]);
+        for _ in 0..1000 {
+            chain.push_block(&[]);
+        }
+        let mut driver = Driver::new(
+            RecordingFold::default(),
+            Counted {
+                inner: chain,
+                calls: 0,
+                period: None,
+                budget: None,
+            },
+            engine_config(2),
+            DriverConfig::from_block(0),
+        )
+        .unwrap();
+        driver.tick();
+        driver.source.period = Some(25);
+        driver.source.inner.push_block(&[42]);
+        // when polled forty times
+        for _ in 0..40 {
+            driver.tick();
+        }
+        // then the event at block 1001 is folded
+        assert!(
+            driver
+                .engine()
+                .fold()
+                .applied
+                .contains(&(Position::new(1001, 0), 42))
+        );
+    }
+
+    #[test]
     fn a_long_gap_is_walked_in_capped_ticks() {
         // given a driver caught up on block 1, then 200 empty blocks, one per window
         let mut driver = counted_driver(one_event_chain(1));
@@ -5048,6 +5147,32 @@ mod tests {
         );
         assert_eq!(ticks, vec![capped, capped, capped, last]);
         assert_eq!(driver.engine().cursor(), Some(Position::new(1, 0)));
+    }
+
+    #[test]
+    fn a_burst_limited_source_still_catches_up() {
+        // given a driver caught up on block 1, then 200 empty blocks, one per window, and an
+        // event at block 202, on a source that answers ten calls a tick
+        let mut driver = counted_driver(one_event_chain(1));
+        run_to_idle(&mut driver);
+        for _ in 2..=201 {
+            driver.source.inner.push_block(&[]);
+        }
+        driver.source.inner.push_block(&[202]);
+        // when polled until idle, with the budget set again before each tick
+        let mut ticks = 0;
+        loop {
+            driver.source.budget = Some(10);
+            ticks += 1;
+            if driver.tick() == Tick::Idle || ticks == 1_000 {
+                break;
+            }
+        }
+        // then the walk shrinks to what the budget allows and grows back: three failed
+        // ticks, then a tick of eight windows and a failed one in turn, to the event
+        assert_eq!(ticks, 54);
+        let chain = driver.source.inner.clone();
+        assert_eq!(driver.engine().fold().applied, canonical_fold(chain));
     }
 
     #[test]
@@ -6370,6 +6495,7 @@ impl<F: Fold, S: Source<Event = F::Event>, K: SnapshotSink<F>> Driver<F, S, K> {
     pub closed spec fn wf(&self) -> bool {
         &&& self.engine.wf()
         &&& self.batch@.wf()
+        &&& 1 <= self.span <= MAX_SPAN
     }
 
     pub closed spec fn engine_view(&self) -> EngineView {

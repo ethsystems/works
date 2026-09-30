@@ -579,7 +579,7 @@ spec 8c23e4f3a570 src/driver.rs::checkpoint_ran
 spec 5f1b9f087444 src/driver.rs::probe_held
 spec 11ac4f02c4c0 src/driver.rs::ladder_tail
 spec 1f0b3f9ddef7 src/driver.rs::reconciled
-spec 837dee6b48bb src/driver.rs::Driver::wf
+spec 02077e4565af src/driver.rs::Driver::wf
 spec 12bc22396fab src/driver.rs::Driver::engine_view
 spec 4e5f02dd0561 src/driver.rs::Driver::synced
 spec a9e2391a6821 src/driver.rs::Driver::durable_ok
