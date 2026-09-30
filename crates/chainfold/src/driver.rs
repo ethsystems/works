@@ -75,6 +75,9 @@ const DEFAULT_BACKOFF_BASE: Duration = Duration::from_millis(200);
 const DEFAULT_BACKOFF_MAX: Duration = Duration::from_secs(30);
 /// Default blocks between checkpoints.
 const DEFAULT_CHECKPOINT_INTERVAL: u64 = 64;
+/// Most `events_in` windows one tick reads.
+#[cfg_attr(verus_keep_ghost, verus_verify)]
+const MAX_SPAN: u64 = 64;
 
 /// True when `block` has reached the next interval step past the last marked block.
 #[cfg_attr(verus_keep_ghost, verus_spec(r =>
@@ -127,8 +130,9 @@ pub enum Tick {
 /// What a scan read.
 #[cfg_attr(verus_keep_ghost, verus_verify)]
 enum Scan {
-    /// A batch for the engine.
-    Batch,
+    /// A batch for the engine; `capped` when the walk stopped at its cap with nothing
+    /// found, so the batch is empty and the tip falls short of its head.
+    Batch { capped: bool },
     /// The head block moved during the scan; the batch is empty.
     Moved,
     /// The head is below the tip or the cursor block and contradicts no hash the ring
@@ -872,11 +876,13 @@ where
         proof_decl! {
             let ghost pa = *self;
         }
-        // Only forward cursor movement earns an immediate re-poll; a batch the
-        // engine fully deduped leaves the loop on its poll interval.
+        // Only forward cursor movement, or a walk cut at its cap (the one Progressed tick
+        // with an empty batch), earns an immediate re-poll; a batch the engine fully deduped
+        // leaves the loop on its poll interval.
         self.advanced = matches!(
             tick,
-            Tick::Progressed(summary) if summary.applied > 0 || summary.skipped > 0
+            Tick::Progressed(summary)
+                if summary.applied > 0 || summary.skipped > 0 || self.batch.is_empty()
         );
         #[cfg(verus_keep_ghost)]
         proof! {
@@ -965,7 +971,7 @@ where
             }
             return Tick::Behind;
         }
-        if !matches!(read, Ok(Scan::Batch)) {
+        if !matches!(read, Ok(Scan::Batch { .. })) {
             self.consecutive_errors = self.consecutive_errors.saturating_add(1);
             #[cfg(verus_keep_ghost)]
             proof! {
@@ -977,6 +983,7 @@ where
             return Tick::SourceError;
         }
         self.consecutive_errors = 0;
+        let capped = matches!(read, Ok(Scan::Batch { capped: true }));
         #[cfg(verus_keep_ghost)]
         proof_decl! {
             let ghost v = self.engine@;
@@ -1055,7 +1062,8 @@ where
                         );
                     }
                 }
-                self.caught_up = self.batch.is_empty();
+                // A walk cut at its cap is not caught up, though it found nothing.
+                self.caught_up = self.batch.is_empty() && !capped;
                 // A snapshot refusal overrides progress; a checkpoint is silent.
                 self.auto_checkpoint();
                 #[cfg(verus_keep_ghost)]
@@ -1094,7 +1102,7 @@ where
                     }
                     return tick;
                 }
-                let tick = if self.batch.is_empty() {
+                let tick = if self.batch.is_empty() && !capped {
                     Tick::Idle
                 } else {
                     Tick::Progressed(summary)
@@ -1188,7 +1196,10 @@ where
     /// Cheapest first: a head equal to the tip is one call; a head whose parent is the tip
     /// reads its own block by hash; a gap past the tip, when that costs fewer calls than
     /// the cursor walk, reads above the tip and then the tip; otherwise the walk starts at
-    /// the cursor block, whose header the first answer carries.
+    /// the cursor block, whose header the first answer carries. A walk reads at most
+    /// `MAX_SPAN` windows; one cut there with nothing found leaves a tip short of its head, and the
+    /// next scan walks on from the tip's end, with no read of the tip when the head is the
+    /// tip or its child.
     // One answer is one view. A tip is a head a scan covered: the chain its hash commits
     // to holds nothing left to fold above the cursor up to it (A1), so a view that holds
     // the tip needs no events or boundary read below it. Every walk ends by reading the
@@ -1213,7 +1224,7 @@ where
                 })
                 &&& l0 < hist.len()
                 &&& grew::<S, S::Event>(sview_log::<S>(&old(self).source), hist)
-                &&& !(r matches Ok(Scan::Batch)) ==> final(self).tip == old(self).tip
+                &&& !(r matches Ok(Scan::Batch { .. })) ==> final(self).tip == old(self).tip
                 &&& infallible::<S>(&old(self).source) ==> r is Ok && infallible::<S>(&final(self).source)
                 &&& r matches Ok(Scan::Moved) ==> moved(hist, l0)
                 &&& r matches Ok(Scan::Behind) ==> final(self).batch@.ends.len() == 0
@@ -1223,15 +1234,15 @@ where
                     old(self).engine@.cursor,
                     old(self).engine@.ring,
                 ) && header(hist[l0], hd.block.number) == Some(hd.block)
-                &&& r matches Ok(Scan::Batch) ==> shaped_at(final(self).batch@, old(self).engine@.cursor)
-                &&& r matches Ok(Scan::Batch) ==> boundary_read(
+                &&& r matches Ok(Scan::Batch { .. }) ==> shaped_at(final(self).batch@, old(self).engine@.cursor)
+                &&& r matches Ok(Scan::Batch { .. }) ==> boundary_read(
                     hist,
                     l0,
                     old(self).engine@.cursor,
                     old(self).engine@.ring.last(),
                     final(self).batch@.boundary,
                 )
-                &&& r matches Ok(Scan::Batch) ==> scanned::<S, S::Event>(
+                &&& r matches Ok(Scan::Batch { .. }) ==> scanned::<S, S::Event>(
                     hist,
                     l0,
                     old(self).config.start_block,
@@ -1244,6 +1255,7 @@ where
     ))]
     // A nested `if let`, not a `let` chain: Verus does not take `let` chains.
     #[allow(clippy::collapsible_if)]
+    #[cfg_attr(verus_keep_ghost, verifier::spinoff_prover)]
     fn scan(&mut self) -> Result<Scan, S::Error> {
         self.batch.clear();
         let cursor = self.engine.cursor();
@@ -1267,7 +1279,8 @@ where
             assert(header(h1[l0], head.block.number) == Some(head.block));
         }
         if let Some(tip) = tip {
-            if head.block == tip.at {
+            let full = tip.done == tip.at.number;
+            if full && head.block == tip.at {
                 #[cfg(verus_keep_ghost)]
                 proof_decl! {
                     let ghost b0 = self.batch;
@@ -1281,31 +1294,48 @@ where
                     assert(b0@.triples() =~= Seq::<(BlockRef, u32, F::Event)>::empty());
                     lemma_rung_same::<S, F::Event>(h1, l0, self.config.start_block, cursor, self.batch@, tip);
                 }
-                return Ok(Scan::Batch);
+                return Ok(Scan::Batch { capped: false });
             }
-            if head.parent == tip.at.hash
-                && tip.at.number.checked_add(1) == Some(head.block.number)
-            {
-                #[cfg(verus_keep_ghost)]
-                proof! {
-                    broadcast use vstd::array::group_array_axioms;
+            let parent = head.parent == tip.at.hash
+                && tip.at.number.checked_add(1) == Some(head.block.number);
+            // The head's own view holds the tip when the tip is the head or its parent, so a
+            // walk above the tip then needs no read of it.
+            let implied = parent || head.block == tip.at;
+            #[cfg(verus_keep_ghost)]
+            proof! {
+                broadcast use vstd::array::group_array_axioms;
+                if parent {
                     assert(head.parent =~= tip.at.hash);
                 }
+                if implied {
+                    lemma_carries::<S, S::Event>(head, tip.at, self.config.start_block);
+                }
+            }
+            if parent && full {
                 if self.next_block(head)? {
-                    return Ok(Scan::Batch);
+                    return Ok(Scan::Batch { capped: false });
                 }
             } else if tip.done < head.block.number
-                && walk_calls(tip.done + 1, head.block.number, window).saturating_add(1)
+                // A head at the tip's height with another hash disproves the tip.
+                && (head.block == tip.at || tip.at.number < head.block.number)
+                && walk_calls(tip.done + 1, head.block.number, window)
+                    .saturating_add(if implied { 0 } else { 1 })
                     < walk_calls(from, head.block.number, window)
             {
-                if let Some(read) = self.above_tip(tip, head.block, window)? {
+                if let Some(read) = self.above_tip(tip, head.block, window, implied)? {
                     #[cfg(verus_keep_ghost)]
                     proof! {
                         if !read {
                             lemma_lost_moved(sview_log::<S>(&self.source), l0, l0 + 1, head.block);
                         }
                     }
-                    return Ok(if read { Scan::Batch } else { Scan::Moved });
+                    return Ok(if read {
+                        Scan::Batch {
+                            capped: self.resuming(),
+                        }
+                    } else {
+                        Scan::Moved
+                    });
                 }
             }
         }
@@ -1339,7 +1369,13 @@ where
                 lemma_lost_moved(sview_log::<S>(&self.source), l0, hw.len() as int, head.block);
             }
         }
-        Ok(if read { Scan::Batch } else { Scan::Moved })
+        Ok(if read {
+            Scan::Batch {
+                capped: self.resuming(),
+            }
+        } else {
+            Scan::Moved
+        })
     }
 
     /// True when the ring holds no hash other than `head`'s at its height, nor other than
@@ -1479,9 +1515,9 @@ where
         Ok(true)
     }
 
-    /// `scan` with a gap past the tip: walks above the tip, then reads the tip back and the
-    /// head block again. `Ok(None)` when the tip is gone;
-    /// the batch is then empty.
+    /// `scan` with a gap past the tip: walks above the tip, then reads the tip back unless
+    /// `implied`, and the head block again. `Ok(None)` when the tip is gone; the batch is
+    /// then empty.
     #[cfg_attr(verus_keep_ghost, verus_spec(r =>
         requires
             old(self).wf(),
@@ -1490,6 +1526,7 @@ where
             tip.done < head.number,
             tip.at.number <= head.number,
             window >= 1,
+            implied ==> carries::<S, S::Event>(head, tip.at, old(self).config.start_block),
         ensures
             final(self).wf(),
             *final(self) == (Driver {
@@ -1536,6 +1573,7 @@ where
         tip: Mark,
         head: BlockRef,
         window: u64,
+        implied: bool,
     ) -> Result<Option<bool>, S::Error> {
         #[cfg(verus_keep_ghost)]
         proof_decl! {
@@ -1544,8 +1582,8 @@ where
             lemma_grew_refl::<S, S::Event>(h1);
             lemma_grew_next::<S, S::Event>(h1, h1);
         }
-        let Some((_at, _reads, reached)) =
-            self.walk(tip.done + 1, head.number, window, false)?
+        let end = capped(tip.done + 1, head.number, MAX_SPAN, window);
+        let Some((_at, _reads, reached)) = self.walk(tip.done + 1, end, window, false)?
         else {
             return Ok(Some(false));
         };
@@ -1557,7 +1595,7 @@ where
                 h2,
                 w0,
                 (tip.done + 1) as u64,
-                head.number,
+                end,
                 window,
                 false,
                 wins,
@@ -1570,7 +1608,7 @@ where
             lemma_grew_refl::<S, S::Event>(h2);
             lemma_grew_next::<S, S::Event>(h2, h2);
         }
-        if self.source.header_at(tip.at.number)? != Some(tip.at) {
+        if !implied && self.source.header_at(tip.at.number)? != Some(tip.at) {
             self.batch.clear();
             return Ok(None);
         }
@@ -1592,10 +1630,11 @@ where
             return Ok(Some(false));
         }
         self.batch.boundary = self.cursor_block();
-        if reached {
+        // A walk cut at the cap with nothing found covers the head's chain up to its end.
+        if reached && (end == head.number || self.batch.is_empty()) {
             self.tip = Some(Mark {
                 at: head,
-                done: head.number,
+                done: end,
             });
         } else {
             self.tip = None;
@@ -1631,19 +1670,22 @@ where
                     self.tip,
                     self.batch@,
                     head,
+                    end,
                     window,
                     wins,
                     _reads,
                     reached,
+                    implied,
                 );
             }
         }
         Ok(Some(true))
     }
 
-    /// `scan` from the cursor block: the first window's answer carries that block's header,
-    /// else `header_at` reads it; a walk of one window or more ends by reading the head block
-    /// again. `Ok(false)` when the head block moved; the batch is then empty.
+    /// `scan` from the cursor block, at most `MAX_SPAN` windows: the first window's answer carries
+    /// that block's header, else `header_at` reads it; a walk of one window or more ends by
+    /// reading the head block again. `Ok(false)` when the head block moved; the batch is then
+    /// empty.
     #[cfg_attr(verus_keep_ghost, verus_spec(r =>
         requires
             old(self).wf(),
@@ -1711,8 +1753,9 @@ where
             lemma_grew_refl::<S, S::Event>(hw);
             lemma_grew_next::<S, S::Event>(hw, hw);
         }
+        let end = capped(from, head.number, MAX_SPAN, window);
         let Some((at, reads, reached)) =
-            self.walk(from, head.number, window, cursor.is_some())?
+            self.walk(from, end, window, cursor.is_some())?
         else {
             return Ok(false);
         };
@@ -1724,7 +1767,7 @@ where
                 h2,
                 w0,
                 from,
-                head.number,
+                end,
                 window,
                 cursor is Some,
                 wins,
@@ -1776,10 +1819,10 @@ where
                 }
             }
         }
-        if reached {
+        if reached && (end == head.number || self.batch.is_empty()) {
             self.tip = Some(Mark {
                 at: head,
-                done: head.number,
+                done: end,
             });
         } else {
             self.tip = None;
@@ -1818,6 +1861,7 @@ where
                     self.batch@,
                     head,
                     from,
+                    end,
                     window,
                     wins,
                     at,
@@ -1827,6 +1871,18 @@ where
             }
         }
         Ok(true)
+    }
+
+    /// True when the tip covers less than its head: the next scan walks on from its end.
+    #[cfg_attr(verus_keep_ghost, verus_spec(r =>
+        ensures
+            r == (self.tip matches Some(m) && m.done < m.at.number),
+    ))]
+    fn resuming(&self) -> bool {
+        match self.tip {
+            Some(tip) => tip.done < tip.at.number,
+            None => false,
+        }
     }
 
     /// The cursor block as the ring holds it: the boundary a scan anchored on the tip
@@ -2319,6 +2375,28 @@ fn walk_calls(from: u64, hi: u64, window: u64) -> u64 {
         return 0;
     }
     ((hi - from) / window).saturating_add(2)
+}
+
+/// The last block of `span` windows of `window` blocks from `from`, or `hi` when that is
+/// lower.
+#[cfg_attr(verus_keep_ghost, verus_spec(r =>
+    requires
+        span >= 1,
+        window >= 1,
+    ensures
+        r <= hi,
+        from <= hi ==> from <= r,
+))]
+fn capped(from: u64, hi: u64, span: u64, window: u64) -> u64 {
+    #[cfg(verus_keep_ghost)]
+    proof! {
+        assert(span * window >= 1) by (nonlinear_arith)
+            requires
+                span >= 1,
+                window >= 1,
+        ;
+    }
+    hi.min(from.saturating_add(span.saturating_mul(window) - 1))
 }
 
 /// Drops the entries at or below block `floor`, in place and out of order, and returns the
@@ -4939,6 +5017,114 @@ mod tests {
     }
 
     #[test]
+    fn a_long_gap_is_walked_in_capped_ticks() {
+        // given a driver caught up on block 1, then 200 empty blocks, one per window
+        let mut driver = counted_driver(one_event_chain(1));
+        run_to_idle(&mut driver);
+        for _ in 2..=201 {
+            driver.source.inner.push_block(&[]);
+        }
+        // when polled until idle
+        let mut ticks = Vec::new();
+        loop {
+            let tick = counted_tick(&mut driver);
+            ticks.push((tick, driver.is_caught_up(), driver.next_delay()));
+            if tick.0 == Tick::Idle {
+                break;
+            }
+        }
+        // then each tick reads at most 64 windows, plus the head twice: three from the
+        // cursor block or the last tick's end, with nothing new, not caught up and no
+        // delay, and then the last nine windows
+        let capped = (
+            (Tick::Progressed(ApplySummary::default()), 66),
+            false,
+            Duration::ZERO,
+        );
+        let last = (
+            (Tick::Idle, 11),
+            true,
+            DriverConfig::default().poll_interval,
+        );
+        assert_eq!(ticks, vec![capped, capped, capped, last]);
+        assert_eq!(driver.engine().cursor(), Some(Position::new(1, 0)));
+    }
+
+    #[test]
+    fn a_partial_tip_resumes_from_its_end() {
+        // given a driver over node a, block 0 with an event and then 300 empty blocks, two
+        // per window; node b is a without its last block
+        let mut a = ScriptedChain::new(0);
+        a.set_window(2);
+        a.push_block(&[1]);
+        for _ in 0..300 {
+            a.push_block(&[]);
+        }
+        let mut b = a.clone();
+        b.reorg(1, &[]);
+        let mut driver = Driver::new(
+            RecordingFold::default(),
+            Pool::new(a, b),
+            engine_config(2),
+            DriverConfig::from_block(0),
+        )
+        .unwrap();
+        assert!(matches!(driver.tick(), Tick::Progressed(_)));
+        // when a tick walks 64 windows from the cursor block, one head call then goes to b,
+        // and block 301 lands before the next poll
+        let capped = pool_tick(&mut driver);
+        driver.source.route = b"B".to_vec();
+        let lagging = pool_tick(&mut driver);
+        driver.source.a.push_block(&[]);
+        let resumed = pool_tick(&mut driver);
+        // then the walk stops at block 127, the head below the tip's waits, and the next
+        // walk starts at block 128 with no read of the tip: its head is the new head's
+        // parent
+        let progressed = Tick::Progressed(ApplySummary::default());
+        assert_eq!(capped, (progressed, 66));
+        assert_eq!(lagging, (Tick::Behind, 1));
+        assert_eq!(resumed, (progressed, 66));
+        let head = driver.source.a.tip().unwrap();
+        assert_eq!(
+            driver.tip,
+            Some(Mark {
+                at: head,
+                done: 255
+            })
+        );
+        run_to_idle(&mut driver);
+        assert_eq!(driver.engine().fold().applied, pool_canonical(&driver));
+
+        // given the same driver after its first capped tick, with node b holding another
+        // block at the tip's height
+        let mut a = ScriptedChain::new(0);
+        a.set_window(2);
+        a.push_block(&[1]);
+        for _ in 0..300 {
+            a.push_block(&[]);
+        }
+        let mut b = a.clone();
+        b.reorg(1, &[&[]]);
+        let mut driver = Driver::new(
+            RecordingFold::default(),
+            Pool::new(a, b),
+            engine_config(2),
+            DriverConfig::from_block(0),
+        )
+        .unwrap();
+        driver.tick();
+        pool_tick(&mut driver);
+        // when every call of the next poll goes to b
+        driver.source.route = [b'B'; 100].to_vec();
+        let sibling = pool_tick(&mut driver);
+        driver.source.route.clear();
+        // then the head disproves the tip, and the walk starts again at the cursor block
+        assert_eq!(sibling, (Tick::Progressed(ApplySummary::default()), 66));
+        run_to_idle(&mut driver);
+        assert_eq!(driver.engine().fold().applied, pool_canonical(&driver));
+    }
+
+    #[test]
     fn scan_returns_when_head_is_u64_max() {
         // given a chain whose only block, number u64::MAX, carries no events
         let mut driver = Driver::new(
@@ -5317,6 +5503,15 @@ spec fn mark_seen<S, E>(m: Mark, c: Option<Position>, h: ChainView, start: u64, 
     }
 }
 
+/// Every view from `start` that holds block `hd` holds block `t`, when `t` lies at or above
+/// `start`.
+#[verifier::opaque]
+spec fn carries<S, E>(hd: BlockRef, t: BlockRef, start: u64) -> bool {
+    t.number >= start ==> forall|v: ChainView|
+        a1::<S, E>(v) && from_start(v, start) && #[trigger] header(v, hd.number) == Some(hd) ==> header(v, t.number)
+            == Some(t)
+}
+
 /// No ABA on block `x` in `hist` from `from`: a view between two views that hold `x` holds it.
 pub open spec fn no_aba(hist: Seq<ChainView>, from: int, x: BlockRef) -> bool {
     forall|i: int, j: int, k: int|
@@ -5566,10 +5761,11 @@ proof fn lemma_floor<S, E>(
     }
 }
 
-/// A walk's windows over `h2` from `w0`, inside a tick over `hist` from `l0` whose first
-/// view read the head `hd`. Its last window's view holds the batch as the window's
-/// entries. With the head read again last, that view also holds nothing from the floor to
-/// the window, and every view of the tick agrees with it up to the head.
+/// A walk's windows over `h2` from `w0` through `hi`, inside a tick over `hist` from `l0`
+/// whose first view read the head `hd`, at or above `hi`. Its last window's view holds the
+/// batch as the window's entries. With the head read again last, that view also holds
+/// nothing from the floor to the window, and every view of the tick agrees with it up to
+/// the head.
 proof fn lemma_walk_core<S, E>(
     hist: Seq<ChainView>,
     h2: Seq<ChainView>,
@@ -5578,6 +5774,7 @@ proof fn lemma_walk_core<S, E>(
     start: u64,
     hd: BlockRef,
     from: u64,
+    hi: u64,
     w: u64,
     floor: bool,
     wins: Seq<(int, int)>,
@@ -5592,7 +5789,8 @@ proof fn lemma_walk_core<S, E>(
         grew::<S, E>(h2, hist),
         header(hist[l0], hd.number) == Some(hd),
         forall|q: int| l0 <= q < hist.len() ==> a1::<S, E>(#[trigger] hist[q]),
-        walked::<S, E>(h2, w0, from, hd.number, w, floor, wins, t, at, n, reached),
+        hi <= hd.number,
+        walked::<S, E>(h2, w0, from, hi, w, floor, wins, t, at, n, reached),
         n > 0 ==> hist.len() > h2.len() && header(hist.last(), hd.number) == Some(hd),
     ensures
         ({
@@ -5601,15 +5799,15 @@ proof fn lemma_walk_core<S, E>(
             let lo = from + if floor { 1int } else { 0int };
             &&& m > 0 ==> {
                 &&& lo <= wlo(wins, floor, m - 1) <= wins[m - 1].1 + 1
-                &&& wins[m - 1].1 <= hd.number
-                &&& from <= hd.number
+                &&& wins[m - 1].1 <= hi
+                &&& from <= hi
                 &&& hist[k] == h2[k]
                 &&& t.to_multiset() == range_entries::<S, E>(
                     hist[k],
                     wlo(wins, floor, m - 1),
                     wins[m - 1].1,
                 ).to_multiset()
-                &&& reached == (wins[m - 1].1 == hd.number)
+                &&& reached == (wins[m - 1].1 == hi)
                 &&& t.len() == 0 ==> reached
                 &&& views_ok(hist, l0, start) && from >= start ==> range_entries::<S, E>(
                     hist[k],
@@ -5622,15 +5820,15 @@ proof fn lemma_walk_core<S, E>(
                         x,
                     )
             }
-            &&& m == 0 ==> from > hd.number && t.len() == 0 && !reached
+            &&& m == 0 ==> from > hi && t.len() == 0 && !reached
         }),
 {
     let m = wins.len() as int;
     let k = w0 + m - 1;
     lemma_grew_next::<S, E>(h2, hist);
     if m > 0 {
-        lemma_wins_bounds(wins, from as int, w, hd.number, 0);
-        lemma_wins_bounds(wins, from as int, w, hd.number, m - 1);
+        lemma_wins_bounds(wins, from as int, w, hi, 0);
+        lemma_wins_bounds(wins, from as int, w, hi, m - 1);
         assert(hist[k] == h2[k]);
         if views_ok(hist, l0, start) && from >= start {
             reveal(views_ok);
@@ -5658,19 +5856,20 @@ proof fn lemma_walk_core<S, E>(
                 h2[w0 + q],
                 x,
             ) == header(vk, x) by {
-                lemma_wins_bounds(wins, from as int, w, hd.number, q);
+                lemma_wins_bounds(wins, from as int, w, hi, q);
                 assert(h2[w0 + q] == hist[w0 + q]);
                 assert(header(hist[w0 + q], x) == header(vk, x));
             }
-            lemma_walk_empty::<S, E>(h2, w0, from, hd.number, w, floor, wins, vk, m - 1);
+            lemma_walk_empty::<S, E>(h2, w0, from, hi, w, floor, wins, vk, m - 1);
         }
     }
 }
 
-/// `scan`'s walk from the cursor block assembles into `scanned`: the head's view `h1[l0]`,
-/// the walk's windows over `h2` from `w0`, the cursor block's view `h3.last()` when the
-/// walk had no entry there, and the head block's view `hist.last()` read again when the
-/// walk read a window.
+/// `scan`'s walk from the cursor block through `hi` assembles into `scanned`: the head's
+/// view `h1[l0]`, the walk's windows over `h2` from `w0`, the cursor block's view
+/// `h3.last()` when the walk had no entry there, and the head block's view `hist.last()`
+/// read again when the walk read a window. A walk with nothing found vouches for the head
+/// up to `hi`.
 proof fn lemma_rung_walk<S, E>(
     hist: Seq<ChainView>,
     h2: Seq<ChainView>,
@@ -5684,6 +5883,7 @@ proof fn lemma_rung_walk<S, E>(
     b: BatchView<E>,
     hd: BlockRef,
     from: u64,
+    hi: u64,
     w: u64,
     wins: Seq<(int, int)>,
     at: Option<BlockRef>,
@@ -5697,7 +5897,8 @@ proof fn lemma_rung_walk<S, E>(
         grew::<S, E>(h3, hist),
         header(hist[l0], hd.number) == Some(hd),
         forall|q: int| l0 <= q < hist.len() ==> a1::<S, E>(#[trigger] hist[q]),
-        walked::<S, E>(h2, w0, from, hd.number, w, c is Some, wins, b.triples(), at, n, reached),
+        hi <= hd.number,
+        walked::<S, E>(h2, w0, from, hi, w, c is Some, wins, b.triples(), at, n, reached),
         from == match c {
             Some(p) => p.block,
             None => start,
@@ -5712,7 +5913,11 @@ proof fn lemma_rung_walk<S, E>(
         },
         hist.len() == h3.len() + if n > 0 { 1int } else { 0int },
         n > 0 ==> header(hist.last(), hd.number) == Some(hd),
-        t1 == if reached { Some(Mark { at: hd, done: hd.number }) } else { None },
+        t1 == if reached && (hi == hd.number || b.triples().len() == 0) {
+            Some(Mark { at: hd, done: hi })
+        } else {
+            None
+        },
         t0 != Some(Mark { at: hd, done: hd.number }),
     ensures
         scanned::<S, E>(hist, l0, start, c, t0, t1, b),
@@ -5722,7 +5927,7 @@ proof fn lemma_rung_walk<S, E>(
     let lo = scan_floor(c, start);
     lemma_grew_next::<S, E>(h2, h3);
     lemma_grew_next::<S, E>(h3, hist);
-    lemma_walk_core::<S, E>(hist, h2, l0, w0, start, hd, from, w, floor, wins, b.triples(), at, n, reached);
+    lemma_walk_core::<S, E>(hist, h2, l0, w0, start, hd, from, hi, w, floor, wins, b.triples(), at, n, reached);
     let k = if m > 0 { w0 + m - 1 } else { hist.len() - 1 };
     let (wl, wh) = if m > 0 { (wlo(wins, floor, m - 1), wins[m - 1].1) } else { (lo, lo - 1) };
     let vk = hist[k];
@@ -5761,15 +5966,16 @@ proof fn lemma_rung_walk<S, E>(
         if t1 is Some && b.triples().len() == 0 {
             vstd::seq_lib::to_multiset_len(b.triples());
             vstd::seq_lib::to_multiset_len(range_entries::<S, E>(vk, wl, wh));
-            lemma_re_split::<S, E>(vk, lo, wl - 1, hd.number as int);
+            lemma_re_split::<S, E>(vk, lo, wl - 1, hi as int);
         }
     }
     assert(scan_view::<S, E>(hist, l0, start, c, t0, t1, b, (k, hd, lo, wl, wh, k, lo)));
 }
 
-/// `scan`'s walk above the tip assembles into `scanned`: the head's view `h1[l0]`, the
-/// walk's windows over `h2` from `l0 + 1`, the tip's view `h3.last()`, and the head block's
-/// view `hist.last()` read again.
+/// `scan`'s walk above the tip through `hi` assembles into `scanned`: the head's view
+/// `h1[l0]`, the walk's windows over `h2` from `l0 + 1`, the tip's view `h3.last()` unless
+/// the head's view holds the tip (`implied`), and the head block's view `hist.last()` read
+/// again.
 proof fn lemma_rung_gap<S, E>(
     hist: Seq<ChainView>,
     h2: Seq<ChainView>,
@@ -5782,10 +5988,12 @@ proof fn lemma_rung_gap<S, E>(
     t1: Option<Mark>,
     b: BatchView<E>,
     hd: BlockRef,
+    hi: u64,
     w: u64,
     wins: Seq<(int, int)>,
     n: u8,
     reached: bool,
+    implied: bool,
 )
     requires
         0 <= l0,
@@ -5794,14 +6002,19 @@ proof fn lemma_rung_gap<S, E>(
         grew::<S, E>(h3, hist),
         header(hist[l0], hd.number) == Some(hd),
         forall|q: int| l0 <= q < hist.len() ==> a1::<S, E>(#[trigger] hist[q]),
-        tip.done < hd.number,
+        tip.done < hi <= hd.number,
         tip.at.number <= hd.number,
-        walked::<S, E>(h2, w0, (tip.done + 1) as u64, hd.number, w, false, wins, b.triples(), None, n, reached),
-        h3.len() == h2.len() + 1,
-        header(h3.last(), tip.at.number) == Some(tip.at),
+        walked::<S, E>(h2, w0, (tip.done + 1) as u64, hi, w, false, wins, b.triples(), None, n, reached),
+        h3.len() == h2.len() + if implied { 0int } else { 1int },
+        implied ==> carries::<S, E>(hd, tip.at, start),
+        !implied ==> header(h3.last(), tip.at.number) == Some(tip.at),
         hist.len() == h3.len() + 1,
         header(hist.last(), hd.number) == Some(hd),
-        t1 == if reached { Some(Mark { at: hd, done: hd.number }) } else { None },
+        t1 == if reached && (hi == hd.number || b.triples().len() == 0) {
+            Some(Mark { at: hd, done: hi })
+        } else {
+            None
+        },
     ensures
         scanned::<S, E>(hist, l0, start, c, Some(tip), t1, b),
 {
@@ -5810,7 +6023,7 @@ proof fn lemma_rung_gap<S, E>(
     let t0 = Some(tip);
     lemma_grew_next::<S, E>(h2, h3);
     lemma_grew_next::<S, E>(h3, hist);
-    lemma_walk_core::<S, E>(hist, h2, l0, w0, start, hd, from, w, false, wins, b.triples(), None, n, reached);
+    lemma_walk_core::<S, E>(hist, h2, l0, w0, start, hd, from, hi, w, false, wins, b.triples(), None, n, reached);
     let k = w0 + m - 1;
     let (wl, wh) = (wlo(wins, false, m - 1), wins[m - 1].1);
     let vk = hist[k];
@@ -5820,13 +6033,21 @@ proof fn lemma_rung_gap<S, E>(
     if views_ok(hist, l0, start) && (c matches Some(q) ==> q.block >= start) && tip.done + 1 >= start {
         assert(header(hist[l0], hd.number) == header(vk, hd.number));
         if tip.at.number >= start {
-            assert(header(hist[p], tip.at.number) == header(vk, tip.at.number));
+            if implied {
+                reveal(views_ok);
+                reveal(carries);
+                assert(from_start(hist[l0], start));
+                assert(header(hist[l0], tip.at.number) == Some(tip.at));
+                assert(header(hist[l0], tip.at.number) == header(vk, tip.at.number));
+            } else {
+                assert(header(hist[p], tip.at.number) == header(vk, tip.at.number));
+            }
         }
         assert(anchored(hist, k, c, t0, b.boundary, start, a));
         if t1 is Some && b.triples().len() == 0 {
             vstd::seq_lib::to_multiset_len(b.triples());
             vstd::seq_lib::to_multiset_len(range_entries::<S, E>(vk, wl, wh));
-            lemma_re_split::<S, E>(vk, a, wl - 1, hd.number as int);
+            lemma_re_split::<S, E>(vk, a, wl - 1, hi as int);
         }
     }
     assert(scan_view::<S, E>(hist, l0, start, c, t0, t1, b, (k, hd, a, wl, wh, k, a)));
@@ -5874,6 +6095,24 @@ proof fn lemma_parent<S, E>(v: ChainView, hd: BlockRef, parent: [u8; 32], tip: B
     lemma_from_start(v, start, hd.number);
     assert(v.contains_key(tip.number));
     assert(v[tip.number] == anc(v[hd.number].hash, tip.number));
+}
+
+/// A view that holds head `hd` holds the tip `t` when `t` is the head or its parent.
+proof fn lemma_carries<S, E>(hd: Head, t: BlockRef, start: u64)
+    requires
+        hd.block == t || (hd.parent == t.hash && t.number + 1 == hd.block.number),
+        hd.block.number > 0 ==> anc(hd.block.hash, (hd.block.number - 1) as u64).hash == hd.parent,
+    ensures
+        carries::<S, E>(hd.block, t, start),
+{
+    reveal(carries);
+    assert forall|v: ChainView|
+        a1::<S, E>(v) && from_start(v, start) && #[trigger] header(v, hd.block.number) == Some(hd.block) && t.number
+            >= start implies header(v, t.number) == Some(t) by {
+        if hd.block != t {
+            lemma_parent::<S, E>(v, hd.block, hd.parent, t, start);
+        }
+    }
 }
 
 /// `scan` with the head one block on top of the tip: the head's view `hist[l0]` holds the
@@ -6131,7 +6370,6 @@ impl<F: Fold, S: Source<Event = F::Event>, K: SnapshotSink<F>> Driver<F, S, K> {
     pub closed spec fn wf(&self) -> bool {
         &&& self.engine.wf()
         &&& self.batch@.wf()
-        &&& self.tip matches Some(m) ==> m.done == m.at.number
     }
 
     pub closed spec fn engine_view(&self) -> EngineView {
