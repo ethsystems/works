@@ -17,7 +17,11 @@ Usage: verus-gates.py <crate-dir>
     silently treats an unannotated fn as external (unverified). Attributes
     are read the way rustc applies them under VERUS_CFG (the CI features), so
     a fn that cfg drops from the Verus build, or that has a second body for
-    another cfg, counts as unverified. An out-of-scope file uses no Verus at
+    another cfg, counts as unverified. Specs do not cover bodies, so in a body
+    `cfg(verus_keep_ghost)` may gate only `proof!`, `proof_decl!` or
+    `proof_with!`, `cfg_attr(verus_keep_ghost, ..)` may only add a Verus
+    annotation, and no other cfg, no `cfg!` and no cfg in a `verus!` block is
+    allowed. An out-of-scope file uses no Verus at
     all. Every trait an in-scope file declares is on `trusted-traits`, since
     its spec is assumed for every unverified impl.
 (c) The crate's `verus-manifest.txt` matches the sources: the tcb.rs items,
@@ -198,6 +202,18 @@ def cfg_of(attrs: list[str]) -> bool:
     return all(cfg_true(m.group(1)) for a in attrs if (m := re.fullmatch(r"cfg\s*\((.*)\)", a, re.S)))
 
 
+def body_attr_ok(attr: str, header: str) -> bool:
+    """Whether an attribute inside a fn body leaves the compiled code the same in every build:
+    `cfg(verus_keep_ghost)` only on a ghost macro, `cfg_attr` only to add a Verus annotation."""
+    attr = attr.strip()
+    if re.fullmatch(r"cfg\s*\(\s*verus_keep_ghost\s*\)", attr):
+        return bool(re.fullmatch(r"\s*(proof|proof_decl|proof_with)\s*!\s*", header))
+    if m := re.fullmatch(r"cfg_attr\s*\((.*)\)", attr, re.S):
+        pred, *rest = split_top(m.group(1))
+        return norm(pred) == "verus_keep_ghost" and not any(re.match(r"cfg(_attr)?\b", a) for a in rest)
+    return not re.match(r"cfg\b", attr)
+
+
 def self_type(impl_rest: str) -> tuple[str, str]:
     """(self type, trait) of an impl header after `impl`."""
     rest = impl_rest.strip()
@@ -219,12 +235,13 @@ def items(src: str, orig: str) -> dict:
     """Walks one file. `src` is stripped; `orig` has only comments stripped (same offsets).
 
     Returns fns as (qualified name, line, verified, live, spec text), traits, `use` and `mod`
-    declarations as (name or text, line, live), and `verus!` blocks as [start, end, line, live].
+    declarations as (name or text, line, live), `verus!` blocks as [start, end, line, live],
+    and the attributes in fn bodies that change code between builds as (text, line).
     `live` means rustc compiles the item under VERUS_CFG.
     """
-    out = {"fns": [], "traits": [], "uses": [], "mods": [], "verus": []}
+    out = {"fns": [], "traits": [], "uses": [], "mods": [], "verus": [], "body_cfgs": []}
     # Scope stack entries: (kind, name, verified, live, start). Kinds: item, impl, trait,
-    # skip, verus, block.
+    # skip, verus, body (a fn body, or a block in one), block.
     stack = [("item", "", False, True, 0)]
     header_start, attrs = 0, []
     i, n = 0, len(src)
@@ -265,6 +282,8 @@ def items(src: str, orig: str) -> dict:
             offset = fn.start() if fn else len(header) - len(header.lstrip())
             line = line_of(src, header_start + offset)
             scanned = kind not in ("skip", "verus") and not is_test
+            if kind == "body":
+                out["body_cfgs"] += [(norm(raw), line) for raw in attrs if not body_attr_ok(raw, header)]
             if scanned:
                 if fn and c in "{;":
                     qual = f"{name}::{fn.group(1)}" if name else fn.group(1)
@@ -282,7 +301,7 @@ def items(src: str, orig: str) -> dict:
                     stack.append(("verus", "", False, live, i))
                     out["verus"].append([i + 1, None, line, live])
                 elif fn:
-                    stack.append(("block", fn.group(1), False, live, i))
+                    stack.append(("body", fn.group(1), False, live, i))
                 elif m := re.search(r"\bimpl\b(.*)$", header, re.S):
                     stack.append(("impl", self_type(m.group(1))[0], marked, live, i))
                 elif m := re.search(r"\btrait\s+(\w+)", header):
@@ -290,7 +309,7 @@ def items(src: str, orig: str) -> dict:
                 elif re.search(r"\bmod\s+\w+\s*$", header):
                     stack.append(("item", "", False, live, i))
                 else:
-                    stack.append(("block", name, False, live, i))
+                    stack.append(("body" if kind == "body" else "block", name, False, live, i))
             elif c == "}" and len(stack) > 1:
                 if stack[-1][0] == "verus":
                     for block in out["verus"]:
@@ -501,9 +520,15 @@ def check(crate: Path) -> list[str]:
             targets = {str((base / f"{name}.rs").relative_to(crate)), str((base / name / "mod.rs").relative_to(crate))}
             if not live and not targets & out_files.keys():
                 errors.append(f"{rel}:{line}: `mod {name}` is cfg'd out of the Verus build")
-        for _, _, line, live in found["verus"]:
+        for a, b, line, live in found["verus"]:
             if not live:
                 errors.append(f"{rel}:{line}: `verus!` block is cfg'd out of the Verus build")
+            for m in re.finditer(r"#\s*!?\s*\[\s*cfg", src[a:b]):
+                errors.append(f"{rel}:{line_of(src, a + m.start())}: cfg in a `verus!` block")
+        for text, line in found["body_cfgs"]:
+            errors.append(f"{rel}:{line}: `#[{text}]` in a fn body makes the build differ from the verified one")
+        for m in re.finditer(r"\bcfg\s*!", src):
+            errors.append(f"{rel}:{line_of(src, m.start())}: `cfg!` makes the build differ from the verified one")
     errors += [f"out-of-scope entry `{key}` matches no fn" for key in out_of_scope if key not in used]
 
     have = [line for line in read_manifest(crate) if is_static(line)]
@@ -653,6 +678,26 @@ mod tests { fn helper() {} }
         "cfg_dead_verus": ("#[cfg(not(verus_keep_ghost))]\nverus! { fn w() {} }", "", {}, False),
         "use_swap": ("#[cfg(not(verus_keep_ghost))]\nuse crate::o::w;", "", {}, False),
         "use_link_ok": ('#[cfg(feature = "std")]\nuse crc as _;', "", {}, True),
+        # A statement or expression cfg ships a body Verus never checked.
+        "body_cfg": (spec + '\nfn w(a: u8) -> u8 {\n#[cfg(feature = "std")]\nif a == 0 { return 1; }\na }', "", {}, False),
+        "body_cfg_block": (spec + '\nfn w(a: u8) -> u8 {\n#[cfg(feature = "std")]\n{ return 1; }\na }', "", {}, False),
+        "body_cfg_let": (spec + "\nfn w(a: u8) -> u8 {\n#[cfg(not(verus_keep_ghost))]\nlet a = 0;\na }", "", {}, False),
+        "body_cfg_ghost_let": (spec + "\nfn w(a: u8) -> u8 {\n#[cfg(verus_keep_ghost)]\nlet a = 0;\na }", "", {}, False),
+        "body_cfg_expr": (spec + '\nfn w(a: u8) -> u8 { let b = #[cfg(feature = "std")] 0; a }', "", {}, False),
+        "body_cfg_tail": (spec + '\nfn w(a: u8) -> u8 { #[cfg(feature = "std")] a }', "", {}, False),
+        "body_cfg_attr": (spec + '\nfn w(a: u8) -> u8 {\n#[cfg_attr(verus_keep_ghost, cfg(any()))]\nlet a = 0;\na }', "", {}, False),
+        "body_cfg_attr_std": (spec + '\nfn w(a: u8) -> u8 {\n#[cfg_attr(feature = "std", allow(unused))]\nlet a = 0;\na }', "", {}, False),
+        "body_cfg_macro": (spec + '\nfn w(a: u8) -> u8 { if cfg!(feature = "std") { return 0; } a }', "", {}, False),
+        "verus_cfg": ('verus! { fn w(a: u8) -> u8 {\n#[cfg(feature = "std")]\nlet a = 0;\na } }', "", {}, False),
+        "body_ghost_ok": (
+            spec + "\nfn w(a: u8) -> u8 {\n#[cfg(verus_keep_ghost)]\nproof! { assert(true); }\n"
+            "#[cfg(verus_keep_ghost)]\nproof_decl! { let ghost g = 0int; }\n"
+            "#[cfg(verus_keep_ghost)]\nproof_with! {Tracked(&mut g)}\nlet b = h(a);\n"
+            "#[cfg_attr(verus_keep_ghost, verus_spec(invariant true))]\nwhile false {}\na }",
+            "",
+            {},
+            True,
+        ),
     }
     for name, (extra, listed, files, want_ok) in cases.items():
         with tempfile.TemporaryDirectory() as tmp:
