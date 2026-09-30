@@ -477,6 +477,7 @@ where
             // A reset leaves the driver out of sync, so `durable_ok` holds until the next
             // tick reconciles the sink.
             old(self).synced() && final(r)@.resets != r@.resets ==> final(self).durable_ok(),
+            final(self).unanchored(),
     ))]
     pub fn engine_mut(&mut self) -> &mut Engine<F> {
         self.tip = None;
@@ -4132,6 +4133,30 @@ mod tests {
     }
 
     #[test]
+    fn manual_rollback_at_the_tip_refolds_the_blocks_above_it() {
+        // given a driver at the tip of six blocks with one event each, checkpointed at 3
+        let mut chain = ScriptedChain::new(1);
+        for value in 1..=3u64 {
+            chain.push_block(&[value]);
+        }
+        let mut driver = new_driver(chain, engine_config(2), DriverConfig::from_block(1));
+        run_to_idle(&mut driver);
+        driver.checkpoint();
+        for value in 4..=6u64 {
+            driver.source.push_block(&[value]);
+        }
+        run_to_idle(&mut driver);
+        // when the engine is rolled back by hand to block 3, then block 7 lands
+        let restored = driver.engine_mut().rollback_at_or_below(3).unwrap();
+        driver.source.push_block(&[7]);
+        run_to_idle(&mut driver);
+        // then blocks 4..=6 fold again, and the fold is the fold from scratch
+        assert_eq!(restored, Some(Position::new(3, 0)));
+        let chain = driver.source.clone();
+        assert_eq!(driver.engine().fold().applied, canonical_fold(chain));
+    }
+
+    #[test]
     fn two_hashes_at_one_height_are_a_source_error() {
         // given a driver caught up on five blocks, and a sixth served under two hashes
         let mut driver = adversary_driver(one_event_chain(5));
@@ -5420,6 +5445,11 @@ impl<F: Fold, S: Source<Event = F::Event>, K: SnapshotSink<F>> Driver<F, S, K> {
     /// The scan tip.
     pub closed spec fn tip_view(&self) -> Option<BlockRef> {
         self.tip
+    }
+
+    /// No scan anchor: the next poll reads from the cursor block.
+    pub closed spec fn unanchored(&self) -> bool {
+        self.tip is None
     }
 
     /// Ghost invariant over log `log` and chain view `h` (`dinv`), with the scan tip

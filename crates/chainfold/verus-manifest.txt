@@ -491,7 +491,7 @@ spec f3bbb76f709a src/driver.rs::Driver::resume_with_sink
 spec 989f3fb62e8b src/driver.rs::Driver::build
 spec c44c7fd42ea7 src/driver.rs::Driver::around
 spec d031062247f1 src/driver.rs::Driver::engine
-spec 69974daa6918 src/driver.rs::Driver::engine_mut
+spec 48378bad1f06 src/driver.rs::Driver::engine_mut
 spec 64c9147026d6 src/driver.rs::Driver::source_mut
 spec c78b46f949be src/driver.rs::Driver::auto_checkpoint
 spec 27737d649a25 src/driver.rs::Driver::run_checkpoint
@@ -578,6 +578,7 @@ spec 46d9001d8ce5 src/driver.rs::Driver::source_log
 spec fe83048f5e5d src/driver.rs::Driver::source_infallible
 spec f405ac92a1f1 src/driver.rs::Driver::batch_view
 spec 41e94f949a52 src/driver.rs::Driver::tip_view
+spec e9b6f0337788 src/driver.rs::Driver::unanchored
 spec a666f8ca53c2 src/driver.rs::Driver::dinv
 spec eb44b97cc947 src/driver.rs::tick_inv
 spec d082c7cfe79b src/driver.rs::t7_tick
