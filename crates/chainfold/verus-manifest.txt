@@ -501,10 +501,10 @@ spec 460f2c103d7b src/driver.rs::Driver::reconcile_reset
 spec 9ba9a901eb78 src/driver.rs::Driver::reconcile_reset_slow
 spec b7e64aa96e72 src/driver.rs::Driver::step
 spec 45740e7f822c src/driver.rs::Driver::poll_apply
-spec a85851c245a4 src/driver.rs::Driver::scan
-spec de0109a0b0d0 src/driver.rs::Driver::next_block
-spec 362f53a0a65f src/driver.rs::Driver::above_tip
-spec 24e2b8d1ea62 src/driver.rs::Driver::cursor_walk
+spec bd4c9b339387 src/driver.rs::Driver::scan
+spec 3f75fb2d2828 src/driver.rs::Driver::next_block
+spec 39b312967529 src/driver.rs::Driver::above_tip
+spec ec33634adf0d src/driver.rs::Driver::cursor_walk
 spec e2f66518c0ca src/driver.rs::Driver::cursor_block
 spec 26748d278430 src/driver.rs::Driver::walk
 spec fe304b98d969 src/driver.rs::Driver::recover_via_bisection

@@ -1127,7 +1127,7 @@ where
 
     /// Fills `batch` with the blocks strictly after the cursor, plus the cursor block's
     /// header. `Ok(false)` when the head block moved during a walk; the batch is then
-    /// empty.
+    /// empty. Every result but `Ok(true)` keeps the tip.
     ///
     /// Cheapest first: a head equal to the tip is one call; a head whose parent is the tip
     /// reads its own block by hash; a gap past the tip, when that costs fewer calls than
@@ -1157,7 +1157,7 @@ where
                 })
                 &&& l0 < hist.len()
                 &&& grew::<S, S::Event>(sview_log::<S>(&old(self).source), hist)
-                &&& !(r matches Ok(true)) ==> final(self).tip is None
+                &&& !(r matches Ok(true)) ==> final(self).tip == old(self).tip
                 &&& infallible::<S>(&old(self).source) ==> r is Ok && infallible::<S>(&final(self).source)
                 &&& r matches Ok(false) ==> moved(hist, l0)
                 &&& r matches Ok(true) ==> shaped_at(final(self).batch@, old(self).engine@.cursor)
@@ -1184,13 +1184,13 @@ where
     fn scan(&mut self) -> Result<bool, S::Error> {
         self.batch.clear();
         let cursor = self.engine.cursor();
-        let tip = self.tip.take();
         #[cfg(verus_keep_ghost)]
         proof! {
             lemma_grew_refl::<S, S::Event>(sview_log::<S>(&self.source));
             lemma_grew_next::<S, S::Event>(sview_log::<S>(&old(self).source), sview_log::<S>(&self.source));
         }
         let head = self.source.head()?;
+        let tip = self.tip;
         let window = self.source.window().max(1);
         let from = match cursor {
             Some(cursor) => cursor.block,
@@ -1210,7 +1210,6 @@ where
                     let ghost b0 = self.batch;
                 }
                 self.batch.boundary = self.cursor_block();
-                self.tip = Some(tip);
                 #[cfg(verus_keep_ghost)]
                 proof! {
                     crate::batch::lemma_batch_view(b0);
@@ -1271,7 +1270,6 @@ where
             old(self).wf(),
             old(self).batch@.ends.len() == 0,
             old(self).batch@.boundary is None,
-            old(self).tip is None,
             sview_log::<S>(&old(self).source).len() > 0,
             header(sview_log::<S>(&old(self).source).last(), head.block.number) == Some(head.block),
             head.block.number > 0 ==> anc(head.block.hash, (head.block.number - 1) as u64).hash == head.parent,
@@ -1286,7 +1284,7 @@ where
                 ..*old(self)
             }),
             grew::<S, S::Event>(sview_log::<S>(&old(self).source), sview_log::<S>(&final(self).source)),
-            !(r matches Ok(true)) ==> final(self).tip is None && final(self).batch@.ends.len() == 0
+            !(r matches Ok(true)) ==> final(self).tip == old(self).tip && final(self).batch@.ends.len() == 0
                 && final(self).batch@.boundary is None,
             infallible::<S>(&old(self).source) ==> r is Ok && infallible::<S>(&final(self).source),
             r matches Ok(true) ==> shaped_at(final(self).batch@, old(self).engine@.cursor),
@@ -1361,7 +1359,6 @@ where
             old(self).wf(),
             old(self).batch@.ends.len() == 0,
             old(self).batch@.boundary is None,
-            old(self).tip is None,
             tip.number < head.number,
             window >= 1,
         ensures
@@ -1374,7 +1371,7 @@ where
                 ..*old(self)
             }),
             grew::<S, S::Event>(sview_log::<S>(&old(self).source), sview_log::<S>(&final(self).source)),
-            !(r matches Ok(Some(true))) ==> final(self).tip is None,
+            !(r matches Ok(Some(true))) ==> final(self).tip == old(self).tip,
             r matches Ok(None) ==> final(self).batch@.ends.len() == 0 && final(self).batch@.boundary is None,
             infallible::<S>(&old(self).source) ==> r is Ok && infallible::<S>(&final(self).source),
             r matches Ok(Some(false)) ==> lost(
@@ -1466,6 +1463,8 @@ where
         self.batch.boundary = self.cursor_block();
         if reached {
             self.tip = Some(head);
+        } else {
+            self.tip = None;
         }
         #[cfg(verus_keep_ghost)]
         proof! {
@@ -1516,7 +1515,6 @@ where
             old(self).wf(),
             old(self).batch@.ends.len() == 0,
             old(self).batch@.boundary is None,
-            old(self).tip is None,
             window >= 1,
             from == match old(self).engine@.cursor {
                 Some(c) => c.block,
@@ -1532,7 +1530,7 @@ where
                 ..*old(self)
             }),
             grew::<S, S::Event>(sview_log::<S>(&old(self).source), sview_log::<S>(&final(self).source)),
-            !(r matches Ok(true)) ==> final(self).tip is None,
+            !(r matches Ok(true)) ==> final(self).tip == old(self).tip,
             infallible::<S>(&old(self).source) ==> r is Ok && infallible::<S>(&final(self).source),
             r matches Ok(false) ==> lost(
                 sview_log::<S>(&final(self).source),
@@ -1646,6 +1644,8 @@ where
         }
         if reached {
             self.tip = Some(head);
+        } else {
+            self.tip = None;
         }
         #[cfg(verus_keep_ghost)]
         proof! {
@@ -4603,6 +4603,97 @@ mod tests {
                 .contains(&(Position::new(21, 0), 21))
         );
         assert_eq!(driver.engine().fold().applied, pool_canonical(&driver));
+    }
+
+    #[test]
+    fn a_failed_head_keeps_the_tip() {
+        // given a driver caught up on block 5 and then on twenty empty blocks, two per
+        // window, so its tip is far above its cursor
+        let mut driver = counted_driver(one_event_chain(5));
+        driver.source.inner.set_window(2);
+        for _ in 6..=25 {
+            driver.source.inner.push_block(&[]);
+        }
+        run_to_idle(&mut driver);
+        // when one head call fails, and the next poll finds no new block
+        driver.source.inner.fail_next_polls(1);
+        let failed = counted_tick(&mut driver);
+        let next = counted_tick(&mut driver);
+        // then the next poll still reads only the head
+        assert_eq!(failed, (Tick::SourceError, 1));
+        assert_eq!(next, (Tick::Idle, 1));
+    }
+
+    /// Calls one tick costs on a pool with no route queued.
+    fn pool_tick(driver: &mut Driver<RecordingFold, Pool>) -> (Tick, u32) {
+        let before = driver.source.calls;
+        let tick = driver.tick();
+        (tick, driver.source.calls - before)
+    }
+
+    #[test]
+    fn an_error_mid_walk_keeps_the_tip() {
+        // given two drivers caught up on node a to block 20, with their tip there, then
+        // ten more blocks; node b lags at block 20 and errs on a range past it
+        let mut failing = pool_driver(&[]);
+        let mut twin = pool_driver(&[]);
+        for driver in [&mut failing, &mut twin] {
+            run_to_idle(driver);
+            driver.source.b = driver.source.a.clone();
+            for _ in 21..=30 {
+                driver.source.a.push_block(&[]);
+            }
+        }
+        // when one driver's first window above the tip goes to b, and then both poll
+        failing.source.route = b"AB".to_vec();
+        let failed = pool_tick(&mut failing);
+        let retry = pool_tick(&mut failing);
+        let clean = pool_tick(&mut twin);
+        // then the retry reads above the tip, as a tick without the error does
+        assert_eq!(failed.0, Tick::SourceError);
+        assert_eq!(retry, clean);
+        assert_eq!(failing.engine().fold().applied, pool_canonical(&failing));
+
+        // given the same, with b behind a proxy at block 2 of a fork whose block 2 carries
+        // 777
+        let mut refused = pool_driver(&[0, 777]);
+        let mut twin = pool_driver(&[0, 777]);
+        for driver in [&mut refused, &mut twin] {
+            run_to_idle(driver);
+            for _ in 21..=30 {
+                driver.source.a.push_block(&[]);
+            }
+        }
+        // when one driver's first window above the tip is answered by b with its block 2
+        refused.source.proxy = true;
+        refused.source.route = b"AB".to_vec();
+        let failed = pool_tick(&mut refused);
+        let retry = pool_tick(&mut refused);
+        let clean = pool_tick(&mut twin);
+        // then the refused answer keeps the tip too
+        assert_eq!(failed.0, Tick::SourceError);
+        assert_eq!(retry, clean);
+        assert_eq!(refused.engine().fold().applied, pool_canonical(&refused));
+
+        // given a driver whose cursor is its tip, at block 20 with an event, then two empty
+        // blocks; node b, behind a proxy, lags at block 19 of a fork whose block 19 carries
+        // 777
+        let mut fork = [0; 19];
+        fork[18] = 777;
+        let mut refused = pool_driver(&fork);
+        refused.source.a.reorg(1, &[&[20]]);
+        run_to_idle(&mut refused);
+        let tip = refused.tip;
+        refused.source.a.push_block(&[]);
+        refused.source.a.push_block(&[]);
+        // when the first window of the walk from the cursor goes to b
+        refused.source.proxy = true;
+        refused.source.route = b"AB".to_vec();
+        let failed = refused.tick();
+        // then the refused answer keeps the tip
+        assert_eq!(failed, Tick::SourceError);
+        assert!(tip.is_some());
+        assert_eq!(refused.tip, tip);
     }
 
     #[test]
