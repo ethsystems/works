@@ -339,13 +339,18 @@ tcb 0a1f173e2ca2 Observed[IteratorSpecImpl]::will_return_none
 tcb ef46daa8a72d Observed[IteratorSpecImpl]::decrease
 tcb 39c8a208db3b Observed[IteratorSpecImpl]::peek
 tcb 09ed59c748e1 (outside-verus!)
-dep crc
-dep crc-fast
-dep include-utils
-dep serde
-dep tokio
-dep vstd
-dep wincode
+dep {"default-features":false,"optional":true,"version":"3.4"} dependencies/crc
+dep {"default-features":false,"optional":true,"version":"1.10"} dependencies/crc-fast
+dep {"default-features":false,"optional":true,"version":"0.2.4"} dependencies/include-utils
+dep {"default-features":false,"features":["alloc","derive"],"optional":true,"version":"1"} dependencies/serde
+dep {"default-features":false,"features":["rt","sync"],"optional":true,"version":"1"} dependencies/tokio
+dep {"default-features":false,"features":["alloc"],"optional":true,"version":"=0.0.0-2026-09-20-0158"} dependencies/vstd
+dep {"default-features":false,"features":["alloc","derive"],"optional":true,"version":"0.6"} dependencies/wincode
+dep {"features":["test-helpers"],"path":"."} dev-dependencies/chainfold
+dep {"default-features":false,"features":["cargo_bench_support","html_reports","plotters"],"version":"0.8"} dev-dependencies/criterion
+dep {"default-features":false,"features":["bit-set","fork","std","timeout"],"version":"1"} dev-dependencies/proptest
+dep {"version":"3"} dev-dependencies/tempfile
+dep {"default-features":false,"features":["macros","rt","sync","time"],"version":"1"} dev-dependencies/tokio
 spec 9ff22c8bfe3e src/batch.rs::SpanView::block
 spec 9e9bb413ec58 src/batch.rs::Batch::new
 spec aadd3a179956 src/batch.rs::Batch::clear
