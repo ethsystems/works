@@ -104,9 +104,10 @@ fn clamp(mark: Option<u64>, to: Option<Position>) -> Option<u64> {
 #[cfg_attr(verus_keep_ghost, verus_verify)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tick {
-    /// Batch applied; the summary counts what the fold saw.
+    /// Batch applied; the summary counts what the fold saw. Also a walk cut at its cap
+    /// with nothing found, with an empty summary: the next tick walks on.
     Progressed(ApplySummary),
-    /// Poll returned nothing new.
+    /// Poll read up to the head and found nothing new.
     Idle,
     /// A fork rolled the engine back to a checkpoint.
     RolledBack {
@@ -150,7 +151,8 @@ pub struct DriverStatus {
     pub last_verified: Option<BlockRef>,
     /// Engine status behind this driver.
     pub engine: EngineStatus,
-    /// True once the most recent poll returned no new blocks.
+    /// True once the most recent applied poll read up to the head and found nothing new;
+    /// a `Behind` or `SourceError` tick leaves it as it was.
     pub caught_up: bool,
     /// Events the fold declared not its own.
     pub skips: u64,
@@ -535,7 +537,8 @@ where
         &mut self.source
     }
 
-    /// True once the most recent poll returned no new blocks.
+    /// True once the most recent applied poll read up to the head and found nothing new;
+    /// a `Behind` or `SourceError` tick leaves it as it was.
     #[cfg_attr(verus_keep_ghost, verus_verify)]
     pub fn is_caught_up(&self) -> bool {
         self.caught_up

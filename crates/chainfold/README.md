@@ -17,9 +17,10 @@ durable, a reorg noticed only when a proof stops verifying.
 - **apply**: a poll fills one `Batch`; the `Engine` enforces the total order, drops
   everything at or below the cursor as already applied, and counts the events the fold
   declares are not its own.
-- **poll**: the driver keeps the last head a scan covered, the tip. A poll whose head is
-  the tip makes one call; a head one block on top of it makes two, the head and that
-  block's logs by its hash. Only a gap reads more.
+- **poll**: the driver keeps a head that a scan read, the tip, and how far below it
+  that scan covered. A poll whose head is the tip makes one call, and so does one whose
+  head lags it; a head one block on top of it makes two, the head and that block's logs
+  by its hash. Only a gap reads more, at most 64 windows a poll.
 - **detect**: each batch carries the current header of the cursor block, from the first
   window's answer, which starts at that block, or from the tip, which commits to it. A
   block hash commits to its whole ancestry, so a reorg touching anything at or below the
@@ -231,8 +232,27 @@ provider's cap errs, and so does every walk that needs a full one. Set it per pr
 - nodes you run: reth caps 100,000 blocks and 20,000 logs by default, Nethermind 20,000
   logs, geth nothing.
 
+A head below the tip or the cursor block, from a node behind the one the last poll read,
+and agreeing with every hash the ring holds, returns `Behind` and costs that one call;
+the fold and the tip stay. A failed call during the scan, or a head block that moved
+during the walk, returns `SourceError` and keeps the tip too, so the next poll goes on
+from it.
+
+One tick reads at most 64 windows. A walk cut there with nothing found returns
+`Progressed` with nothing applied, leaves `is_caught_up` false and `next_delay` zero, and
+keeps a tip that covers only the heights it read; the next tick walks on from there.
+After a tick whose scan fails or sees the head block move, that limit halves, down to
+one window; after each applied tick it doubles, up to 64. So a provider that fails every
+call of a tick past a burst still lets the driver catch up, in walks that fit the burst
+(see the second table below).
+
+A reorg that replaces the tip block leaves the scan no anchor above the cursor. The next
+poll walks from the cursor block again, about (head − cursor) / window `events_in` calls,
+64 windows a tick.
+
 Calls per scenario, counted with a counting source over `ScriptedChain`: window 10, the
-driver caught up at block 100. One call is one `Source` method, one JSON-RPC request.
+driver caught up at block 100. These are test sizes, not the defaults. One call is one
+`Source` method, one JSON-RPC request.
 
 | scenario | calls |
 |---|---|
@@ -240,17 +260,39 @@ driver caught up at block 100. One call is one `Source` method, one JSON-RPC req
 | one new block, with or without events | 2 |
 | one new empty block, then 9 idle polls | 11 |
 | 2, 10, 25 new empty blocks (one tick) | 3, 4, 5 |
-| an event after 1, 10, 100 empty windows (ticks to fold it) | 4, 13, 103 |
-| 1, 10, 100 empty windows, then 10 polls with no new block | 13, 22, 112 |
+| an event after 1, 10, 100 empty windows (ticks to fold it) | 4, 13, 105 |
+| 1, 10, 100 empty windows, then 10 polls with no new block | 13, 22, 113 |
 | 1, 10, 100 empty windows, then 10 polls with one new block each | 22, 31, 121 |
+| 100, 1000 empty windows above the tip (ticks to idle) | 105 in 2 ticks, 1,033 in 16; at most 66 a tick |
+| tip 10 windows above the cursor: a head from a node 1 block behind (that poll; then to idle) | 1; 1 |
+| tip 10 windows above the cursor: a failed `head` (that poll; then to idle) | 1; 1 |
 | reorg of the cursor block (ticks to idle) | 17 |
 | reorg before the second window of a 30-block walk (ticks to idle) | 14 |
 | reorg of the tip, 10 blocks above the cursor (ticks to idle) | 4 |
+| reorg of the tip, 100 and 1000 windows above the cursor (ticks to idle) | 105 in 2 ticks, 1,033 in 16 |
 | reorg below the tip and above the cursor that adds an event (ticks to idle) | 6 |
-| one new block, `events_at` to a node without it, lag clears after one tick (ticks to idle) | 6 |
+| one new block, `events_at` to a node without it, lag clears after one tick (ticks to idle) | 5 |
 | one-window answer torn by a reorg, 5 blocks above the cursor (ticks to idle) | 7 |
 
-The bloom check is not in these counts: `ScriptedChain` answers every `events_at` itself.
+The same count at the defaults (window 500, ring 1024, 4 checkpoint slots, checkpoint
+interval 64), over a synthetic chain source that meets the `Source` contract. "1/day" has
+one event a day (7,200 blocks), so the cursor sits the stated distance below the head;
+"deploy only" has one event, at the start block.
+
+| scenario | calls |
+|---|---|
+| 1/day, cursor 1 day below the head: poll, no new block | 1 |
+| 1/day, cursor 1 day below the head: one new block | 2 |
+| 1/day, cursor 1 day below the head: 2, 5, 25 new blocks (one tick) | 4, 4, 4 |
+| 1/day, cursor 1 day below the head: 20 polls, `head` from a node 1 block behind on every other one | 20 |
+| 1/day, cursor 1 day below the head: a failed `head` (that poll; then to idle) | 1; 1 |
+| 1/day, cursor 1 hour, 1 day, 1 week below the head: depth-1 reorg of the tip (ticks to idle) | 3, 17, 105 in 2 ticks |
+| first sync, deploy only, 1 week, 1 month, 1 year back (ticks to idle) | 108 in 3 ticks, 450 in 8, 5,430 in 84; at most 66 a tick |
+| first sync, deploy only, 1 year back, each call fails with chance 1% (median of 5 seeds) | median 7,174, median 191 ticks |
+| first sync, deploy only, 1 year back, every call of a tick past its 10th fails | 13,829 in 1,318 ticks; at most 11 a tick |
+
+The bloom check is not in these counts: `ScriptedChain` and the synthetic source answer
+every `events_at` themselves.
 
 ### durability (`storage` feature)
 
@@ -301,8 +343,9 @@ dependency stack that a guest or wasm build has no use for.
 - `DriverConfig::snapshot_interval`: blocks of durable-point progress between sink offers.
   `None` disables offers entirely.
 - `DriverConfig::poll_interval`, `backoff_base`, `backoff_max`: cadence at the tip, and
-  the capped exponential backoff after a source error. A tick that moved the cursor asks
-  for no delay, so catch-up and post-resync replay run at source speed.
+  the capped exponential backoff after a source error. A tick that moved the cursor, or
+  whose walk stopped at its cap, asks for no delay, so catch-up and post-resync replay
+  run at source speed. A `Behind` tick waits the poll interval.
 - `Flusher::spawn(store, queue_depth)`: snapshot jobs admitted before an offer blocks. The
   bound is the backpressure signal when the disk falls behind.
 - `StoreConfig::retain`: superseded snapshot files kept beyond the two the manifest names,
@@ -377,11 +420,15 @@ trusted items are in `src/verus/tcb.rs`.
   from `start_block` to that entry. After `Behind`, the engine and the tip are
   unchanged: the head was below the tip or the cursor block, and no hash the ring holds
   at its height or its parent's contradicts it. That tick makes one call. A chain that
-  reorgs to fewer blocks than the cursor block, where the ring holds none of its heights,
-  looks the same as a node that lags, so its ticks return `Behind` until it grows past
-  the cursor block. `dinv` also covers the scan tip, as a fact of its
-  hash: every view that holds the tip agrees with the chain view of `dinv` up to the
-  cursor block, and holds nothing to fold between the cursor and the tip. T7 takes A2
+  reorgs to fewer blocks than the tip, at heights the ring does not hold, looks the same
+  as a node that lags, so its ticks return `Behind` until its head reaches the tip's
+  height (the cursor block's, with no tip). `dinv` also covers the scan tip, as a fact
+  of its hash: every view that holds the tip's head block agrees with the chain view of
+  `dinv` up to the cursor block, and holds nothing to fold from the cursor up to the
+  height the scan covered. That height is the head's, or lower when the walk stopped at
+  its cap of windows with nothing found. Such a tick returns `Progressed` with nothing
+  applied, and the fold claim above covers it as it does any `Progressed` tick. It also
+  leaves `is_caught_up` false (a test checks this; no proof does). T7 takes A2
   (iii) and (iv) only for the views of the tick itself, so a tick may answer from a
   view older than one an earlier tick read. The test
   `a_tick_on_an_older_view_folds_what_a_fold_from_scratch_of_it_does` runs such ticks
