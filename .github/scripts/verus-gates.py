@@ -3,14 +3,19 @@
 
 Usage: verus-gates.py <crate-dir>
        verus-gates.py --results <crate-dir> <verus-stdout>
+       verus-gates.py --no-cheating <crate-dir> <verus-stderr>
        verus-gates.py --update <crate-dir> [<verus-stdout>]
        verus-gates.py --features <crate-dir>
        verus-gates.py --self-test
 
-(a) No trusted construct outside src/verus/tcb.rs. `--no-cheating` cannot do
-    this: it also rejects the tcb.rs entries and `uninterp` spec fns, and it
-    ignores `#[verifier::external]`. Nothing that hides code from these
-    regexes either: `#[path]`, `include!`, `macro_rules!`, a build script, a
+(a) No trusted construct outside src/verus/tcb.rs. Two independent checks:
+    regexes over the sources, and `--no-cheating`, which reads the errors of
+    a Verus run with that flag. Verus names there every assume, admit,
+    external_body and assume_specification it compiled, whatever macro
+    built it; each must be in tcb.rs, an `uninterp` spec fn, or the wrapper
+    Verus makes for a fn with ghost args. The flag ignores
+    `#[verifier::external]`; `--results` catches that as a fn that no longer
+    verifies. Nothing that hides code from the regexes either: `#[path]`, `include!`, `macro_rules!`, a build script, a
     nightly feature not on FEATURES, or in in-scope code a macro, attribute
     or derive from a crate not on MACRO_CRATES (`paste` builds identifiers),
     a glob import from another crate, or a `use` or `extern crate` that binds
@@ -751,6 +756,30 @@ def results(crate: Path, stdout: str) -> list[str]:
     return errors
 
 
+def cheats(crate: Path, stderr: str) -> list[str]:
+    """Checks a `--no-cheating` Verus run. Verus names every trusted item it compiled there,
+    however a macro spelled it; each must be in tcb.rs, an `uninterp` spec fn, or the
+    external wrapper Verus makes for a fn with ghost (`with`) args."""
+    load(crate)
+    found = re.findall(r"^error: (.*not allowed with --no-cheating)\n\s*--> ([^\n]+?):(\d+):\d+$", stderr, re.M)
+    total = re.search(r"^error: could not compile `[^`]+` \(lib\) due to (\d+) previous errors?", stderr, re.M)
+    if not total:
+        return ["the --no-cheating run rejected nothing, so it never compiled tcb.rs (cached?)"]
+    errors = [] if int(total.group(1)) == len(found) else [f"{total.group(1)} errors, {len(found)} from --no-cheating"]
+    root = workspace(crate)[0]
+    for what, file, line in found:
+        rel = (root / file).resolve().relative_to(crate.resolve())
+        src, _, parsed = parse(crate / rel)
+        text = src.splitlines()[int(line) - 1]
+        allowed = rel == TCB or "external_body" in what and (
+            re.match(r"\s*(pub(\s*\([^)]*\))?\s+)?uninterp\s+spec\s+fn\b", text)
+            or any(n == int(line) and re.search(r"\bwith\b", spec) for _, n, _, _, spec in parsed["fns"])
+        )
+        if not allowed:
+            errors.append(f"{rel}:{line}: Verus says `{what}`")
+    return errors
+
+
 def update(crate: Path, stdout: str | None) -> None:
     toml, config = load(crate)
     dynamic = [line for line in read_manifest(crate) if not is_static(line)]
@@ -999,6 +1028,35 @@ mod tests { fn helper() {} }
             update(crate, report(2, 0, ["t::f", "t::g", "vstd::x"]))
             errors = results(crate, stdout)
             assert (not errors) == want_ok, f"self-test `{name}`: {errors}"
+    # Verus's own list of trusted items, from a --no-cheating run.
+    a_rs = (
+        "verus! {\npub uninterp spec fn u() -> int;\n}\n"
+        "#[cfg_attr(verus_keep_ghost, verus_spec(with Tracked(s): Tracked<&mut int>))]\nfn w() {}\nfn x() {}\n"
+    )
+
+    def nc(*errs: tuple[str, str, int]) -> str:
+        out = "".join(f"error: {w} not allowed with --no-cheating\n  --> {f}:{n}:1\n   |\n\n" for w, f, n in errs)
+        return out + f"error: could not compile `t` (lib) due to {len(errs)} previous errors\n"
+
+    eb, aa = "external_body/assume_specification", "assume/admit"
+    trusted = [(eb, "src/verus/tcb.rs", 1), (eb, "src/a.rs", 2), (eb, "src/a.rs", 5)]
+    nc_runs = {
+        "trusted_only": (nc(*trusted), True),
+        "assume": (nc(*trusted, (aa, "src/a.rs", 6)), False),
+        "external_body": (nc(*trusted, (eb, "src/a.rs", 6)), False),
+        "external_body_on_decl": (nc(*trusted, (eb, "src/a.rs", 1)), False),
+        "other_error": (nc(*trusted).replace("due to 3", "due to 4"), False),
+        "cached": ("", False),
+    }
+    for name, (stderr, want_ok) in nc_runs.items():
+        with tempfile.TemporaryDirectory() as tmp:
+            crate = Path(tmp)
+            (crate / "src/verus").mkdir(parents=True)
+            (crate / "src/verus/tcb.rs").write_text(tcb)
+            (crate / "src/a.rs").write_text(a_rs)
+            (crate / "Cargo.toml").write_text('[package]\nname = "t"\n')
+            errors = cheats(crate, stderr.replace("src/", f"{crate}/src/"))
+            assert (not errors) == want_ok, f"self-test `{name}`: {errors}"
     print("verus-gates self-test: ok")
 
 
@@ -1016,11 +1074,14 @@ def main() -> None:
         return
     if args[:1] == ["--results"] and len(args) == 3:
         errors = results(Path(args[1]), Path(args[2]).read_text())
+    elif args[:1] == ["--no-cheating"] and len(args) == 3:
+        errors = cheats(Path(args[1]), Path(args[2]).read_text())
     elif len(args) == 1 and not args[0].startswith("--"):
         errors = check(Path(args[0]))
     else:
         sys.exit(
             "usage: verus-gates.py <crate-dir> | --results <crate-dir> <verus-stdout>"
+            " | --no-cheating <crate-dir> <verus-stderr>"
             " | --update <crate-dir> [<verus-stdout>] | --features <crate-dir> | --self-test"
         )
     for error in errors:

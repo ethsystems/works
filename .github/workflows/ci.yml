@@ -151,6 +151,19 @@ jobs:
           # show 0 errors, and its verified count and verified fns must match
           # crates/chainfold/verus-manifest.txt exactly.
           python3 .github/scripts/verus-gates.py --results crates/chainfold "$RUNNER_TEMP/verus.out"
+      - name: Verify with --no-cheating
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Verus rejects each trusted item it compiles here, however a macro spelled it. The
+          # run fails by design; the gate checks that each rejected item is an allowed one.
+          # A changed flag does not trigger a new run, so clean first.
+          cargo clean -p chainfold
+          features=$(python3 .github/scripts/verus-gates.py --features crates/chainfold)
+          cargo verus verify -p chainfold --features "$features" --locked \
+            --check-toolchain --fwd-verus-args-to roots -- --no-cheating \
+            2> "$RUNNER_TEMP/no-cheating.err" || true
+          python3 .github/scripts/verus-gates.py --no-cheating crates/chainfold "$RUNNER_TEMP/no-cheating.err"
 
   gate:
     name: CI Gate
