@@ -484,15 +484,21 @@ where
         &mut self.engine
     }
 
-    /// Mutable access to the underlying event source.
+    /// Mutable access to the underlying event source. Clears the scan tip, so the next
+    /// poll reads again from the cursor block: a changed filter may match events at
+    /// heights the tip vouched held none.
     #[cfg_attr(verus_keep_ghost, verus_spec(
         ensures
             final(self).engine_view() == old(self).engine_view(),
             old(self).wf() ==> final(self).wf(),
             old(self).synced() ==> final(self).synced(),
             old(self).durable_ok() ==> final(self).durable_ok(),
+            final(self).unanchored(),
+            forall|log: Seq<(Position, F::Event)>, h: ChainView|
+                #[trigger] old(self).dinv(log, h) ==> final(self).dinv(log, h),
     ))]
     pub fn source_mut(&mut self) -> &mut S {
+        self.tip = None;
         &mut self.source
     }
 
@@ -4057,9 +4063,11 @@ mod tests {
 
     /// One tick, with the `Source` calls it made.
     fn counted_tick(driver: &mut Driver<RecordingFold, Counted>) -> (Tick, u32) {
-        let before = driver.source_mut().calls;
+        // The field, not `source_mut`: the chain moves under the driver, and `source_mut`
+        // clears the tip.
+        let before = driver.source.calls;
         let tick = driver.tick();
-        (tick, driver.source_mut().calls - before)
+        (tick, driver.source.calls - before)
     }
 
     #[test]
@@ -4070,10 +4078,10 @@ mod tests {
         // when polled with no new block, after one new empty block, and after one with
         // an event
         let unchanged = counted_tick(&mut driver);
-        driver.source_mut().inner.push_block(&[]);
+        driver.source.inner.push_block(&[]);
         let empty = counted_tick(&mut driver);
         let after_empty = counted_tick(&mut driver);
-        driver.source_mut().inner.push_block(&[7]);
+        driver.source.inner.push_block(&[7]);
         let event = counted_tick(&mut driver);
         // then an unchanged head costs one call, and one new block two
         assert_eq!(unchanged, (Tick::Idle, 1));
@@ -4088,14 +4096,14 @@ mod tests {
         // given a driver caught up on block 5 and then on ten empty blocks, two per window
         let mut driver = counted_driver(one_event_chain(5));
         run_to_idle(&mut driver);
-        driver.source_mut().inner.set_window(2);
+        driver.source.inner.set_window(2);
         for _ in 6..=15 {
-            driver.source_mut().inner.push_block(&[]);
+            driver.source.inner.push_block(&[]);
         }
         let catch_up = counted_tick(&mut driver);
         // when five more empty blocks arrive
         for _ in 16..=20 {
-            driver.source_mut().inner.push_block(&[]);
+            driver.source.inner.push_block(&[]);
         }
         let gap = counted_tick(&mut driver);
         // then the first walk reads from the cursor block, the head and a bracket around
@@ -4111,22 +4119,22 @@ mod tests {
         // given a driver caught up on block 5 and then on ten empty blocks, two per window
         let mut driver = counted_driver(one_event_chain(5));
         run_to_idle(&mut driver);
-        driver.source_mut().inner.set_window(2);
+        driver.source.inner.set_window(2);
         for _ in 6..=15 {
-            driver.source_mut().inner.push_block(&[]);
+            driver.source.inner.push_block(&[]);
         }
         run_to_idle(&mut driver);
         assert_eq!(counted_tick(&mut driver), (Tick::Idle, 1));
         // when blocks 8..=15 are replaced by a longer chain whose block 8 carries an event
         let mut blocks: Vec<&[u64]> = vec![&[80]];
         blocks.extend([&[][..]; 8]);
-        driver.source_mut().inner.reorg(8, &blocks);
+        driver.source.inner.reorg(8, &blocks);
         let outcome = driver.tick();
         run_to_idle(&mut driver);
         // then the tip no longer matches, the walk restarts at the cursor, and the event
         // folds
         assert!(matches!(outcome, Tick::Progressed(_)), "got {outcome:?}");
-        let chain = driver.source_mut().inner.clone();
+        let chain = driver.source.inner.clone();
         let folded = canonical_fold(chain);
         assert!(folded.contains(&(Position::new(8, 0), 80)));
         assert_eq!(driver.engine().fold().applied, folded);
@@ -4154,6 +4162,87 @@ mod tests {
         assert_eq!(restored, Some(Position::new(3, 0)));
         let chain = driver.source.clone();
         assert_eq!(driver.engine().fold().applied, canonical_fold(chain));
+    }
+
+    /// A chain whose filter is instance state: it answers only events of at least `min`.
+    #[derive(Clone)]
+    struct Filtered {
+        inner: ScriptedChain,
+        min: u64,
+    }
+
+    impl Source for Filtered {
+        type Event = u64;
+        type Error = PollFailure;
+
+        fn head(&mut self) -> Result<Head, PollFailure> {
+            self.inner.head()
+        }
+
+        fn header_at(&mut self, number: u64) -> Result<Option<BlockRef>, PollFailure> {
+            self.inner.header_at(number)
+        }
+
+        fn events_in(
+            &mut self,
+            from: u64,
+            to: u64,
+            out: &mut Vec<(BlockRef, u32, u64)>,
+        ) -> Result<(), PollFailure> {
+            self.inner.events_in(from, to, out)?;
+            out.retain(|entry| entry.2 >= self.min);
+            Ok(())
+        }
+
+        fn events_at(
+            &mut self,
+            block: &BlockRef,
+            out: &mut Vec<(BlockRef, u32, u64)>,
+        ) -> Result<(), PollFailure> {
+            self.inner.events_at(block, out)?;
+            out.retain(|entry| entry.2 >= self.min);
+            Ok(())
+        }
+
+        fn horizon(&self) -> ReplayHorizon {
+            self.inner.horizon()
+        }
+
+        fn window(&self) -> u64 {
+            self.inner.window()
+        }
+    }
+
+    #[test]
+    fn a_filter_widened_through_source_mut_folds_below_the_old_tip() {
+        // given a driver at the tip of four blocks whose filter drops the events of 2..=4
+        let mut chain = ScriptedChain::new(1);
+        for value in [10, 2, 3, 4] {
+            chain.push_block(&[value]);
+        }
+        let source = Filtered {
+            inner: chain,
+            min: 10,
+        };
+        let engine = engine_config(2);
+        let mut driver = Driver::new(
+            RecordingFold::default(),
+            source,
+            engine,
+            DriverConfig::from_block(1),
+        )
+        .unwrap();
+        run_to_idle(&mut driver);
+        assert_eq!(driver.status().cursor, Some(Position::new(1, 0)));
+        // when the filter is widened to every event
+        driver.source_mut().min = 0;
+        run_to_idle(&mut driver);
+        // then the events above the cursor, up to the old tip, fold
+        let expected: Vec<(Position, u64)> = (1..=4u64)
+            .zip([10, 2, 3, 4])
+            .map(|(block, value)| (Position::new(block, 0), value))
+            .collect();
+        assert_eq!(driver.engine().fold().applied, expected);
     }
 
     #[test]

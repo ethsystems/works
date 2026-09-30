@@ -492,7 +492,7 @@ spec 989f3fb62e8b src/driver.rs::Driver::build
 spec c44c7fd42ea7 src/driver.rs::Driver::around
 spec d031062247f1 src/driver.rs::Driver::engine
 spec 48378bad1f06 src/driver.rs::Driver::engine_mut
-spec 64c9147026d6 src/driver.rs::Driver::source_mut
+spec 6c7514319c8b src/driver.rs::Driver::source_mut
 spec c78b46f949be src/driver.rs::Driver::auto_checkpoint
 spec 27737d649a25 src/driver.rs::Driver::run_checkpoint
 spec 8527b0f10708 src/driver.rs::Driver::offer_snapshot
