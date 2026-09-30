@@ -114,7 +114,11 @@ pub trait Source {
     /// block is left out and none is added. Any order. A hash the source does not know, or
     /// whose block it has not executed, gives `Err`. A JSON-RPC source reads it with
     /// `eth_getLogs` by `blockHash`, never by number: a by-number read can answer another
-    /// block at that height, or nothing from a node that lags.
+    /// block at that height, or nothing from a node that lags. Build each entry's
+    /// `BlockRef` from the log's own `blockHash` and `blockNumber`, never by copying
+    /// `block`: the driver drops an answer with an entry from another block, which catches a
+    /// node that answers the canonical block's logs for a hash off its chain, and a copied
+    /// `block` hides it.
     ///
     /// A source that holds the header for this hash, such as the one `head` just read, may
     /// answer from its `logsBloom` instead: `Ok` with nothing appended when the bloom rules

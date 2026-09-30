@@ -177,7 +177,10 @@ whether it does. Two answers matter most:
   there.
 - `events_at` reads `eth_getLogs` by `blockHash` and errs on a hash the node does not know
   or has not executed. An empty answer for such a hash is folded as a block with no
-  events (A2 ii).
+  events (A2 ii). Build each entry's `BlockRef` from the log's own `blockHash` and
+  `blockNumber`, never by copying the block the call asked for. The driver drops an
+  answer with an entry from another block, which catches a node that answers the
+  canonical block's logs for a hash off its chain; a copied ref hides it.
 
 `events_at` can often skip the request. The header that `head` reads carries `logsBloom`.
 A source that keeps it with the hash may answer `events_at` for that hash with `Ok` and
@@ -209,17 +212,20 @@ and from one provider, measured:
 | Besu | errs; first version not known | errs | not known |
 | dRPC (`eth.drpc.org`, measured) | a range above its head answered the head block's logs | errs on an unknown hash | none (a provider) |
 
-Behind a load balancer, the backends also lag each other. Any one of these keeps a
-lagging backend from skipping events:
+Behind a load balancer, or a proxy that splits one range across upstreams, the backends
+lag each other, and a lagging one can still be on a fork the others left. Such a pool
+breaks A2 (iii) even when every backend is at or above its first good version: a range
+or a `header_at` that reaches a backend on a stale fork answers from that fork, and its
+events stay folded. The pool needs one of these:
 
-- a confirmation depth: `head` answers the block N below the node's latest, or the `safe`
-  tag, and the source serves nothing above it. A range then never passes the head of a
-  backend that lags by less than N blocks. It costs N blocks of latency (`safe` is about
-  one epoch), and `safe` adds a trust in the tag. `safe` can also step back between
-  backends; such a poll returns `Behind` and costs one call.
 - one pinned node: a node you run, or a sticky session.
-- a minimum client version: every backend at or above its first good version above. No
-  geth version fixes its by-hash answer, so a geth pool also needs one of the other two.
+- a confirmation depth deeper than any lag between the backends, where a backend on a
+  stale fork lags down to the last block it shares with the newest head: `head` answers
+  the block N below the latest, or the `safe` tag, and the source serves nothing above
+  it. It costs N blocks of latency (`safe` is the justified checkpoint, one epoch or more
+  back), and `safe` adds a trust in the tag. `safe` can also step back between backends;
+  a poll whose head steps below the tip or the cursor block, and agrees with the ring,
+  returns `Behind` and costs one call.
 
 `window()` is the span of one `events_in` call, 500 blocks by default. A window over the
 provider's cap errs, and so does every walk that needs a full one. Set it per provider:
@@ -419,18 +425,18 @@ trusted items are in `src/verus/tcb.rs`.
   logs of a view that confirmed the probed ring entry, when that view holds every height
   from `start_block` to that entry. After `Behind`, the engine and the tip are
   unchanged: the head was below the tip or the cursor block, and no hash the ring holds
-  at its height or its parent's contradicts it. That tick makes one call. A chain that
-  reorgs to fewer blocks than the tip, at heights the ring does not hold, looks the same
-  as a node that lags, so its ticks return `Behind` until its head reaches the tip's
-  height (the cursor block's, with no tip). `dinv` also covers the scan tip, as a fact
-  of its hash: every view that holds the tip's head block agrees with the chain view of
-  `dinv` up to the cursor block, and holds nothing to fold from the cursor up to the
-  height the scan covered. That height is the head's, or lower when the walk stopped at
-  its cap of windows with nothing found. Such a tick returns `Progressed` with nothing
-  applied, and the fold claim above covers it as it does any `Progressed` tick. It also
-  leaves `is_caught_up` false (a test checks this; no proof does). T7 takes A2
-  (iii) and (iv) only for the views of the tick itself, so a tick may answer from a
-  view older than one an earlier tick read. The test
+  at its height or its parent's contradicts it. That tick makes one call (a test checks
+  this; no proof does). A chain that reorgs to fewer blocks than the tip, at heights the
+  ring does not hold, looks the same as a node that lags, so its ticks return `Behind`
+  until its head reaches the tip's height (the cursor block's, with no tip). `dinv` also
+  covers the scan tip, as a fact of its hash: every view that holds the tip's head block
+  agrees with the chain view of `dinv` up to the cursor block, and holds nothing to fold
+  from the cursor up to the height the scan covered. That height is the head's, or lower
+  when the walk stopped at its cap of windows with nothing found. Such a tick returns
+  `Progressed` with nothing applied, and the fold claim above covers it as it does any
+  `Progressed` tick. It also leaves `is_caught_up` false (a test checks this; no proof
+  does). T7 takes A2 (iii) and (iv) only for the views of the tick itself, so a tick may
+  answer from a view older than one an earlier tick read. The test
   `a_tick_on_an_older_view_folds_what_a_fold_from_scratch_of_it_does` runs such ticks
   and checks each fold against a fold from scratch of the view that the tick read.
 
@@ -470,12 +476,16 @@ exceptions are the fns listed as out of scope in `Cargo.toml`.
   `head` call read: a view of the tick between two views that hold such a block holds it. The
   scan tip needs no such assumption across ticks, because A1 makes it a fact of the tip's
   hash, true in every view that holds the tip. The block on top of the tip is read by
-  its hash, so a load-balanced node without it errs and the tip stays below it. Only a
-  range read on a backend that clamps it can still break (iii): behind a load balancer
-  whose nodes lag each other, a node that answers `events_in` past its own head with
+  its hash, so a load-balanced node without it errs and the tip stays below it. A range
+  read or a `header_at` is by number, so a pool whose nodes lag each other can break
+  (iii) on every backend version. A node that answers `events_in` past its own head with
   nothing answers the newest blocks with nothing, the tip moves past them, and their
-  events are skipped. Point such a source at one node, at nodes that never answer below
-  a head another has reported, or at nodes that err on a range past their own head.
+  events are skipped. A node that errs there but lags on a stale fork answers a range
+  from that fork, and a later `header_at` from it vouches for that fork's block at the
+  cursor, so its events stay folded. An unpinned pool (a load balancer, or a proxy that
+  splits one range across upstreams) needs one pinned node, a sticky session, or a
+  confirmation depth deeper than any lag between its nodes, where a node on a stale fork
+  lags down to the last block it shares with the newest head.
   (iv) Each view holds every height from `start_block` up to each height it holds.
 - **A2′, one bisection view.** All probes of one bisection see one view. Only the
   optimality of `canonical_prefix` needs it. Optimality also takes `down_closed(V)` as a hypothesis: `V`
@@ -489,7 +499,7 @@ exceptions are the fns listed as out of scope in `Cargo.toml`.
 - **A4, sink honesty.** `SnapshotSink::durable_cursor` is `None` or a point offered
   since the last `reset` (`sink_offered`). The sink given to a driver has offered
   nothing past the engine's cursor and its live slots. The shipped sinks trusted for
-  this are `NoSink` (tcb item 12) and `storage::Flusher`. The flusher's watermark
+  this are `NoSink` (tcb item 10) and `storage::Flusher`. The flusher's watermark
   changes behind `&self`, from its fsync thread, but only onto a point that `offer`
   queued since the last `reset`. Its `submit` is private, so no other caller can queue
   a point, even through `Driver::sink`.

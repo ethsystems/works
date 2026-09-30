@@ -1433,7 +1433,8 @@ where
 
     /// `scan` with the head one block on top of the tip: reads the head block by its hash,
     /// and takes it only when every entry carries that hash. `Ok(false)` when some entry
-    /// does not; the batch is then empty.
+    /// does not; the batch is then empty. The check catches a source that breaks A2 (ii) by
+    /// answering another block's logs; T7 does not rest on it.
     #[cfg_attr(verus_keep_ghost, verus_spec(r =>
         requires
             old(self).wf(),
