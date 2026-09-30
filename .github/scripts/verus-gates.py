@@ -9,39 +9,39 @@ Usage: verus-gates.py <crate-dir>
        verus-gates.py --self-test
 
 (a) No trusted construct outside src/verus/tcb.rs. Two independent checks:
-    regexes over the sources, and `--no-cheating`, which reads the errors of
-    a Verus run with that flag. Verus names there every assume, admit,
-    external_body and assume_specification it compiled, whatever macro
-    built it; each must be in tcb.rs, an `uninterp` spec fn, or the wrapper
-    Verus makes for a fn with ghost args. The flag ignores
-    `#[verifier::external]`; `--results` catches that as a fn that no longer
-    verifies. Nothing that hides code from the regexes either: `#[path]`, `include!`, `macro_rules!`, a build script, a
-    nightly feature not on FEATURES, or in in-scope code a macro, attribute
-    or derive from a crate not on MACRO_CRATES (`paste` builds identifiers),
-    a glob import from another crate, or a `use` or `extern crate` that binds
-    a trusted macro or crate name to something else.
+    regexes over the sources, and `--no-cheating`, which reads the errors of a
+    Verus run with that flag. Verus names there every assume, admit,
+    external_body and assume_specification it compiled, whatever macro built
+    it; each must be in tcb.rs, an `uninterp` spec fn, or the wrapper Verus
+    makes for a fn with ghost args. The flag ignores `#[verifier::external]`;
+    `--results` catches that as a fn that no longer verifies. Nothing that
+    hides code from the regexes either: `#[path]`, `include!`, `macro_rules!`,
+    a build script, a nightly feature not on FEATURES, or in in-scope code a
+    macro, attribute or derive from a crate not on MACRO_CRATES (`paste`
+    builds identifiers), a glob import from another crate, or a `use` or
+    `extern crate` that binds a trusted macro or crate name to something else.
 (b) Every `src/**/*.rs` is in scope, out of scope, or tcb.rs. Every fn in an
     in-scope file carries a verifying attribute, or sits in an impl/trait
     marked `verus_verify`, or is listed as out of scope. Attribute mode
-    silently treats an unannotated fn as external (unverified). Attributes
-    are read the way rustc applies them in the Verus run (VERUS_CFG, derived
-    from [features] and the config's `features`), so
-    a fn that cfg drops from the Verus build, or that has a second body for
-    another cfg, counts as unverified. Specs do not cover bodies, so in a body
+    silently treats an unannotated fn as external (unverified). Attributes are
+    read the way rustc applies them in the Verus run (VERUS_CFG, derived from
+    [features] and the config's `features`), so a fn that cfg drops from the
+    Verus build, or that has a second body for another cfg, counts as
+    unverified. Specs do not cover bodies, so in a body
     `cfg(verus_keep_ghost)` may gate only `proof!`, `proof_decl!` or
     `proof_with!`, `cfg_attr(verus_keep_ghost, ..)` may only add a Verus
     annotation, and no other cfg, no `cfg!` and no cfg in a `verus!` block is
-    allowed. An out-of-scope file uses no Verus at
-    all. Every trait an in-scope file declares is on `trusted-traits`, since
-    its spec is assumed for every unverified impl.
+    allowed. An out-of-scope file uses no Verus at all. Every trait an
+    in-scope file declares is on `trusted-traits`, since its spec is assumed
+    for every unverified impl.
 (c) The crate's `verus-manifest.txt` matches the sources: the tcb.rs items,
     every entry of every dependency table (target, build and dev ones too)
     with its requirement and features, the version and checksum Cargo.lock
     gives each trusted crate, and a hash of every spec (each `verus_spec`, the
-    signature and contract of each fn in a `verus!` block, each spec fn
-    body), and the gate config: every [features] entry, the Verus run's cfgs,
-    the scope lists and trusted-traits. `--results` checks a Verus run against the same file: the
-    verified count and the exact set of fns Verus verified.
+    signature and contract of each fn in a `verus!` block, each spec fn body),
+    and the gate config: every [features] entry, the Verus run's cfgs, the
+    scope lists and trusted-traits. `--results` checks a Verus run against the
+    same file: the verified count and the exact set of fns Verus verified.
 
 Config lives in the crate's Cargo.toml:
 
@@ -540,7 +540,8 @@ def resolved_lines(crate: Path, config: dict) -> list[str]:
         if p["name"] in trusted
     ]
     found = {line.split(" ")[-1].split("@")[0] for line in lines}
-    return sorted(lines, key=lambda line: line.split(" ")[-1]) + [f"resolved missing {name}" for name in sorted(set(trusted) - found)]
+    missing = [f"resolved missing {name}" for name in sorted(set(trusted) - found)]
+    return sorted(lines, key=lambda line: line.split(" ")[-1]) + missing
 
 
 def static_manifest(crate: Path, config: dict, toml: dict) -> list[str]:
@@ -555,10 +556,12 @@ def static_manifest(crate: Path, config: dict, toml: dict) -> list[str]:
         pairs.append(("(outside-verus!)", "".join(rest)))
         lines += [f"tcb {digest(t)} {k}" for k, t in unique(pairs)]
     lines += dep_lines(crate, toml) + resolved_lines(crate, config)
-    lines += [f"feature {re.sub(r'\s+', '', json.dumps(v))} {k}" for k, v in sorted(toml.get("features", {}).items())]
+    features = sorted(toml.get("features", {}).items())
+    lines += [f"feature {json.dumps(v, separators=(',', ':'))} {k}" for k, v in features]
     lines += [f"cfg {c}" for c in sorted(VERUS_CFG)]
     lines += [f"scope in {rel}" for rel in sorted(config.get("in-scope", []))]
-    lines += [f"scope out {key}" for key in sorted({**config.get("out-of-scope-files", {}), **config.get("out-of-scope", {})})]
+    out = {**config.get("out-of-scope-files", {}), **config.get("out-of-scope", {})}
+    lines += [f"scope out {key}" for key in sorted(out)]
     lines += [f"trusted-trait {name}" for name in sorted(config.get("trusted-traits", []))]
     for rel in sorted(config.get("in-scope", [])):
         if not (crate / rel).is_file():
@@ -632,7 +635,7 @@ def check(crate: Path) -> list[str]:
         # A name MACROS or MACRO_CRATES trusts, bound to another crate's item.
         for m in re.finditer(r"\bextern\s+crate\s+(\w+)(\s+as\b)?", src):
             if m.group(2) or m.group(1) not in ("std", "core", "alloc"):
-                errors.append(f"{rel}:{line_of(src, m.start())}: `{norm(m.group(0))}` can rename a crate to a macro crate")
+                errors.append(f"{rel}:{line_of(src, m.start())}: `{norm(m.group(0))}` can rename a crate")
         for text, line, _ in items(src, strip(path.read_text(), strings=False))["uses"]:
             for full, name in use_names(text):
                 std = full.split("::")[0] in ("std", "core", "alloc", "vstd")
@@ -815,6 +818,7 @@ mod tests { fn helper() {} }
 """
     tcb = "verus! { pub assume_specification[ f ]() -> u8; }\n"
     spec = "#[cfg_attr(verus_keep_ghost, verus_spec(ensures true))]"
+    fw = spec + "\nfn w(a: u8) -> u8 {\n"
     # name: (appended to src/a.rs, out-of-scope entries, extra files, passes)
     cases = {
         "clean": ("", "", {}, True),
@@ -871,20 +875,20 @@ mod tests { fn helper() {} }
         "use_swap": ("#[cfg(not(verus_keep_ghost))]\nuse crate::o::w;", "", {}, False),
         "use_link_ok": ('#[cfg(feature = "std")]\nuse crc as _;', "", {}, True),
         # A statement or expression cfg ships a body Verus never checked.
-        "body_cfg": (spec + '\nfn w(a: u8) -> u8 {\n#[cfg(feature = "std")]\nif a == 0 { return 1; }\na }', "", {}, False),
-        "body_cfg_block": (spec + '\nfn w(a: u8) -> u8 {\n#[cfg(feature = "std")]\n{ return 1; }\na }', "", {}, False),
-        "body_cfg_let": (spec + "\nfn w(a: u8) -> u8 {\n#[cfg(not(verus_keep_ghost))]\nlet a = 0;\na }", "", {}, False),
-        "body_cfg_ghost_let": (spec + "\nfn w(a: u8) -> u8 {\n#[cfg(verus_keep_ghost)]\nlet a = 0;\na }", "", {}, False),
+        "body_cfg": (fw + '#[cfg(feature = "std")]\nif a == 0 { return 1; }\na }', "", {}, False),
+        "body_cfg_block": (fw + '#[cfg(feature = "std")]\n{ return 1; }\na }', "", {}, False),
+        "body_cfg_let": (fw + "#[cfg(not(verus_keep_ghost))]\nlet a = 0;\na }", "", {}, False),
+        "body_cfg_ghost_let": (fw + "#[cfg(verus_keep_ghost)]\nlet a = 0;\na }", "", {}, False),
         "body_cfg_expr": (spec + '\nfn w(a: u8) -> u8 { let b = #[cfg(feature = "std")] 0; a }', "", {}, False),
         "body_cfg_tail": (spec + '\nfn w(a: u8) -> u8 { #[cfg(feature = "std")] a }', "", {}, False),
-        "body_cfg_attr": (spec + '\nfn w(a: u8) -> u8 {\n#[cfg_attr(verus_keep_ghost, cfg(any()))]\nlet a = 0;\na }', "", {}, False),
-        "body_cfg_attr_std": (spec + '\nfn w(a: u8) -> u8 {\n#[cfg_attr(feature = "std", allow(unused))]\nlet a = 0;\na }', "", {}, False),
+        "body_cfg_attr": (fw + '#[cfg_attr(verus_keep_ghost, cfg(any()))]\nlet a = 0;\na }', "", {}, False),
+        "body_cfg_attr_std": (fw + '#[cfg_attr(feature = "std", allow(unused))]\nlet a = 0;\na }', "", {}, False),
         "body_cfg_macro": (spec + '\nfn w(a: u8) -> u8 { if cfg!(feature = "std") { return 0; } a }', "", {}, False),
         "verus_cfg": ('verus! { fn w(a: u8) -> u8 {\n#[cfg(feature = "std")]\nlet a = 0;\na } }', "", {}, False),
         # Macros from a dependency can build any token, `assume` included.
         "macro_dep": (spec + "\nfn w() { paste::paste! { [<ass ume>](false); } }", "", {}, False),
         "macro_dep_bare": ("use paste::paste;\n" + spec + "\nfn w() { paste! { [<ass ume>](false); } }", "", {}, False),
-        "macro_renamed": ("use paste::paste as vec;\n" + spec + "\nfn w() { vec! { [<ass ume>](false); } }", "", {}, False),
+        "macro_renamed": ("use paste::paste as vec;\n" + spec + "\nfn w() { vec! { [<ass ume>](0); } }", "", {}, False),
         "macro_crate_renamed": ("use paste as vstd;\n" + spec + "\nfn w() { vstd::paste! { } }", "", {}, False),
         "macro_extern_crate": ("extern crate paste as vstd;", "", {}, False),
         "macro_glob": ("use paste::*;", "", {}, False),
@@ -900,7 +904,7 @@ mod tests { fn helper() {} }
             True,
         ),
         "body_ghost_ok": (
-            spec + "\nfn w(a: u8) -> u8 {\n#[cfg(verus_keep_ghost)]\nproof! { assert(true); }\n"
+            fw + "#[cfg(verus_keep_ghost)]\nproof! { assert(true); }\n"
             "#[cfg(verus_keep_ghost)]\nproof_decl! { let ghost g = 0int; }\n"
             "#[cfg(verus_keep_ghost)]\nproof_with! {Tracked(&mut g)}\nlet b = h(a);\n"
             "#[cfg_attr(verus_keep_ghost, verus_spec(invariant true))]\nwhile false {}\na }",
@@ -937,14 +941,16 @@ mod tests { fn helper() {} }
         ),
         {"features": ["b"]},
     )
-    assert cfg == VERUS_CFG | {f'feature="{f}"' for f in ("default", "a", "b", "c", "y")}, f"self-test `verus_cfg`: {cfg}"
+    want = VERUS_CFG | {f'feature="{f}"' for f in ("default", "a", "b", "c", "y")}
+    assert cfg == want, f"self-test `verus_cfg`: {cfg}"
 
     # The manifest pins the tcb.rs items, the specs, every dependency table and the gate config.
     toml = '[package]\nname = "t"\n[package.metadata.verus-gates]\nin-scope = ["src/a.rs"]\ntrusted-traits = ["T"]\n'
     toml += 'trusted-crates = ["crc"]\nfeatures = ["verus"]\n'
     toml += '[features]\nverus = []\nstd = []\n'
     toml += '[dependencies]\ncrc = { version = "3.4", default-features = false }\nwincode = { workspace = true }\n'
-    root = '[workspace]\nmembers = ["c"]\n[workspace.dependencies]\nwincode = { version = "0.6", features = ["alloc"] }\n'
+    root = '[workspace]\nmembers = ["c"]\n'
+    root += '[workspace.dependencies]\nwincode = { version = "0.6", features = ["alloc"] }\n'
     lock = 'version = 4\n[[package]]\nname = "crc"\nversion = "3.4.0"\nchecksum = "5eb8"\n'
     pinned = {
         "tcb_added_item": ("src/verus/tcb.rs", tcb + "verus! { pub proof fn z() ensures false { assume(false); } }\n"),
