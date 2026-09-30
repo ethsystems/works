@@ -483,17 +483,31 @@ lagging node at the cursor block resyncs from the start block.
 
 `.github/scripts/verus-gates.py` fails when a trusted construct appears outside
 `tcb.rs`, or a construct that hides code from its checks: `#[path]`, `include!`,
-`macro_rules!`, a build script, or a nightly feature that is not on its list. `Cargo.toml`
+`macro_rules!`, a build script, a nightly feature that is not on its list, or, in
+in-scope code, a macro, attribute or derive from a crate that is not on its list (for
+example `paste`, which builds identifiers). `Cargo.toml`
 lists every file in `src/` as in scope or out of scope, and an out-of-scope file has no
 Verus annotations. In an in-scope file, the script fails on a fn that has no verifying
 attribute and is not on the out-of-scope list. It also fails on a fn that a `cfg`
 removes from the Verus build, for example a second body under `cfg(not(verus_keep_ghost))`
-or `cfg(feature = "std")`. It reads attributes as rustc applies them with the CI features.
+or `cfg(feature = "std")`. In a fn body, a `cfg` may gate only `proof!`, `proof_decl!` or
+`proof_with!`, and `cfg!` is rejected, so every build runs the body that Verus checked.
+It reads attributes as rustc applies them in the Verus run, with the cfgs it derives
+from `[features]` and the `features` list in `Cargo.toml`.
 Every trait that an in-scope file declares must be on `trusted-traits`, because Verus
 assumes its spec for each impl that it does not check.
 
-`verus-manifest.txt` records what the proofs cover. It has a hash of each tcb item, the
-dependency list, and a hash of each spec: each `verus_spec`, the contract of each fn in a
+A second Verus run with `--no-cheating` is an independent check. Verus rejects each
+assume, admit, `external_body` and `assume_specification` that it compiles, whatever
+macro spelled it, and gives its location. The script requires each one to be in
+`tcb.rs`, an `uninterp` spec fn, or the wrapper that Verus makes for a fn with ghost
+arguments.
+
+`verus-manifest.txt` records what the proofs cover. It has a hash of each tcb item; each
+entry of each dependency table, with its version requirement and features; the version
+and checksum that `Cargo.lock` gives each crate on `trusted-crates` (the codec, CRC and
+Verus crates); the gate config (the scope lists, `trusted-traits`, each `[features]`
+entry and the cfgs of the Verus run); and a hash of each spec: each `verus_spec`, the contract of each fn in a
 `verus!` block, and the body of each spec fn. It also has the verified count and the name
 of each fn that Verus verified. The script compares the hashes with the sources. The CI
 job compares the Verus report with the count and the names. Thus a weaker spec, a new
@@ -545,10 +559,17 @@ x86 Linux:
 python3 .github/scripts/verus-gates.py --self-test
 python3 .github/scripts/verus-gates.py crates/chainfold
 RUSTUP_TOOLCHAIN=<toolchain> cargo clean -p chainfold
-RUSTUP_TOOLCHAIN=<toolchain> cargo verus verify -p chainfold --features verus,wincode \
+features=$(python3 .github/scripts/verus-gates.py --features crates/chainfold)
+RUSTUP_TOOLCHAIN=<toolchain> cargo verus verify -p chainfold --features "$features" --locked \
     --check-toolchain --fwd-verus-args-to roots -- --output-json --time-expanded > verus.out
 python3 .github/scripts/verus-gates.py --results crates/chainfold verus.out
+RUSTUP_TOOLCHAIN=<toolchain> cargo clean -p chainfold
+RUSTUP_TOOLCHAIN=<toolchain> cargo verus verify -p chainfold --features "$features" --locked \
+    --check-toolchain --fwd-verus-args-to roots -- --no-cheating 2> no-cheating.err
+python3 .github/scripts/verus-gates.py --no-cheating crates/chainfold no-cheating.err
 ```
+
+The `--no-cheating` run fails by design: its errors are the list the last step checks.
 
 Clean before each run. A cached run prints no report and verifies nothing.
 There is no prebuilt Verus for aarch64 Linux. Build it from source there (Verus
