@@ -2026,7 +2026,14 @@ where
     #[cfg_attr(verus_keep_ghost, verus_spec(r =>
         ensures
             r.cursor == self.engine_view().cursor,
+            r.last_verified == self.engine_view().last_verified,
+            r.engine == self.engine_view().status,
+            r.caught_up == self.caught_up_view(),
+            r.skips == self.engine_view().skips,
+            !self.synced() ==> r.durable_cursor is None,
             self.durable_ok() ==> opt_le(r.durable_cursor, r.cursor),
+            r.durability_lost == self.durability_lost_view(),
+            r.generation == self.generation_view(),
     ))]
     pub fn status(&self) -> DriverStatus {
         DriverStatus {
@@ -5539,6 +5546,21 @@ impl<F: Fold, S: Source<Event = F::Event>, K: SnapshotSink<F>> Driver<F, S, K> {
     /// No scan anchor: the next poll reads from the cursor block.
     pub closed spec fn unanchored(&self) -> bool {
         self.tip is None
+    }
+
+    /// True once the most recent poll returned no new blocks.
+    pub closed spec fn caught_up_view(&self) -> bool {
+        self.caught_up
+    }
+
+    /// True once the sink refused an offer.
+    pub closed spec fn durability_lost_view(&self) -> bool {
+        self.durability_lost
+    }
+
+    /// Ticks so far, wrapping.
+    pub closed spec fn generation_view(&self) -> u64 {
+        self.generation
     }
 
     /// Ghost invariant over log `log` and chain view `h` (`dinv`), with the scan tip

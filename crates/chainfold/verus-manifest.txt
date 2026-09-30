@@ -514,7 +514,7 @@ spec 5f76f3af0677 src/driver.rs::Driver::walk
 spec fe304b98d969 src/driver.rs::Driver::recover_via_bisection
 spec c863359fe242 src/driver.rs::Driver::tick
 spec f4cdf96e984a src/driver.rs::Driver::checkpoint
-spec c32330a2b384 src/driver.rs::Driver::status
+spec 420d850dd60c src/driver.rs::Driver::status
 spec 9c80f78786c8 src/driver.rs::all_in
 spec 88f30a0d6a49 src/driver.rs::walk_calls
 spec 4f9ec250540c src/driver.rs::take_floor
@@ -579,6 +579,9 @@ spec fe83048f5e5d src/driver.rs::Driver::source_infallible
 spec f405ac92a1f1 src/driver.rs::Driver::batch_view
 spec 41e94f949a52 src/driver.rs::Driver::tip_view
 spec e9b6f0337788 src/driver.rs::Driver::unanchored
+spec 3144e8fb0bf1 src/driver.rs::Driver::caught_up_view
+spec c96f5c04f1f2 src/driver.rs::Driver::durability_lost_view
+spec 0e8947bfc6ea src/driver.rs::Driver::generation_view
 spec a666f8ca53c2 src/driver.rs::Driver::dinv
 spec eb44b97cc947 src/driver.rs::tick_inv
 spec d082c7cfe79b src/driver.rs::t7_tick
