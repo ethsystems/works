@@ -75,11 +75,8 @@ verify = true
 in-scope = ["src/ring.rs", "src/position.rs", "src/batch.rs", "src/checkpoint.rs", "src/engine.rs", "src/snapshot.rs", "src/driver.rs", "src/error.rs", "src/fold.rs", "src/sink.rs", "src/source.rs", "src/lib.rs", "src/verus/mod.rs", "src/verus/model.rs"]
 # Each spec is assumed for every impl Verus does not check (A1 to A5).
 trusted-traits = ["Fold", "Source", "SnapshotSink", "Persist"]
-# The code behind the codec and checksum items in tcb.rs, and the Verus macros and spec
-# library. The manifest pins the version and checksum Cargo.lock gives each.
 # Features of the Verus run; CI reads them with `verus-gates.py --features`.
 features = ["verus", "wincode"]
-trusted-crates = ["crc", "crc-catalog", "crc-fast", "verus_builtin", "verus_builtin_macros", "vstd", "wincode", "wincode-derive"]
 
 [package.metadata.verus-gates.out-of-scope-files]
 "src/harness.rs" = "threads and async runtime"

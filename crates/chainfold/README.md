@@ -503,11 +503,10 @@ macro spelled it, and gives its location. The script requires each one to be in
 `tcb.rs`, an `uninterp` spec fn, or the wrapper that Verus makes for a fn with ghost
 arguments.
 
-`verus-manifest.txt` records what the proofs cover. It has a hash of each tcb item; each
-entry of each dependency table, with its version requirement and features; the version
-and checksum that `Cargo.lock` gives each crate on `trusted-crates` (the codec, CRC and
-Verus crates); the gate config (the scope lists, `trusted-traits`, each `[features]`
-entry and the cfgs of the Verus run); and a hash of each spec: each `verus_spec`, the contract of each fn in a
+`verus-manifest.txt` records what the proofs cover. It has a hash of each tcb item; the
+name of each entry of each dependency table (target, build and dev ones too); the gate
+config (the scope lists, `trusted-traits`, each `[features]` entry and the cfgs of the
+Verus run); and a hash of each spec: each `verus_spec`, the contract of each fn in a
 `verus!` block, and the body of each spec fn. It also has the verified count and the name
 of each fn that Verus verified. The script compares the hashes with the sources. The CI
 job compares the Verus report with the count and the names. Thus a weaker spec, a new
@@ -560,11 +559,11 @@ python3 .github/scripts/verus-gates.py --self-test
 python3 .github/scripts/verus-gates.py crates/chainfold
 RUSTUP_TOOLCHAIN=<toolchain> cargo clean -p chainfold
 features=$(python3 .github/scripts/verus-gates.py --features crates/chainfold)
-RUSTUP_TOOLCHAIN=<toolchain> cargo verus verify -p chainfold --features "$features" --locked \
+RUSTUP_TOOLCHAIN=<toolchain> cargo verus verify -p chainfold --features "$features" \
     --check-toolchain --fwd-verus-args-to roots -- --output-json --time-expanded > verus.out
 python3 .github/scripts/verus-gates.py --results crates/chainfold verus.out
 RUSTUP_TOOLCHAIN=<toolchain> cargo clean -p chainfold
-RUSTUP_TOOLCHAIN=<toolchain> cargo verus verify -p chainfold --features "$features" --locked \
+RUSTUP_TOOLCHAIN=<toolchain> cargo verus verify -p chainfold --features "$features" \
     --check-toolchain --fwd-verus-args-to roots -- --no-cheating 2> no-cheating.err
 python3 .github/scripts/verus-gates.py --no-cheating crates/chainfold no-cheating.err
 ```

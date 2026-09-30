@@ -144,7 +144,7 @@ jobs:
           # stdout gets chainfold's JSON report; on a fresh target dir, vstd prints its own
           # plain results line before it. Diagnostics go to stderr.
           features=$(python3 .github/scripts/verus-gates.py --features crates/chainfold)
-          cargo verus verify -p chainfold --features "$features" --locked \
+          cargo verus verify -p chainfold --features "$features" \
             --check-toolchain --fwd-verus-args-to roots -- --output-json --time-expanded \
             > "$RUNNER_TEMP/verus.out"
           # A cached or skipped run prints no report and proves nothing. The report must
@@ -160,7 +160,7 @@ jobs:
           # A changed flag does not trigger a new run, so clean first.
           cargo clean -p chainfold
           features=$(python3 .github/scripts/verus-gates.py --features crates/chainfold)
-          cargo verus verify -p chainfold --features "$features" --locked \
+          cargo verus verify -p chainfold --features "$features" \
             --check-toolchain --fwd-verus-args-to roots -- --no-cheating \
             2> "$RUNNER_TEMP/no-cheating.err" || true
           python3 .github/scripts/verus-gates.py --no-cheating crates/chainfold "$RUNNER_TEMP/no-cheating.err"

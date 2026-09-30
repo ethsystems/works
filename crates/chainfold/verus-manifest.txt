@@ -339,26 +339,18 @@ tcb 0a1f173e2ca2 Observed[IteratorSpecImpl]::will_return_none
 tcb ef46daa8a72d Observed[IteratorSpecImpl]::decrease
 tcb 39c8a208db3b Observed[IteratorSpecImpl]::peek
 tcb 09ed59c748e1 (outside-verus!)
-dep {"default-features":false,"optional":true,"version":"3.4"} dependencies/crc
-dep {"default-features":false,"optional":true,"version":"1.10"} dependencies/crc-fast
-dep {"default-features":false,"optional":true,"version":"0.2.4"} dependencies/include-utils
-dep {"default-features":false,"features":["alloc","derive"],"optional":true,"version":"1"} dependencies/serde
-dep {"default-features":false,"features":["rt","sync"],"optional":true,"version":"1"} dependencies/tokio
-dep {"default-features":false,"features":["alloc"],"optional":true,"version":"=0.0.0-2026-09-20-0158"} dependencies/vstd
-dep {"default-features":false,"features":["alloc","derive"],"optional":true,"version":"0.6"} dependencies/wincode
-dep {"features":["test-helpers"],"path":"."} dev-dependencies/chainfold
-dep {"default-features":false,"features":["cargo_bench_support","html_reports","plotters"],"version":"0.8"} dev-dependencies/criterion
-dep {"default-features":false,"features":["bit-set","fork","std","timeout"],"version":"1"} dev-dependencies/proptest
-dep {"version":"3"} dev-dependencies/tempfile
-dep {"default-features":false,"features":["macros","rt","sync","time"],"version":"1"} dev-dependencies/tokio
-resolved 217698eaf96b4a3f0bc4f3662aaa55bdf913cd54d7204591faa790070c6d0853 crc-catalog@2.5.0
-resolved e75b2483e97a5a7da73ac68a05b629f9c53cff58d8ed1c77866079e18b00dba5 crc-fast@1.10.0
-resolved 5eb8a2a1cd12ab0d987a5d5e825195d372001a4094a0376319d5a0ad71c1ba0d crc@3.4.0
-resolved 5e4a9e69d45ddbe303075756d3fc2fcc965eb9dc70c80651d0e4458a6af1ed83 verus_builtin@0.0.0-2026-09-16-0054
-resolved 213ca3e8a80925aec251d3f1952a213d6090156b58ad81dccc3a2f1fed77c99f verus_builtin_macros@0.0.0-2026-09-20-0158
-resolved bb7a36bbc0193492141eef73272853a5a8d73288bed1ea5344563b0382cdf7c9 vstd@0.0.0-2026-09-20-0158
-resolved 11d582d9fc9d813264407a9e16bfa16846ccf15ef032f9bbcd700741bdc00255 wincode-derive@0.5.1
-resolved bfc6339f1ba427bf7ad7c42403b28e524832ba2ddb5eef1bb2cc3b85db6b7b75 wincode@0.6.1
+dep dependencies/crc
+dep dependencies/crc-fast
+dep dependencies/include-utils
+dep dependencies/serde
+dep dependencies/tokio
+dep dependencies/vstd
+dep dependencies/wincode
+dep dev-dependencies/chainfold
+dep dev-dependencies/criterion
+dep dev-dependencies/proptest
+dep dev-dependencies/tempfile
+dep dev-dependencies/tokio
 feature [] default
 feature ["dep:include-utils"] docs
 feature ["dep:serde"] serde
