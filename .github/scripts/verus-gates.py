@@ -26,7 +26,8 @@ Usage: verus-gates.py <crate-dir>
     its spec is assumed for every unverified impl.
 (c) The crate's `verus-manifest.txt` matches the sources: the tcb.rs items,
     every entry of every dependency table (target, build and dev ones too)
-    with its requirement and features, and a hash of every spec (each `verus_spec`, the
+    with its requirement and features, the version and checksum Cargo.lock
+    gives each trusted crate, and a hash of every spec (each `verus_spec`, the
     signature and contract of each fn in a `verus!` block, each spec fn
     body). `--results` checks a Verus run against the same file: the
     verified count and the exact set of fns Verus verified.
@@ -37,6 +38,7 @@ Config lives in the crate's Cargo.toml:
     in-scope = ["src/ring.rs"]
     out-of-scope-files = { "src/storage.rs" = "why" }
     trusted-traits = ["Fold"]
+    trusted-crates = ["crc"]
     out-of-scope = { "src/ring.rs::BlockRing::push" = "why" }
 
 Test code (items under an exact `#[cfg(test)]`) and `verus! { ... }` blocks
@@ -399,21 +401,21 @@ def load(crate: Path) -> tuple[dict, dict]:
     return toml, toml.get("package", {}).get("metadata", {}).get("verus-gates", {})
 
 
-def workspace_deps(crate: Path) -> dict:
-    """`[workspace.dependencies]` of the workspace the crate is in, if any."""
-    for d in [crate, *crate.resolve().parents]:
+def workspace(crate: Path) -> tuple[Path, dict]:
+    """The root and `[workspace]` table of the workspace the crate is in, or the crate."""
+    for d in [crate.resolve(), *crate.resolve().parents]:
         if (d / "Cargo.toml").is_file():
             with (d / "Cargo.toml").open("rb") as fh:
                 ws = tomllib.load(fh).get("workspace")
             if ws is not None:
-                return ws.get("dependencies", {})
-    return {}
+                return d, ws
+    return crate, {}
 
 
 def dep_lines(crate: Path, toml: dict) -> list[str]:
     """One line per entry of every dependency table, with `workspace = true` resolved:
     the requirement, features and flags, then the table and name."""
-    ws = workspace_deps(crate)
+    ws = workspace(crate)[1].get("dependencies", {})
     kinds = ("dependencies", "build-dependencies", "dev-dependencies", "build_dependencies", "dev_dependencies")
     tables = [(k, toml.get(k, {})) for k in kinds]
     tables += [(f"target.{cfg}.{k}", t.get(k, {})) for cfg, t in toml.get("target", {}).items() for k in kinds]
@@ -433,6 +435,20 @@ def dep_lines(crate: Path, toml: dict) -> list[str]:
     return sorted(lines, key=lambda line: line.split(" ")[-1])
 
 
+def resolved_lines(crate: Path, config: dict) -> list[str]:
+    """The version and checksum (or source) the lockfile gives each trusted crate."""
+    trusted = config.get("trusted-crates", [])
+    lock = workspace(crate)[0] / "Cargo.lock"
+    packages = tomllib.loads(lock.read_text()).get("package", []) if trusted and lock.is_file() else []
+    lines = [
+        f"resolved {p.get('checksum') or p.get('source', 'path')} {p['name']}@{p['version']}"
+        for p in packages
+        if p["name"] in trusted
+    ]
+    found = {line.split(" ")[-1].split("@")[0] for line in lines}
+    return sorted(lines, key=lambda line: line.split(" ")[-1]) + [f"resolved missing {name}" for name in sorted(set(trusted) - found)]
+
+
 def static_manifest(crate: Path, config: dict, toml: dict) -> list[str]:
     """The manifest lines the sources fix: tcb items, dependencies, spec hashes."""
     lines = []
@@ -444,7 +460,7 @@ def static_manifest(crate: Path, config: dict, toml: dict) -> list[str]:
             rest[a:b] = " " * (b - a)
         pairs.append(("(outside-verus!)", "".join(rest)))
         lines += [f"tcb {digest(t)} {k}" for k, t in unique(pairs)]
-    lines += dep_lines(crate, toml)
+    lines += dep_lines(crate, toml) + resolved_lines(crate, config)
     for rel in sorted(config.get("in-scope", [])):
         if not (crate / rel).is_file():
             continue
@@ -464,7 +480,7 @@ def read_manifest(crate: Path) -> list[str]:
 
 
 def is_static(line: str) -> bool:
-    return line.split(" ", 1)[0] in ("tcb", "dep", "spec")
+    return line.split(" ", 1)[0] in ("tcb", "dep", "resolved", "spec")
 
 
 def diff(want: list[str], have: list[str], what: str) -> list[str]:
@@ -566,10 +582,12 @@ def check(crate: Path) -> list[str]:
             errors.append(f"{rel}:{line_of(src, m.start())}: `cfg!` makes the build differ from the verified one")
     errors += [f"out-of-scope entry `{key}` matches no fn" for key in out_of_scope if key not in used]
 
+    want = static_manifest(crate, config, toml)
+    errors += [f"trusted crate `{line.split()[-1]}` is not in Cargo.lock" for line in want if " missing " in line]
     have = [line for line in read_manifest(crate) if is_static(line)]
     if not have:
         errors.append(f"{MANIFEST} missing or empty")
-    elif mismatch := diff(static_manifest(crate, config, toml), have, MANIFEST):
+    elif mismatch := diff(want, have, MANIFEST):
         errors += mismatch + ["run `verus-gates.py --update` and review the manifest diff"]
     return errors
 
@@ -755,8 +773,10 @@ mod tests { fn helper() {} }
 
     # The manifest pins the tcb.rs items, the specs and every dependency table.
     toml = '[package]\nname = "t"\n[package.metadata.verus-gates]\nin-scope = ["src/a.rs"]\ntrusted-traits = ["T"]\n'
+    toml += 'trusted-crates = ["crc"]\n'
     toml += '[dependencies]\ncrc = { version = "3.4", default-features = false }\nwincode = { workspace = true }\n'
     root = '[workspace]\nmembers = ["c"]\n[workspace.dependencies]\nwincode = { version = "0.6", features = ["alloc"] }\n'
+    lock = 'version = 4\n[[package]]\nname = "crc"\nversion = "3.4.0"\nchecksum = "5eb8"\n'
     pinned = {
         "tcb_added_item": ("src/verus/tcb.rs", tcb + "verus! { pub proof fn z() ensures false { assume(false); } }\n"),
         "tcb_changed_item": ("src/verus/tcb.rs", tcb.replace("-> u8", "-> u16")),
@@ -771,6 +791,10 @@ mod tests { fn helper() {} }
         "dep_version_changed": ("Cargo.toml", toml.replace('"3.4"', '"3.5"')),
         "dep_features_changed": ("Cargo.toml", toml.replace("false }", 'false, features = ["std"] }')),
         "dep_workspace_changed": ("../Cargo.toml", root.replace('"alloc"', '"std"')),
+        # The trusted crates' resolved versions, from the lockfile.
+        "lock_bumped": ("../Cargo.lock", lock.replace("3.4.0", "3.4.1")),
+        "lock_patched": ("../Cargo.lock", lock.replace('checksum = "5eb8"', 'source = "git+https://x"')),
+        "lock_gone": ("../Cargo.lock", "version = 4\n"),
     }
     for name, (rel, text) in pinned.items():
         with tempfile.TemporaryDirectory() as tmp:
@@ -780,6 +804,7 @@ mod tests { fn helper() {} }
             (crate / "src/a.rs").write_text(body)
             (crate / "Cargo.toml").write_text(toml)
             (crate / "../Cargo.toml").write_text(root)
+            (crate / "../Cargo.lock").write_text(lock)
             update(crate, None)
             assert not check(crate), f"self-test `{name}` before: {check(crate)}"
             (crate / rel).write_text(text)
