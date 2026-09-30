@@ -110,6 +110,7 @@ async fn main() {
             Tick::Idle => break,
             Tick::Resynced => println!("recovery: resynced from genesis"),
             Tick::SourceError => println!("recovery: source error, retrying"),
+            Tick::Behind => println!("recovery: source behind, retrying"),
             Tick::DurabilityLost => println!("recovery: durability lost, folding on"),
             Tick::Terminal(status) => {
                 println!("recovery: terminal at {status:?}");

@@ -215,7 +215,7 @@ lagging backend from skipping events:
   tag, and the source serves nothing above it. A range then never passes the head of a
   backend that lags by less than N blocks. It costs N blocks of latency (`safe` is about
   one epoch), and `safe` adds a trust in the tag. `safe` can also step back between
-  backends; the driver then walks from the cursor, which costs calls.
+  backends; such a poll returns `Behind` and costs one call.
 - one pinned node: a node you run, or a sticky session.
 - a minimum client version: every backend at or above its first good version above. No
   geth version fixes its by-hash answer, so a geth pool also needs one of the other two.
@@ -374,7 +374,12 @@ trusted items are in `src/verus/tcb.rs`.
   canonical logs, up to the cursor, of one view the tick's calls answered from, and the
   ring is a hash chain in that view. After `RolledBack`, `inv` holds over the canonical
   logs of a view that confirmed the probed ring entry, when that view holds every height
-  from `start_block` to that entry. `dinv` also covers the scan tip, as a fact of its
+  from `start_block` to that entry. After `Behind`, the engine and the tip are
+  unchanged: the head was below the tip or the cursor block, and no hash the ring holds
+  at its height or its parent's contradicts it. That tick makes one call. A chain that
+  reorgs to fewer blocks than the cursor block, where the ring holds none of its heights,
+  looks the same as a node that lags, so its ticks return `Behind` until it grows past
+  the cursor block. `dinv` also covers the scan tip, as a fact of its
   hash: every view that holds the tip agrees with the chain view of `dinv` up to the
   cursor block, and holds nothing to fold between the cursor and the tip. T7 takes A2
   (iii) and (iv) only for the views of the tick itself, so a tick may answer from a

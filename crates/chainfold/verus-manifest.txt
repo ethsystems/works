@@ -1,6 +1,6 @@
 # Checked by .github/scripts/verus-gates.py; regenerate it with `--update` (see there).
 # tcb and spec lines: hash of the normalized text, then the item. fn lines: from Verus.
-verified 348
+verified 349
 fn exec chainfold::batch::Batch::blocks_within
 fn exec chainfold::batch::Batch::clear
 fn exec chainfold::batch::Batch::clone
@@ -53,6 +53,7 @@ fn exec chainfold::driver::Driver::resume
 fn exec chainfold::driver::Driver::resume_with_sink
 fn exec chainfold::driver::Driver::resync
 fn exec chainfold::driver::Driver::resync_or_terminal
+fn exec chainfold::driver::Driver::ring_agrees
 fn exec chainfold::driver::Driver::roll_back_to
 fn exec chainfold::driver::Driver::run_checkpoint
 fn exec chainfold::driver::Driver::scan
@@ -499,16 +500,17 @@ spec 28bcd4d3c406 src/driver.rs::Driver::resync_or_terminal
 spec b933d47806de src/driver.rs::Driver::resync
 spec 460f2c103d7b src/driver.rs::Driver::reconcile_reset
 spec 9ba9a901eb78 src/driver.rs::Driver::reconcile_reset_slow
-spec b7e64aa96e72 src/driver.rs::Driver::step
-spec 45740e7f822c src/driver.rs::Driver::poll_apply
-spec bd4c9b339387 src/driver.rs::Driver::scan
+spec 69b23007f84d src/driver.rs::Driver::step
+spec 8f7b7ad33a3c src/driver.rs::Driver::poll_apply
+spec 214154047763 src/driver.rs::Driver::scan
+spec 33a9880643b2 src/driver.rs::Driver::ring_agrees
 spec 3f75fb2d2828 src/driver.rs::Driver::next_block
 spec 39b312967529 src/driver.rs::Driver::above_tip
 spec ec33634adf0d src/driver.rs::Driver::cursor_walk
 spec e2f66518c0ca src/driver.rs::Driver::cursor_block
 spec 26748d278430 src/driver.rs::Driver::walk
 spec fe304b98d969 src/driver.rs::Driver::recover_via_bisection
-spec c863359fe242 src/driver.rs::Driver::tick
+spec 86b4bd342c0c src/driver.rs::Driver::tick
 spec f4cdf96e984a src/driver.rs::Driver::checkpoint
 spec 420d850dd60c src/driver.rs::Driver::status
 spec 9c80f78786c8 src/driver.rs::all_in
@@ -539,6 +541,8 @@ spec 1faa90f9766b src/driver.rs::from_start
 spec 6edb90192ccb src/driver.rs::lost
 spec 09f4e02d1cf3 src/driver.rs::moved
 spec 09e7e5e84c91 src/driver.rs::boundary_read
+spec e6e6e5128aa3 src/driver.rs::behind
+spec 54d54c0724cd src/driver.rs::ring_agrees
 spec 258eda9d9fed src/driver.rs::shaped_at
 spec 496d8593712d src/driver.rs::lemma_lost_moved
 spec f86ab4bed873 src/driver.rs::grew
@@ -580,8 +584,8 @@ spec 3144e8fb0bf1 src/driver.rs::Driver::caught_up_view
 spec c96f5c04f1f2 src/driver.rs::Driver::durability_lost_view
 spec 0e8947bfc6ea src/driver.rs::Driver::generation_view
 spec a666f8ca53c2 src/driver.rs::Driver::dinv
-spec eb44b97cc947 src/driver.rs::tick_inv
-spec d082c7cfe79b src/driver.rs::t7_tick
+spec 301d3122894b src/driver.rs::tick_inv
+spec 22b2256fc7a7 src/driver.rs::t7_tick
 spec 194ea734fe7d src/driver.rs::dinv
 spec 76185f1fe215 src/driver.rs::t7_state
 spec 0607b9b53f6c src/driver.rs::lemma_flat_triples

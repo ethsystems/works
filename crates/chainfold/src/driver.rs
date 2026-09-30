@@ -114,10 +114,26 @@ pub enum Tick {
     Resynced,
     /// Source or its contract failed; the next delay backs off.
     SourceError,
+    /// The source's head is below the tip or the cursor block, and no block the driver
+    /// holds contradicts it: a node behind the one the last poll read answered. Nothing
+    /// changes.
+    Behind,
     /// Sink refused a snapshot offer; reported once, folding continues unpersisted.
     DurabilityLost,
     /// Engine can make no further automated progress.
     Terminal(EngineStatus),
+}
+
+/// What a scan read.
+#[cfg_attr(verus_keep_ghost, verus_verify)]
+enum Scan {
+    /// A batch for the engine.
+    Batch,
+    /// The head block moved during the scan; the batch is empty.
+    Moved,
+    /// The head is below the tip or the cursor block and contradicts no hash the ring
+    /// holds; the batch is empty.
+    Behind,
 }
 
 /// Point-in-time snapshot of driver and engine state for external observers.
@@ -826,6 +842,15 @@ where
                 sview_log::<S>(&final(self).source),
                 sview_log::<S>(&old(self).source).len() as int,
             ),
+            r is Behind ==> final(self).engine_view() == old(self).engine_view() && final(self).tip_view()
+                == old(self).tip_view() && exists|hd: Head| #[trigger] behind(
+                hd,
+                old(self).tip_view(),
+                old(self).engine_view().cursor,
+                old(self).engine_view().ring,
+            ) && header(final(self).source_log()[old(self).source_log().len() as int], hd.block.number) == Some(
+                hd.block,
+            ),
     ))]
     fn step(&mut self) -> Tick {
         self.reconcile_reset();
@@ -888,6 +913,15 @@ where
                 sview_log::<S>(&final(self).source),
                 sview_log::<S>(&old(self).source).len() as int,
             ),
+            r is Behind ==> final(self).engine_view() == old(self).engine_view() && final(self).tip_view()
+                == old(self).tip_view() && exists|hd: Head| #[trigger] behind(
+                hd,
+                old(self).tip_view(),
+                old(self).engine_view().cursor,
+                old(self).engine_view().ring,
+            ) && header(final(self).source_log()[old(self).source_log().len() as int], hd.block.number) == Some(
+                hd.block,
+            ),
     ))]
     #[cfg_attr(verus_keep_ghost, verifier::spinoff_prover)]
     #[cfg_attr(verus_keep_ghost, verifier::rlimit(20))]
@@ -910,7 +944,19 @@ where
             }
             return tick;
         }
-        if !matches!(self.scan(), Ok(true)) {
+        let read = self.scan();
+        if matches!(read, Ok(Scan::Behind)) {
+            self.consecutive_errors = 0;
+            #[cfg(verus_keep_ghost)]
+            proof! {
+                assert forall|log: Seq<(Position, F::Event)>, h: ChainView|
+                    #[trigger] old(self).dinv(log, h) implies t7_tick(*old(self), *self, Tick::Behind, log, h) by {
+                    assert(self.dinv(log, h));
+                }
+            }
+            return Tick::Behind;
+        }
+        if !matches!(read, Ok(Scan::Batch)) {
             self.consecutive_errors = self.consecutive_errors.saturating_add(1);
             #[cfg(verus_keep_ghost)]
             proof! {
@@ -1126,8 +1172,9 @@ where
     }
 
     /// Fills `batch` with the blocks strictly after the cursor, plus the cursor block's
-    /// header. `Ok(false)` when the head block moved during a walk; the batch is then
-    /// empty. Every result but `Ok(true)` keeps the tip.
+    /// header. `Moved` when the head block moved during a walk, and `Behind` when the head
+    /// lags the tip or the cursor block; the batch is then empty. Every result but a batch
+    /// keeps the tip.
     ///
     /// Cheapest first: a head equal to the tip is one call; a head whose parent is the tip
     /// reads its own block by hash; a gap past the tip, when that costs fewer calls than
@@ -1157,18 +1204,25 @@ where
                 })
                 &&& l0 < hist.len()
                 &&& grew::<S, S::Event>(sview_log::<S>(&old(self).source), hist)
-                &&& !(r matches Ok(true)) ==> final(self).tip == old(self).tip
+                &&& !(r matches Ok(Scan::Batch)) ==> final(self).tip == old(self).tip
                 &&& infallible::<S>(&old(self).source) ==> r is Ok && infallible::<S>(&final(self).source)
-                &&& r matches Ok(false) ==> moved(hist, l0)
-                &&& r matches Ok(true) ==> shaped_at(final(self).batch@, old(self).engine@.cursor)
-                &&& r matches Ok(true) ==> boundary_read(
+                &&& r matches Ok(Scan::Moved) ==> moved(hist, l0)
+                &&& r matches Ok(Scan::Behind) ==> final(self).batch@.ends.len() == 0
+                    && final(self).batch@.boundary is None && exists|hd: Head| #[trigger] behind(
+                    hd,
+                    old(self).tip,
+                    old(self).engine@.cursor,
+                    old(self).engine@.ring,
+                ) && header(hist[l0], hd.block.number) == Some(hd.block)
+                &&& r matches Ok(Scan::Batch) ==> shaped_at(final(self).batch@, old(self).engine@.cursor)
+                &&& r matches Ok(Scan::Batch) ==> boundary_read(
                     hist,
                     l0,
                     old(self).engine@.cursor,
                     old(self).engine@.ring.last(),
                     final(self).batch@.boundary,
                 )
-                &&& r matches Ok(true) ==> scanned::<S, S::Event>(
+                &&& r matches Ok(Scan::Batch) ==> scanned::<S, S::Event>(
                     hist,
                     l0,
                     old(self).config.start_block,
@@ -1181,7 +1235,7 @@ where
     ))]
     // A nested `if let`, not a `let` chain: Verus does not take `let` chains.
     #[allow(clippy::collapsible_if)]
-    fn scan(&mut self) -> Result<bool, S::Error> {
+    fn scan(&mut self) -> Result<Scan, S::Error> {
         self.batch.clear();
         let cursor = self.engine.cursor();
         #[cfg(verus_keep_ghost)]
@@ -1218,7 +1272,7 @@ where
                     assert(b0@.triples() =~= Seq::<(BlockRef, u32, F::Event)>::empty());
                     lemma_rung_same::<S, F::Event>(h1, l0, self.config.start_block, cursor, self.batch@, head.block);
                 }
-                return Ok(true);
+                return Ok(Scan::Batch);
             }
             if head.parent == tip.hash
                 && tip.number.checked_add(1) == Some(head.block.number)
@@ -1229,7 +1283,7 @@ where
                     assert(head.parent =~= tip.hash);
                 }
                 if self.next_block(head)? {
-                    return Ok(true);
+                    return Ok(Scan::Batch);
                 }
             } else if tip.number < head.block.number
                 && walk_calls(tip.number + 1, head.block.number, window).saturating_add(1)
@@ -1242,9 +1296,26 @@ where
                             lemma_lost_moved(sview_log::<S>(&self.source), l0, l0 + 1, head.block);
                         }
                     }
-                    return Ok(read);
+                    return Ok(if read { Scan::Batch } else { Scan::Moved });
                 }
             }
+        }
+        // Every rung above needs a head above the tip, so a head below it, or below the
+        // cursor block, lands here without another call.
+        let below_tip = match tip {
+            Some(tip) => head.block.number < tip.number,
+            None => false,
+        };
+        let below_cursor = match cursor {
+            Some(cursor) => head.block.number < cursor.block,
+            None => false,
+        };
+        if (below_tip || below_cursor) && self.ring_agrees(head) {
+            #[cfg(verus_keep_ghost)]
+            proof! {
+                assert(behind(head, tip, cursor, self.engine@.ring));
+            }
+            return Ok(Scan::Behind);
         }
         #[cfg(verus_keep_ghost)]
         proof_decl! {
@@ -1252,14 +1323,56 @@ where
             lemma_grew_next::<S, S::Event>(sview_log::<S>(&old(self).source), hw);
             assert(hw[l0] == h1[l0]);
         }
-        let read = self.cursor_walk(head.block, window, from);
+        let read = self.cursor_walk(head.block, window, from)?;
         #[cfg(verus_keep_ghost)]
         proof! {
-            if read matches Ok(false) {
+            if !read {
                 lemma_lost_moved(sview_log::<S>(&self.source), l0, hw.len() as int, head.block);
             }
         }
-        read
+        Ok(if read { Scan::Batch } else { Scan::Moved })
+    }
+
+    /// True when the ring holds no hash other than `head`'s at its height, nor other than
+    /// its parent's at the height below.
+    // A lagging head that contradicts the ring goes to the walk, which reports the fork.
+    #[cfg_attr(verus_keep_ghost, verus_spec(r =>
+        requires
+            self.wf(),
+        ensures
+            r ==> ring_agrees(head, self.engine@.ring),
+    ))]
+    // Nested `if let`s, not `let` chains: Verus does not take `let` chains.
+    #[allow(clippy::collapsible_if)]
+    fn ring_agrees(&self, head: Head) -> bool {
+        let number = head.block.number;
+        #[cfg(verus_keep_ghost)]
+        proof! {
+            broadcast use vstd::array::group_array_axioms;
+            self.engine.lemma_wf();
+        }
+        let ring = self.engine.ring();
+        if let Some(hash) = ring.hash_at(number) {
+            if hash != head.block.hash {
+                return false;
+            }
+            #[cfg(verus_keep_ghost)]
+            proof! {
+                assert(hash =~= head.block.hash);
+            }
+        }
+        if let Some(parent) = number.checked_sub(1) {
+            if let Some(hash) = ring.hash_at(parent) {
+                if hash != head.parent {
+                    return false;
+                }
+                #[cfg(verus_keep_ghost)]
+                proof! {
+                    assert(hash =~= head.parent);
+                }
+            }
+        }
+        true
     }
 
     /// `scan` with the head one block on top of the tip: reads the head block by its hash,
@@ -2043,6 +2156,15 @@ where
             r is SourceError ==> !old(self).source_infallible() || moved(
                 final(self).source_log(),
                 old(self).source_log().len() as int,
+            ),
+            r is Behind ==> final(self).engine_view() == old(self).engine_view() && final(self).tip_view()
+                == old(self).tip_view() && exists|hd: Head| #[trigger] behind(
+                hd,
+                old(self).tip_view(),
+                old(self).engine_view().cursor,
+                old(self).engine_view().ring,
+            ) && header(final(self).source_log()[old(self).source_log().len() as int], hd.block.number) == Some(
+                hd.block,
             ),
     ))]
     pub fn tick(&mut self) -> Tick {
@@ -4171,18 +4293,24 @@ mod tests {
                     }
                     _ => None,
                 };
+                let before = driver.engine().fold().applied.clone();
                 let tick = driver.tick();
                 // then no tick errs, and the fold is the fold from scratch over the chain
-                // the tick read, up to the cursor
+                // the tick read, up to the cursor; a head below the cursor block or the tip
+                // that the ring cannot tell from a lagging node leaves the fold as it was
                 assert!(
                     !matches!(tick, Tick::SourceError | Tick::Terminal(_)),
                     "seed {seed} step {step}: {tick:?}"
                 );
-                let want = from_scratch(
-                    driver.source_mut().clone(),
-                    start,
-                    driver.engine().cursor(),
-                );
+                let want = if tick == Tick::Behind {
+                    before
+                } else {
+                    from_scratch(
+                        driver.source_mut().clone(),
+                        start,
+                        driver.engine().cursor(),
+                    )
+                };
                 assert_eq!(
                     driver.engine().fold().applied,
                     want,
@@ -4697,6 +4825,94 @@ mod tests {
     }
 
     #[test]
+    fn a_head_behind_the_tip_costs_one_call() {
+        // given a driver caught up on node a to block 20, with its tip there; node b is a
+        // without its last block
+        let mut driver = pool_driver(&[]);
+        run_to_idle(&mut driver);
+        let mut behind = driver.source.a.clone();
+        behind.reorg(1, &[]);
+        driver.source.b = behind;
+        let before = driver.engine().fold().clone();
+        // when one head call goes to b, and the next poll to a
+        driver.source.route = b"B".to_vec();
+        let lagging = pool_tick(&mut driver);
+        let caught_up = driver.is_caught_up();
+        let delay = driver.next_delay();
+        let next = pool_tick(&mut driver);
+        // then the lagging head costs one call and changes nothing, and the tip stays
+        assert_eq!(lagging, (Tick::Behind, 1));
+        assert_eq!(driver.engine().fold(), &before);
+        assert!(caught_up);
+        assert_eq!(delay, DriverConfig::default().poll_interval);
+        assert_eq!(next, (Tick::Idle, 1));
+
+        // given a driver with no cursor yet, at the tip of ten empty blocks
+        let mut empty = ScriptedChain::new(0);
+        for _ in 0..10 {
+            empty.push_block(&[]);
+        }
+        let mut behind = empty.clone();
+        behind.reorg(1, &[]);
+        let mut driver = Driver::new(
+            RecordingFold::default(),
+            Pool::new(empty, behind),
+            engine_config(2),
+            DriverConfig::from_block(0),
+        )
+        .unwrap();
+        run_to_idle(&mut driver);
+        // when one head call goes to b, and then a block with an event lands
+        driver.source.route = b"B".to_vec();
+        let lagging = pool_tick(&mut driver);
+        driver.source.a.push_block(&[11]);
+        run_to_idle(&mut driver);
+        // then the lagging head changes nothing, and the event folds
+        assert_eq!(lagging, (Tick::Behind, 1));
+        assert_eq!(
+            driver.engine().fold().applied,
+            vec![(Position::new(10, 0), 11)]
+        );
+    }
+
+    #[test]
+    fn a_head_below_the_cursor_changes_nothing() {
+        // given a driver caught up on node a, blocks 0..=3 with events at 0, 2 and 3; node
+        // b stops at block 1, and node c at block 0
+        let mut a = ScriptedChain::new(0);
+        a.set_window(10);
+        a.push_block(&[1]);
+        a.push_block(&[]);
+        let b = a.clone();
+        a.push_block(&[2]);
+        a.push_block(&[3]);
+        let mut c = b.clone();
+        c.reorg(1, &[]);
+        let mut driver = Driver::new(
+            RecordingFold::default(),
+            Pool::new(a, b),
+            engine_config(2),
+            DriverConfig::from_block(0),
+        )
+        .unwrap();
+        run_to_idle(&mut driver);
+        let before = driver.engine().fold().clone();
+        // when every call of one poll goes to b, then to c
+        driver.source.route = b"BBBBBBBBBB".to_vec();
+        let at_one = driver.tick();
+        driver.source.b = c;
+        driver.source.route = b"BBBBBBBBBB".to_vec();
+        let at_zero = driver.tick();
+        driver.source.route.clear();
+        // then neither rolls back or resyncs, and the fold is kept
+        assert_eq!(at_one, Tick::Behind);
+        assert_eq!(at_zero, Tick::Behind);
+        assert_eq!(driver.engine().fold(), &before);
+        assert_eq!(run_to_idle(&mut driver), Tick::Idle);
+        assert_eq!(driver.engine().fold().applied, pool_canonical(&driver));
+    }
+
+    #[test]
     fn scan_returns_when_head_is_u64_max() {
         // given a chain whose only block, number u64::MAX, carries no events
         let mut driver = Driver::new(
@@ -5109,6 +5325,21 @@ pub open spec fn boundary_read(
 ) -> bool {
     c matches Some(p) ==> bd == Some(last) || exists|k: int|
         l0 <= k < hist.len() && bd == #[trigger] header(hist[k], p.block)
+}
+
+/// Head `hd` lies below tip `t` or cursor `c`'s block, and agrees with `ring`.
+pub open spec fn behind(hd: Head, t: Option<BlockRef>, c: Option<Position>, ring: Seq<BlockRef>) -> bool {
+    &&& (t matches Some(t) && hd.block.number < t.number) || (c matches Some(c) && hd.block.number < c.block)
+    &&& ring_agrees(hd, ring)
+}
+
+/// Every hash `ring` holds at head `hd`'s height is `hd`'s, and every one at the height
+/// below is its parent's.
+pub open spec fn ring_agrees(hd: Head, ring: Seq<BlockRef>) -> bool {
+    &&& forall|i: int|
+        0 <= i < ring.len() && (#[trigger] ring[i]).number == hd.block.number ==> ring[i].hash == hd.block.hash
+    &&& forall|i: int| 0 <= i < ring.len() && (#[trigger] ring[i]).number + 1 == hd.block.number ==> ring[i].hash
+        == hd.parent
 }
 
 /// A batch `validate` accepts, whose boundary, if any, is at cursor `c`'s block.
@@ -5936,7 +6167,8 @@ impl<F: Fold, S: Source<Event = F::Event>, K: SnapshotSink<F>> Driver<F, S, K> {
 }
 
 /// `Inv` threading through one tick: the log grows by the applied calls, is cut at a
-/// rollback target, restarts empty at a resync, and stays on a source error.
+/// rollback target, restarts empty at a resync, and stays on a source error or a head
+/// behind.
 pub open spec fn tick_inv<F: Fold, S: Source<Event = F::Event>, K: SnapshotSink<F>>(
     pre: Driver<F, S, K>,
     post: Driver<F, S, K>,
@@ -5949,6 +6181,7 @@ pub open spec fn tick_inv<F: Fold, S: Source<Event = F::Event>, K: SnapshotSink<
         Tick::RolledBack { to } => f.inv::<F, F::Event, F::Error>(init, upto(log, to)),
         Tick::Resynced => f.inv::<F, F::Event, F::Error>(post.init_view(), Seq::empty()),
         Tick::SourceError => f.inv::<F, F::Event, F::Error>(init, log),
+        Tick::Behind => f.inv::<F, F::Event, F::Error>(init, log),
         _ => f.inv::<F, F::Event, F::Error>(
             init,
             log + calls::<F, F::Event, F::Error>(pre.engine_view(), post.batch_view()),
@@ -5961,7 +6194,8 @@ pub open spec fn tick_inv<F: Fold, S: Source<Event = F::Event>, K: SnapshotSink<
 /// invariant carries over, and after `Progressed`/`Idle` with the engine Active the fold is
 /// the fold of the canonical logs of one of the tick's views, with the ring a hash chain
 /// inside that view. After `RolledBack`, `Inv` holds over the canonical logs of a view that
-/// confirmed the probed ring entry, when that view holds `[start_block, entry]`.
+/// confirmed the probed ring entry, when that view holds `[start_block, entry]`. After
+/// `Behind`, the engine is unchanged.
 pub open spec fn t7_tick<F: Fold, S: Source<Event = F::Event>, K: SnapshotSink<F>>(
     pre: Driver<F, S, K>,
     post: Driver<F, S, K>,
@@ -5974,6 +6208,7 @@ pub open spec fn t7_tick<F: Fold, S: Source<Event = F::Event>, K: SnapshotSink<F
     let hyp = (r is Progressed || r is Idle || r is DurabilityLost) ==> views_ok(hist, l0, start);
     let ring = pre.engine_view().ring;
     &&& hyp ==> exists|log2: Seq<(Position, F::Event)>, h2: ChainView| #[trigger] post.dinv(log2, h2)
+    &&& r is Behind ==> post.engine_view() == pre.engine_view()
     &&& hyp && (r is Progressed || r is Idle) && post.engine_view().status is Active ==> exists|k: int|
         l0 <= k < hist.len() && #[trigger] t7_state::<F, S, F::Event, F::Error>(
             post.engine_view(),
