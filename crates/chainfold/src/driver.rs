@@ -1161,6 +1161,13 @@ where
                 &&& infallible::<S>(&old(self).source) ==> r is Ok && infallible::<S>(&final(self).source)
                 &&& r matches Ok(false) ==> moved(hist, l0)
                 &&& r matches Ok(true) ==> shaped_at(final(self).batch@, old(self).engine@.cursor)
+                &&& r matches Ok(true) ==> boundary_read(
+                    hist,
+                    l0,
+                    old(self).engine@.cursor,
+                    old(self).engine@.ring.last(),
+                    final(self).batch@.boundary,
+                )
                 &&& r matches Ok(true) ==> scanned::<S, S::Event>(
                     hist,
                     l0,
@@ -1283,6 +1290,10 @@ where
                 && final(self).batch@.boundary is None,
             infallible::<S>(&old(self).source) ==> r is Ok && infallible::<S>(&final(self).source),
             r matches Ok(true) ==> shaped_at(final(self).batch@, old(self).engine@.cursor),
+            r matches Ok(true) ==> final(self).batch@.boundary == match old(self).engine@.cursor {
+                Some(_) => Some(old(self).engine@.ring.last()),
+                None => None,
+            },
             r matches Ok(true) ==> forall|tip: BlockRef|
                 tip.hash == head.parent && tip.number + 1 == head.block.number ==> #[trigger] scanned::<S, S::Event>(
                     sview_log::<S>(&final(self).source),
@@ -1372,6 +1383,10 @@ where
                 head,
             ),
             r matches Ok(Some(true)) ==> shaped_at(final(self).batch@, old(self).engine@.cursor),
+            r matches Ok(Some(true)) ==> final(self).batch@.boundary == match old(self).engine@.cursor {
+                Some(_) => Some(old(self).engine@.ring.last()),
+                None => None,
+            },
             r matches Ok(Some(true)) ==> forall|l0: int|
                 0 <= l0 && l0 + 1 == sview_log::<S>(&old(self).source).len() && header(
                     sview_log::<S>(&old(self).source)[l0],
@@ -1522,6 +1537,13 @@ where
                 head,
             ),
             r matches Ok(true) ==> shaped_at(final(self).batch@, old(self).engine@.cursor),
+            r matches Ok(true) ==> boundary_read(
+                sview_log::<S>(&final(self).source),
+                sview_log::<S>(&old(self).source).len() as int,
+                old(self).engine@.cursor,
+                old(self).engine@.ring.last(),
+                final(self).batch@.boundary,
+            ),
             r matches Ok(true) ==> forall|l0: int, t0: Option<BlockRef>|
                 0 <= l0 < sview_log::<S>(&old(self).source).len() && header(
                     sview_log::<S>(&old(self).source)[l0],
@@ -1602,6 +1624,20 @@ where
             return Ok(false);
         }
         self.batch.boundary = boundary;
+        #[cfg(verus_keep_ghost)]
+        proof! {
+            if let Some(p) = cursor {
+                let hf = sview_log::<S>(&self.source);
+                if at is Some {
+                    assert(hf[w0] == h2[w0]);
+                    assert(boundary == header(hf[w0], p.block));
+                } else {
+                    let n = h2.len() as int;
+                    assert(hf[n] == h3[n]);
+                    assert(boundary == header(hf[n], p.block));
+                }
+            }
+        }
         if reached {
             self.tip = Some(head);
         }
@@ -4745,6 +4781,19 @@ pub open spec fn lost(hist: Seq<ChainView>, l0: int, b: BlockRef) -> bool {
 /// The source log `hist` from `l0` holds a view other than its first.
 pub open spec fn moved(hist: Seq<ChainView>, l0: int) -> bool {
     exists|k: int| l0 <= k < hist.len() && #[trigger] hist[k] != hist[l0]
+}
+
+/// The boundary `bd` of a batch scanned above cursor `c`: the cursor block as the ring
+/// holds it (`last`), or as a view of the source log `hist` from `l0` answered it.
+pub open spec fn boundary_read(
+    hist: Seq<ChainView>,
+    l0: int,
+    c: Option<Position>,
+    last: BlockRef,
+    bd: Option<BlockRef>,
+) -> bool {
+    c matches Some(p) ==> bd == Some(last) || exists|k: int|
+        l0 <= k < hist.len() && bd == #[trigger] header(hist[k], p.block)
 }
 
 /// A batch `validate` accepts, whose boundary, if any, is at cursor `c`'s block.

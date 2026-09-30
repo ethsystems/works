@@ -505,10 +505,10 @@ spec 460f2c103d7b src/driver.rs::Driver::reconcile_reset
 spec 9ba9a901eb78 src/driver.rs::Driver::reconcile_reset_slow
 spec b7e64aa96e72 src/driver.rs::Driver::step
 spec 45740e7f822c src/driver.rs::Driver::poll_apply
-spec 43ad2ab04639 src/driver.rs::Driver::scan
-spec c697caa50518 src/driver.rs::Driver::next_block
-spec 5e5300ba0a01 src/driver.rs::Driver::above_tip
-spec 0cffb3f6894a src/driver.rs::Driver::cursor_walk
+spec a85851c245a4 src/driver.rs::Driver::scan
+spec de0109a0b0d0 src/driver.rs::Driver::next_block
+spec 362f53a0a65f src/driver.rs::Driver::above_tip
+spec 24e2b8d1ea62 src/driver.rs::Driver::cursor_walk
 spec e2f66518c0ca src/driver.rs::Driver::cursor_block
 spec 5f76f3af0677 src/driver.rs::Driver::walk
 spec fe304b98d969 src/driver.rs::Driver::recover_via_bisection
@@ -542,6 +542,7 @@ spec 13cf9f9e0d77 src/driver.rs::no_aba
 spec 1faa90f9766b src/driver.rs::from_start
 spec 6edb90192ccb src/driver.rs::lost
 spec 09f4e02d1cf3 src/driver.rs::moved
+spec 09e7e5e84c91 src/driver.rs::boundary_read
 spec 258eda9d9fed src/driver.rs::shaped_at
 spec 496d8593712d src/driver.rs::lemma_lost_moved
 spec f86ab4bed873 src/driver.rs::grew
