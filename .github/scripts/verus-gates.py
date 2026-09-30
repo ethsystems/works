@@ -10,8 +10,11 @@ Usage: verus-gates.py <crate-dir>
 (a) No trusted construct outside src/verus/tcb.rs. `--no-cheating` cannot do
     this: it also rejects the tcb.rs entries and `uninterp` spec fns, and it
     ignores `#[verifier::external]`. Nothing that hides code from these
-    regexes either: `#[path]`, `include!`, `macro_rules!`, a build script, or
-    a nightly feature not on FEATURES.
+    regexes either: `#[path]`, `include!`, `macro_rules!`, a build script, a
+    nightly feature not on FEATURES, or in in-scope code a macro, attribute
+    or derive from a crate not on MACRO_CRATES (`paste` builds identifiers),
+    a glob import from another crate, or a `use` or `extern crate` that binds
+    a trusted macro or crate name to something else.
 (b) Every `src/**/*.rs` is in scope, out of scope, or tcb.rs. Every fn in an
     in-scope file carries a verifying attribute, or sits in an impl/trait
     marked `verus_verify`, or is listed as out of scope. Attribute mode
@@ -89,6 +92,23 @@ OPAQUE = [
     r"\bmacro_rules\b",
     r"\bconcat_idents\b",
 ]
+# The crates in-scope code may take macros, attributes and derives from. A macro from any
+# other crate (`paste`) can build tokens, `assume` among them, that these regexes never see.
+MACRO_CRATES = {"std", "core", "alloc", "vstd", "verifier", "rustfmt", "clippy", "serde", "wincode", "include_utils"}
+MACROS = {
+    *("assert", "assert_eq", "assert_ne", "debug_assert", "debug_assert_eq", "debug_assert_ne"),
+    *("format", "matches", "panic", "unreachable", "vec", "write", "writeln"),
+    *("verus", "proof", "proof_decl", "proof_with", "seq"),
+}
+ATTRS = {
+    *("cfg", "cfg_attr", "cfg_eval", "derive", "doc", "allow", "warn", "deny", "forbid", "expect", "feature"),
+    *("inline", "cold", "must_use", "repr", "non_exhaustive", "track_caller", "test", "no_std", "deprecated"),
+    *("trigger", "verus_spec", "verus_verify", "serde", "wincode"),
+}
+DERIVES = {"Clone", "Copy", "Debug", "Default", "Eq", "Hash", "Ord", "PartialEq", "PartialOrd", "StructuralEq"}
+# Words a `!` can follow that are not macro names: `if !(x)`, `ensures !(x)`.
+NOT_MACROS = {"if", "while", "match", "return", "in", "else", "break", "let", "mut", "move", "yield"}
+NOT_MACROS |= {"requires", "ensures", "invariant", "decreases", "recommends", "returns", "when", "via"}
 FEATURES = {"proc_macro_hygiene", "cfg_eval", "allocator_api", "doc_cfg"}
 # The cfgs of the Verus run, `cargo verus verify --features <the crate's `features` list>`.
 # `load` derives them from the crate's [features].
@@ -221,6 +241,49 @@ def body_attr_ok(attr: str, header: str) -> bool:
         pred, *rest = split_top(m.group(1))
         return norm(pred) == "verus_keep_ghost" and not any(re.match(r"cfg(_attr)?\b", a) for a in rest)
     return not re.match(r"cfg\b", attr)
+
+
+def macro_uses(src: str) -> list[tuple[int, str, str]]:
+    """(offset, path, kind) of every macro call, attribute (with `cfg_attr` expanded) and derive."""
+    path = r"(?:::)?\w+(?:\s*::\s*\w+)*"
+    found = [
+        (m.start(), re.sub(r"\s+", "", m.group(1)), "macro")
+        for m in re.finditer(rf"(?<![\w:])({path})\s*!\s*[(\[{{]", src)
+        if m.group(1) not in NOT_MACROS
+    ]
+    for m in re.finditer(r"#\s*!?\s*\[", src):
+        depth, j = 1, m.end()
+        while j < len(src) and depth:
+            depth += {"[": 1, "]": -1}.get(src[j], 0)
+            j += 1
+        todo = [src[m.end() : j - 1]]
+        while todo:
+            attr = todo.pop().strip()
+            if call := re.fullmatch(r"(cfg_attr|derive)\s*\((.*)\)", attr, re.S):
+                args = split_top(call.group(2))
+                if call.group(1) == "cfg_attr":
+                    todo += args[1:]
+                else:
+                    found += [(m.start(), re.sub(r"\s+", "", d), "derive") for d in args]
+            elif name := re.match(path, attr):
+                found.append((m.start(), re.sub(r"\s+", "", name.group(0)), "attr"))
+    return found
+
+
+def macro_ok(path: str, kind: str) -> bool:
+    root, *rest = path.removeprefix("::").split("::")
+    return root in MACRO_CRATES if rest else path in {"macro": MACROS, "attr": ATTRS, "derive": DERIVES}[kind]
+
+
+def use_names(text: str, prefix: str = "") -> list[tuple[str, str]]:
+    """(path, bound name) of each name a `use` item imports."""
+    tree = re.sub(r"\s*(::|,|\{|\})\s*", r"\1", re.sub(r"^(pub(\(.*?\))?\s+)?use\s+", "", text.strip()))
+    if tree.endswith("}"):
+        head, _, inner = tree.partition("{")
+        return [n for part in split_top(inner[:-1]) for n in use_names(part, prefix + head)]
+    m = re.fullmatch(r"(.*?)(?:\s+as\s+(\w+))?", tree, re.S)
+    full = (prefix + m.group(1)).removesuffix("::self")
+    return [(full, m.group(2) or full.split("::")[-1])]
 
 
 def self_type(impl_rest: str) -> tuple[str, str]:
@@ -561,6 +624,15 @@ def check(crate: Path) -> list[str]:
             for feature in split_top(m.group(1)):
                 if feature not in FEATURES:
                     errors.append(f"{rel}:{line_of(src, m.start())}: feature `{feature}` is not on the allowed list")
+        # A name MACROS or MACRO_CRATES trusts, bound to another crate's item.
+        for m in re.finditer(r"\bextern\s+crate\s+(\w+)(\s+as\b)?", src):
+            if m.group(2) or m.group(1) not in ("std", "core", "alloc"):
+                errors.append(f"{rel}:{line_of(src, m.start())}: `{norm(m.group(0))}` can rename a crate to a macro crate")
+        for text, line, _ in items(src, strip(path.read_text(), strings=False))["uses"]:
+            for full, name in use_names(text):
+                std = full.split("::")[0] in ("std", "core", "alloc", "vstd")
+                if name in MACROS | ATTRS | DERIVES | MACRO_CRATES and not std:
+                    errors.append(f"{rel}:{line}: `use {full}` binds `{name}`, a macro or macro crate name")
         if str(rel) in out_files:
             for m in re.finditer(r"\bverus\w*", src):
                 errors.append(f"{rel}:{line_of(src, m.start())}: out-of-scope file uses `{m.group(0)}`")
@@ -607,6 +679,13 @@ def check(crate: Path) -> list[str]:
                 errors.append(f"{rel}:{line}: `verus!` block is cfg'd out of the Verus build")
             for m in re.finditer(r"#\s*!?\s*\[\s*cfg", src[a:b]):
                 errors.append(f"{rel}:{line_of(src, a + m.start())}: cfg in a `verus!` block")
+        for pos, name, kind in macro_uses(src):
+            if not macro_ok(name, kind):
+                errors.append(f"{rel}:{line_of(src, pos)}: {kind} `{name}` is not from a crate on MACRO_CRATES")
+        for text, line, _ in found["uses"]:
+            for full, name in use_names(text):
+                if name == "*" and full.split("::")[0] not in ("vstd", "crate", "self", "super"):
+                    errors.append(f"{rel}:{line}: glob import `{full}` can shadow a macro name")
         for text, line in found["body_cfgs"]:
             errors.append(f"{rel}:{line}: `#[{text}]` in a fn body makes the build differ from the verified one")
         for m in re.finditer(r"\bcfg\s*!", src):
@@ -773,6 +852,24 @@ mod tests { fn helper() {} }
         "body_cfg_attr_std": (spec + '\nfn w(a: u8) -> u8 {\n#[cfg_attr(feature = "std", allow(unused))]\nlet a = 0;\na }', "", {}, False),
         "body_cfg_macro": (spec + '\nfn w(a: u8) -> u8 { if cfg!(feature = "std") { return 0; } a }', "", {}, False),
         "verus_cfg": ('verus! { fn w(a: u8) -> u8 {\n#[cfg(feature = "std")]\nlet a = 0;\na } }', "", {}, False),
+        # Macros from a dependency can build any token, `assume` included.
+        "macro_dep": (spec + "\nfn w() { paste::paste! { [<ass ume>](false); } }", "", {}, False),
+        "macro_dep_bare": ("use paste::paste;\n" + spec + "\nfn w() { paste! { [<ass ume>](false); } }", "", {}, False),
+        "macro_renamed": ("use paste::paste as vec;\n" + spec + "\nfn w() { vec! { [<ass ume>](false); } }", "", {}, False),
+        "macro_crate_renamed": ("use paste as vstd;\n" + spec + "\nfn w() { vstd::paste! { } }", "", {}, False),
+        "macro_extern_crate": ("extern crate paste as vstd;", "", {}, False),
+        "macro_glob": ("use paste::*;", "", {}, False),
+        "attr_dep": ("#[paste::item]\n" + spec + "\nfn w() {}", "", {}, False),
+        "attr_bare": ("use evil::rewrite;\n#[rewrite]\n" + spec + "\nfn w() {}", "", {}, False),
+        "derive_dep": ("#[derive(Clone, evil::Evil)]\nstruct Z;", "", {}, False),
+        "macro_std_ok": (
+            "#[derive(Clone, wincode::SchemaWrite)]\nstruct Z;\n"
+            + spec
+            + "\nfn w() -> Vec<u8> { assert!(true); if !(true) {} vstd::prelude::proof! { } vec![1] }",
+            "",
+            {},
+            True,
+        ),
         "body_ghost_ok": (
             spec + "\nfn w(a: u8) -> u8 {\n#[cfg(verus_keep_ghost)]\nproof! { assert(true); }\n"
             "#[cfg(verus_keep_ghost)]\nproof_decl! { let ghost g = 0int; }\n"
