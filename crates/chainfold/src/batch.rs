@@ -119,6 +119,32 @@ impl<E> Batch<E> {
         self.ends.is_empty()
     }
 
+    /// True when every block the batch carries lies in `lo..=hi`.
+    #[cfg_attr(verus_keep_ghost, verus_spec(r =>
+        requires
+            self@.wf(),
+            self@.shaped(),
+        ensures
+            r == forall|i: int| 0 <= i < self@.blocks.len() ==> lo <= #[trigger] self@.blocks[i] <= hi,
+    ))]
+    pub(crate) fn blocks_within(&self, lo: u64, hi: u64) -> bool {
+        // Blocks ascend, so the first and the last bound them all.
+        let n = self.blocks.len();
+        #[cfg(verus_keep_ghost)]
+        proof! {
+            assert forall|i: int| 0 <= i < n implies self@.blocks[0] <= #[trigger] self@.blocks[i]
+                && self@.blocks[i] <= self@.blocks[n - 1] by {
+                if 0 < i {
+                    assert(self@.blocks[0] < self@.blocks[i]);
+                }
+                if i < n - 1 {
+                    assert(self@.blocks[i] < self@.blocks[n - 1]);
+                }
+            }
+        }
+        n == 0 || (lo <= self.blocks[0] && self.blocks[n - 1] <= hi)
+    }
+
     /// Spans the batch carries, one per observed block.
     #[cfg_attr(verus_keep_ghost, verus_spec(r => ensures r == self@.ends.len()))]
     pub fn span_count(&self) -> usize {

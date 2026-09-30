@@ -1416,8 +1416,11 @@ where
             lemma_grew_refl::<S, S::Event>(h1);
             lemma_grew_next::<S, S::Event>(h1, h1);
         }
-        let (_at, _reads, reached) =
-            self.walk(tip.number + 1, head.number, window, false)?;
+        let Some((_at, _reads, reached)) =
+            self.walk(tip.number + 1, head.number, window, false)?
+        else {
+            return Ok(Some(false));
+        };
         #[cfg(verus_keep_ghost)]
         proof_decl! {
             let ghost d2 = *self;
@@ -1576,8 +1579,11 @@ where
             lemma_grew_refl::<S, S::Event>(hw);
             lemma_grew_next::<S, S::Event>(hw, hw);
         }
-        let (at, reads, reached) =
-            self.walk(from, head.number, window, cursor.is_some())?;
+        let Some((at, reads, reached)) =
+            self.walk(from, head.number, window, cursor.is_some())?
+        else {
+            return Ok(false);
+        };
         #[cfg(verus_keep_ghost)]
         proof_decl! {
             let ghost d2 = *self;
@@ -1715,6 +1721,8 @@ where
     /// entry above the floor into the batch. With `floor`, the floor is block `from` itself:
     /// its entries are dropped and the first answer's header for it is returned. Also
     /// returns the windows read, capped at 2, and whether the last one reached `hi`.
+    /// `Ok(None)` when an answer holds an entry outside its window; the batch is then
+    /// empty.
     #[cfg_attr(verus_keep_ghost, verus_spec(r =>
         requires
             old(self).wf(),
@@ -1731,11 +1739,12 @@ where
                 ..*old(self)
             }),
             grew::<S, S::Event>(sview_log::<S>(&old(self).source), sview_log::<S>(&final(self).source)),
-            r matches Ok(p) ==> (p.0 matches Some(b) ==> floor),
-            r matches Ok(p) ==> p.1 <= 2,
+            r matches Ok(o) ==> o is Some,
+            r matches Ok(Some(p)) ==> (p.0 matches Some(b) ==> floor),
+            r matches Ok(Some(p)) ==> p.1 <= 2,
             r is Ok ==> final(self).batch@.shaped(),
             infallible::<S>(&old(self).source) ==> r is Ok && infallible::<S>(&final(self).source),
-            r matches Ok(p) ==> exists|wins: Seq<(int, int)>|
+            r matches Ok(Some(p)) ==> exists|wins: Seq<(int, int)>|
                 #[trigger] walked::<S, S::Event>(
                     sview_log::<S>(&final(self).source),
                     sview_log::<S>(&old(self).source).len() as int,
@@ -1757,7 +1766,7 @@ where
         hi: u64,
         window: u64,
         floor: bool,
-    ) -> Result<(Option<BlockRef>, u8, bool), S::Error> {
+    ) -> Result<Option<Walk>, S::Error> {
         let mut next = from;
         let mut at: Option<BlockRef> = None;
         let mut reads = 0u8;
@@ -1867,9 +1876,14 @@ where
                 assert(got == got.subrange(0, got.len() as int));
                 assert(got.to_multiset() == range_entries::<S, S::Event>(v, next as int, to as int).to_multiset());
                 assert(sview_log::<S>(&self.source)[l0 + wins.len() - 1] == v);
+                lemma_answer_within::<S, S::Event>(v, next as int, to as int, got);
             }
             if floor && reads == 0 {
-                at = take_floor(&mut self.scratch, next);
+                let (floor_at, below) = take_floor(&mut self.scratch, next);
+                if below {
+                    return Ok(None);
+                }
+                at = floor_at;
                 #[cfg(verus_keep_ghost)]
                 proof! {
                     lemma_floor::<S, S::Event>(v, next, to, got, self.scratch@);
@@ -1903,6 +1917,17 @@ where
                 #[cfg(verus_keep_ghost)]
                 proof! {
                     vstd::seq_lib::to_multiset_len(self.batch@.triples());
+                    lemma_answer_within::<S, S::Event>(
+                        v,
+                        wlo(wins, floor, wins.len() - 1),
+                        to as int,
+                        self.batch@.triples(),
+                    );
+                    lemma_triples_within(self.batch@, next, to);
+                }
+                if !self.batch.blocks_within(next, to) {
+                    self.batch.clear();
+                    return Ok(None);
                 }
                 break;
             }
@@ -1950,7 +1975,7 @@ where
                 read.2,
             ));
         }
-        Ok(read)
+        Ok(Some(read))
     }
 
     /// Bisects the observed ring for the deepest still-canonical block, then rolls back.
@@ -2132,6 +2157,10 @@ fn all_in<E>(entries: &[(BlockRef, u32, E)], block: BlockRef) -> bool {
     true
 }
 
+/// A walk's result: the first answer's header for the floor block, the windows read (at
+/// most 2), and whether the last one reached the walk's end.
+type Walk = (Option<BlockRef>, u8, bool);
+
 /// `events_in` calls a walk over `from..=hi` makes, plus the head read that follows.
 #[cfg_attr(verus_keep_ghost, verus_spec(
     requires
@@ -2145,18 +2174,24 @@ fn walk_calls(from: u64, hi: u64, window: u64) -> u64 {
 }
 
 /// Drops the entries at or below block `floor`, in place and out of order, and returns the
-/// header one of them carried at `floor`.
+/// header one of them carried at `floor`, and whether one lay below `floor`.
 #[cfg_attr(verus_keep_ghost, verus_verify)]
 #[cfg_attr(verus_keep_ghost, verus_spec(r =>
     ensures
         forall|x: (BlockRef, u32, E)| #[trigger] final(entries)@.to_multiset().count(x)
             == if x.0.number > floor { old(entries)@.to_multiset().count(x) } else { 0 },
-        r matches Some(b) ==> b.number == floor && exists|i: int|
+        r.0 matches Some(b) ==> b.number == floor && exists|i: int|
             0 <= i < old(entries)@.len() && #[trigger] old(entries)@[i].0 == b,
-        r is None ==> forall|i: int| 0 <= i < old(entries)@.len() ==> #[trigger] old(entries)@[i].0.number != floor,
+        r.0 is None ==> forall|i: int| 0 <= i < old(entries)@.len() ==> #[trigger] old(entries)@[i].0.number != floor,
+        !r.1 ==> forall|i: int| 0 <= i < old(entries)@.len() ==> (#[trigger] old(entries)@[i]).0.number >= floor,
+        r.1 ==> exists|i: int| 0 <= i < old(entries)@.len() && (#[trigger] old(entries)@[i]).0.number < floor,
 ))]
-fn take_floor<E>(entries: &mut Vec<(BlockRef, u32, E)>, floor: u64) -> Option<BlockRef> {
+fn take_floor<E>(
+    entries: &mut Vec<(BlockRef, u32, E)>,
+    floor: u64,
+) -> (Option<BlockRef>, bool) {
     let mut at: Option<BlockRef> = None;
+    let mut below = false;
     let mut i = entries.len();
     #[cfg(verus_keep_ghost)]
     proof_decl! {
@@ -2177,6 +2212,8 @@ fn take_floor<E>(entries: &mut Vec<(BlockRef, u32, E)>, floor: u64) -> Option<Bl
             entries@.to_multiset().add(gone.to_multiset()) == s.to_multiset(),
             at matches Some(b) ==> b.number == floor && exists|j: int| i <= j < s.len() && #[trigger] s[j].0 == b,
             at is None ==> forall|j: int| i <= j < s.len() ==> #[trigger] s[j].0.number != floor,
+            !below ==> forall|j: int| i <= j < s.len() ==> (#[trigger] s[j]).0.number >= floor,
+            below ==> exists|j: int| i <= j < s.len() && (#[trigger] s[j]).0.number < floor,
         decreases i,
     ))]
     while i > 0 {
@@ -2185,6 +2222,8 @@ fn take_floor<E>(entries: &mut Vec<(BlockRef, u32, E)>, floor: u64) -> Option<Bl
             let block = entries[i].0;
             if block.number == floor {
                 at = Some(block);
+            } else {
+                below = true;
             }
             #[cfg(verus_keep_ghost)]
             proof_decl! {
@@ -2242,7 +2281,7 @@ fn take_floor<E>(entries: &mut Vec<(BlockRef, u32, E)>, floor: u64) -> Option<Bl
             }
         }
     }
-    at
+    (at, below)
 }
 
 /// `group_into`'s sort key. `MAX - x` reverses each lane, so the sort is descending
@@ -2573,8 +2612,86 @@ mod tests {
         }
     }
 
-    /// Source that re-serves the same one-event block whatever one-block range or block is
-    /// asked for, so the engine dedupes every poll after the first.
+    /// Load balancer over two nodes: each call goes to `b` when the next queued route is
+    /// `b'B'`, else to `a`. A node errs on a range past its own head, except that with
+    /// `proxy` a range starting past `b`'s head is answered with the logs of that head
+    /// block. Counts every call.
+    struct Pool {
+        a: ScriptedChain,
+        b: ScriptedChain,
+        route: Vec<u8>,
+        proxy: bool,
+        calls: u32,
+    }
+
+    impl Pool {
+        fn new(a: ScriptedChain, b: ScriptedChain) -> Self {
+            Self {
+                a,
+                b,
+                route: Vec::new(),
+                proxy: false,
+                calls: 0,
+            }
+        }
+
+        /// The node the next call goes to, and whether it is `b`.
+        fn pick(&mut self) -> (bool, &mut ScriptedChain) {
+            self.calls += 1;
+            let to_b = !self.route.is_empty() && self.route.remove(0) == b'B';
+            if to_b {
+                (true, &mut self.b)
+            } else {
+                (false, &mut self.a)
+            }
+        }
+    }
+
+    impl Source for Pool {
+        type Event = u64;
+        type Error = PollFailure;
+
+        fn head(&mut self) -> Result<Head, PollFailure> {
+            self.pick().1.head()
+        }
+
+        fn header_at(&mut self, number: u64) -> Result<Option<BlockRef>, PollFailure> {
+            self.pick().1.header_at(number)
+        }
+
+        fn events_in(
+            &mut self,
+            from: u64,
+            to: u64,
+            out: &mut Vec<(BlockRef, u32, u64)>,
+        ) -> Result<(), PollFailure> {
+            let proxy = self.proxy;
+            let (to_b, node) = self.pick();
+            let top = node.tip().map_or(0, |tip| tip.number);
+            if to_b && proxy && from > top {
+                return node.events_in(top, top, out);
+            }
+            if to > top {
+                return Err(PollFailure);
+            }
+            node.events_in(from, to, out)
+        }
+
+        fn events_at(
+            &mut self,
+            block: &BlockRef,
+            out: &mut Vec<(BlockRef, u32, u64)>,
+        ) -> Result<(), PollFailure> {
+            self.pick().1.events_at(block, out)
+        }
+
+        fn window(&self) -> u64 {
+            self.a.window()
+        }
+    }
+
+    /// Source that serves the same one-event block for every block asked for and every range
+    /// that reaches it, so each read above the block is served it again.
     struct Stuck {
         block: BlockRef,
     }
@@ -2613,10 +2730,12 @@ mod tests {
         fn events_in(
             &mut self,
             _from: u64,
-            _to: u64,
+            to: u64,
             out: &mut Vec<(BlockRef, u32, u64)>,
         ) -> Result<(), PollFailure> {
-            out.push((self.block, 0, 1));
+            if to >= self.block.number {
+                out.push((self.block, 0, 1));
+            }
             Ok(())
         }
 
@@ -3218,8 +3337,8 @@ mod tests {
     }
 
     #[test]
-    fn a_fully_deduped_batch_keeps_the_poll_interval() {
-        // given a source that re-serves the same one-event block on every poll
+    fn a_block_served_again_for_a_later_range_is_refused() {
+        // given a source that serves its one-event block again for every range above it
         let block = BlockRef {
             number: 1,
             hash: [7u8; 32],
@@ -3231,12 +3350,13 @@ mod tests {
             DriverConfig::default(),
         )
         .unwrap();
-        // when the first tick applies the block and the second dedupes it
+        // when the first tick applies the block and the second is served it again
         let applying = driver.tick();
         let after_apply = driver.next_delay();
-        let deduping = driver.tick();
-        let after_dedup = driver.next_delay();
-        // then only the applying tick asks for an immediate re-poll
+        let again = driver.tick();
+        let after_again = driver.next_delay();
+        // then the second answer is refused, and only the applying tick asks for an
+        // immediate re-poll
         assert_eq!(
             applying,
             Tick::Progressed(ApplySummary {
@@ -3246,15 +3366,9 @@ mod tests {
             })
         );
         assert_eq!(after_apply, Duration::ZERO);
-        assert_eq!(
-            deduping,
-            Tick::Progressed(ApplySummary {
-                applied: 0,
-                deduped: 1,
-                skipped: 0,
-            })
-        );
-        assert_eq!(after_dedup, Duration::from_secs(1));
+        assert_eq!(again, Tick::SourceError);
+        assert_eq!(after_again, DriverConfig::default().backoff_base);
+        assert_eq!(driver.engine().fold().applied.len(), 1);
     }
 
     #[test]
@@ -4379,6 +4493,116 @@ mod tests {
             }),
             |source| &mut source.0,
         );
+    }
+
+    /// A chain of block 0, with event 10, and blocks 1..=20, empty, for `a`; and for `b`, a
+    /// fork of it from block 1 whose blocks carry `fork` (one event per block, 0 for none).
+    fn pool_driver(fork: &[u64]) -> Driver<RecordingFold, Pool> {
+        let mut base = ScriptedChain::new(0);
+        base.set_window(2);
+        base.push_block(&[10]);
+        let mut b = base.clone();
+        for event in fork {
+            b.push_block(if *event == 0 {
+                &[]
+            } else {
+                core::slice::from_ref(event)
+            });
+        }
+        let mut a = base.clone();
+        // A push that a reorg drops, so `a`'s blocks from 1 get other hashes than `b`'s.
+        a.push_block(&[]);
+        a.reorg(1, &[]);
+        for _ in 1..=20 {
+            a.push_block(&[]);
+        }
+        assert_ne!(a.header(1), b.header(1));
+        Driver::new(
+            RecordingFold::default(),
+            Pool::new(a, b),
+            engine_config(2),
+            DriverConfig::from_block(0),
+        )
+        .unwrap()
+    }
+
+    /// The fold of a fresh driver over the pool's node `a`.
+    fn pool_canonical(driver: &Driver<RecordingFold, Pool>) -> Vec<(Position, u64)> {
+        let mut fresh = new_driver(
+            driver.source.a.clone(),
+            engine_config(2),
+            DriverConfig::from_block(0),
+        );
+        run_to_idle(&mut fresh);
+        fresh.engine().fold().applied.clone()
+    }
+
+    #[test]
+    fn an_entry_outside_its_window_is_refused() {
+        // given a driver caught up on node a to block 20, with its tip there, then ten more
+        // blocks; node b, behind a proxy, lags at block 2 of a fork whose block 2 carries 777
+        let mut driver = pool_driver(&[0, 777]);
+        run_to_idle(&mut driver);
+        for _ in 21..=30 {
+            driver.source.a.push_block(&[]);
+        }
+        driver.source.proxy = true;
+        // when the first window above the tip, 21..=22, is answered by b with its block 2
+        driver.source.route = b"ABAA".to_vec();
+        let outcome = driver.tick();
+        // then the answer is refused, and nothing of b's fork is folded
+        assert_eq!(outcome, Tick::SourceError);
+        assert_eq!(
+            driver.engine().fold().applied,
+            vec![(Position::new(0, 0), 10)]
+        );
+        run_to_idle(&mut driver);
+        assert_eq!(driver.engine().fold().applied, pool_canonical(&driver));
+
+        // given the same, with b lagging at block 1 of a fork whose block 1 carries 777
+        let mut driver = pool_driver(&[777]);
+        run_to_idle(&mut driver);
+        // when a walk from the cursor, since `source_mut` drops the tip, has its second
+        // window, 2..=3, answered by b with its block 1
+        driver.source_mut().proxy = true;
+        driver.source_mut().route = b"AAB".to_vec();
+        let outcome = driver.tick();
+        // then that answer is refused too
+        assert_eq!(outcome, Tick::SourceError);
+        assert_eq!(
+            driver.engine().fold().applied,
+            vec![(Position::new(0, 0), 10)]
+        );
+        run_to_idle(&mut driver);
+        assert_eq!(driver.engine().fold().applied, pool_canonical(&driver));
+
+        // given a driver whose cursor is its tip, at block 20 with an event, then block 21
+        // with an event and an empty block 22; node b, behind a proxy, lags at block 19 of a
+        // fork whose block 19 carries 777
+        let mut fork = [0; 19];
+        fork[18] = 777;
+        let mut driver = pool_driver(&fork);
+        driver.source.a.reorg(1, &[&[20]]);
+        run_to_idle(&mut driver);
+        driver.source.a.push_block(&[21]);
+        driver.source.a.push_block(&[]);
+        driver.source.proxy = true;
+        // when the first window of a walk from the cursor, 20..=21, is answered by b with its
+        // block 19
+        driver.source.route = b"AB".to_vec();
+        let outcome = driver.tick();
+        // then that answer is refused too, not read as a window with nothing above the
+        // cursor block, and block 21 folds
+        assert_eq!(outcome, Tick::SourceError);
+        run_to_idle(&mut driver);
+        assert!(
+            driver
+                .engine()
+                .fold()
+                .applied
+                .contains(&(Position::new(21, 0), 21))
+        );
+        assert_eq!(driver.engine().fold().applied, pool_canonical(&driver));
     }
 
     #[test]
@@ -6561,6 +6785,40 @@ proof fn lemma_re_ascending<S, E>(v: ChainView, lo: int, hi: int)
                 assert(l[i - r0.len()].0 < l[j - r0.len()].0);
             }
         }
+    }
+}
+
+/// An answer with the entries of `v`'s heights `lo..=hi` holds no entry outside them.
+proof fn lemma_answer_within<S, E>(v: ChainView, lo: int, hi: int, got: Seq<(BlockRef, u32, E)>)
+    requires
+        a1::<S, E>(v),
+        got.to_multiset() == range_entries::<S, E>(v, lo, hi).to_multiset(),
+    ensures
+        forall|i: int| 0 <= i < got.len() ==> lo <= (#[trigger] got[i]).0.number <= hi,
+{
+    let t = range_entries::<S, E>(v, lo, hi);
+    lemma_re_facts::<S, E>(v, lo, hi);
+    assert forall|i: int| 0 <= i < got.len() implies lo <= (#[trigger] got[i]).0.number <= hi by {
+        vstd::seq_lib::to_multiset_contains(got, got[i]);
+        vstd::seq_lib::to_multiset_contains(t, got[i]);
+        assert(got.contains(got[i]));
+        let j = choose|j: int| 0 <= j < t.len() && t[j] == got[i];
+        assert(t[j] == got[i]);
+    }
+}
+
+/// A shaped batch whose entries lie at heights `lo..=hi` carries only blocks there.
+proof fn lemma_triples_within<E>(b: BatchView<E>, lo: u64, hi: u64)
+    requires
+        b.wf(),
+        b.shaped(),
+        forall|i: int| 0 <= i < b.triples().len() ==> lo <= (#[trigger] b.triples()[i]).0.number <= hi,
+    ensures
+        forall|i: int| 0 <= i < b.blocks.len() ==> lo <= #[trigger] b.blocks[i] <= hi,
+{
+    assert forall|i: int| 0 <= i < b.blocks.len() implies lo <= #[trigger] b.blocks[i] <= hi by {
+        lemma_triples_at(b, b.ends.len() as int, i);
+        assert(b.triples()[b.start(i)].0 == b.block(i));
     }
 }
 

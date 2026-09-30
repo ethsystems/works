@@ -1,6 +1,7 @@
 # Checked by .github/scripts/verus-gates.py; regenerate it with `--update` (see there).
 # tcb and spec lines: hash of the normalized text, then the item. fn lines: from Verus.
-verified 345
+verified 348
+fn exec chainfold::batch::Batch::blocks_within
 fn exec chainfold::batch::Batch::clear
 fn exec chainfold::batch::Batch::clone
 fn exec chainfold::batch::Batch::default
@@ -169,6 +170,7 @@ fn proof chainfold::batch::lemma_spans_ok_shaped
 fn proof chainfold::checkpoint::CheckpointRing::lemma_live_view
 fn proof chainfold::checkpoint::Slot::lemma_view
 fn proof chainfold::driver::lemma_anchor
+fn proof chainfold::driver::lemma_answer_within
 fn proof chainfold::driver::lemma_apply_empty
 fn proof chainfold::driver::lemma_apply_floor
 fn proof chainfold::driver::lemma_apply_step
@@ -203,6 +205,7 @@ fn proof chainfold::driver::lemma_triples_at
 fn proof chainfold::driver::lemma_triples_ignore_boundary
 fn proof chainfold::driver::lemma_triples_len
 fn proof chainfold::driver::lemma_triples_upto_kept
+fn proof chainfold::driver::lemma_triples_within
 fn proof chainfold::driver::lemma_walk_core
 fn proof chainfold::driver::lemma_walk_empty
 fn proof chainfold::driver::lemma_wins_bounds
@@ -411,6 +414,7 @@ spec 9ff22c8bfe3e src/batch.rs::SpanView::block
 spec 9e9bb413ec58 src/batch.rs::Batch::new
 spec aadd3a179956 src/batch.rs::Batch::clear
 spec daba8dba592a src/batch.rs::Batch::is_empty
+spec 3f0e122d3406 src/batch.rs::Batch::blocks_within
 spec 6a99ea19ce53 src/batch.rs::Batch::span_count
 spec 83a7cab57445 src/batch.rs::Batch::push_block
 spec b61a41922fac src/batch.rs::Batch::span
@@ -502,14 +506,14 @@ spec de0109a0b0d0 src/driver.rs::Driver::next_block
 spec 362f53a0a65f src/driver.rs::Driver::above_tip
 spec 24e2b8d1ea62 src/driver.rs::Driver::cursor_walk
 spec e2f66518c0ca src/driver.rs::Driver::cursor_block
-spec 5f76f3af0677 src/driver.rs::Driver::walk
+spec 26748d278430 src/driver.rs::Driver::walk
 spec fe304b98d969 src/driver.rs::Driver::recover_via_bisection
 spec c863359fe242 src/driver.rs::Driver::tick
 spec f4cdf96e984a src/driver.rs::Driver::checkpoint
 spec 420d850dd60c src/driver.rs::Driver::status
 spec 9c80f78786c8 src/driver.rs::all_in
 spec 88f30a0d6a49 src/driver.rs::walk_calls
-spec 4f9ec250540c src/driver.rs::take_floor
+spec 4215bf35e4c0 src/driver.rs::take_floor
 spec 022f3f9b64d1 src/driver.rs::descending
 spec ed2cd9830c07 src/driver.rs::group_into
 spec 70d5b0f602c9 src/driver.rs::clamp_spec
@@ -600,6 +604,8 @@ spec 3826a8353bcb src/driver.rs::key_le
 spec ee1bd31c45e7 src/driver.rs::desc
 spec a12257db319a src/driver.rs::popped_desc
 spec c4bcd3cf55b9 src/driver.rs::lemma_re_ascending
+spec 1057b5f9f109 src/driver.rs::lemma_answer_within
+spec 04e64c7f3801 src/driver.rs::lemma_triples_within
 spec d754365eb3fc src/driver.rs::lemma_re_one_view
 spec 5d30445bc76f src/driver.rs::lemma_sorted_desc
 spec bbdd8fc65a3c src/driver.rs::lemma_push_desc
