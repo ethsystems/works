@@ -873,8 +873,7 @@ where
             r is Progressed || r is RolledBack || r is Resynced || r is Terminal ==> !final(self).caught_up_view(),
             r is Behind || r is SourceError ==> final(self).caught_up_view() == old(self).caught_up_view(),
             r is Behind ==> final(self).engine_view() == old(self).engine_view() && final(self).tip_view()
-                == old(self).tip_view() && final(self).tip_end_view() == old(self).tip_end_view()
-                && exists|hd: Head| #[trigger] behind(
+                == old(self).tip_view() && final(self).tip_same(*old(self)) && exists|hd: Head| #[trigger] behind(
                 hd,
                 old(self).tip_view(),
                 old(self).engine_view().cursor,
@@ -948,8 +947,7 @@ where
             r is Progressed || r is RolledBack || r is Resynced || r is Terminal ==> !final(self).caught_up_view(),
             r is Behind || r is SourceError ==> final(self).caught_up_view() == old(self).caught_up_view(),
             r is Behind ==> final(self).engine_view() == old(self).engine_view() && final(self).tip_view()
-                == old(self).tip_view() && final(self).tip_end_view() == old(self).tip_end_view()
-                && exists|hd: Head| #[trigger] behind(
+                == old(self).tip_view() && final(self).tip_same(*old(self)) && exists|hd: Head| #[trigger] behind(
                 hd,
                 old(self).tip_view(),
                 old(self).engine_view().cursor,
@@ -2277,8 +2275,7 @@ where
             r is Progressed || r is RolledBack || r is Resynced || r is Terminal ==> !final(self).caught_up_view(),
             r is Behind || r is SourceError ==> final(self).caught_up_view() == old(self).caught_up_view(),
             r is Behind ==> final(self).engine_view() == old(self).engine_view() && final(self).tip_view()
-                == old(self).tip_view() && final(self).tip_end_view() == old(self).tip_end_view()
-                && exists|hd: Head| #[trigger] behind(
+                == old(self).tip_view() && final(self).tip_same(*old(self)) && exists|hd: Head| #[trigger] behind(
                 hd,
                 old(self).tip_view(),
                 old(self).engine_view().cursor,
@@ -6820,13 +6817,9 @@ impl<F: Fold, S: Source<Event = F::Event>, K: SnapshotSink<F>> Driver<F, S, K> {
         }
     }
 
-    /// The last block the scan tip covers; below the tip's head when a walk was cut at
-    /// its cap.
-    pub closed spec fn tip_end_view(&self) -> Option<u64> {
-        match self.tip {
-            Some(m) => Some(m.done),
-            None => None,
-        }
+    /// The scan tip is `o`'s, in every field: its head and the last block it covers.
+    pub closed spec fn tip_same(&self, o: Self) -> bool {
+        self.tip == o.tip
     }
 
     /// No scan anchor: the next poll reads from the cursor block.

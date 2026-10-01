@@ -507,8 +507,8 @@ spec e23da2b8c91a src/driver.rs::Driver::resync_or_terminal
 spec b933d47806de src/driver.rs::Driver::resync
 spec 460f2c103d7b src/driver.rs::Driver::reconcile_reset
 spec 9ba9a901eb78 src/driver.rs::Driver::reconcile_reset_slow
-spec 8a50dbb0a4e3 src/driver.rs::Driver::step
-spec 67f16cbe3643 src/driver.rs::Driver::poll_apply
+spec 3603f0136232 src/driver.rs::Driver::step
+spec d131dfa1840f src/driver.rs::Driver::poll_apply
 spec 57cfb2efa848 src/driver.rs::Driver::scan
 spec 33a9880643b2 src/driver.rs::Driver::ring_agrees
 spec ea4a2f04450b src/driver.rs::Driver::next_block
@@ -518,7 +518,7 @@ spec ccd3449dabb4 src/driver.rs::Driver::resuming
 spec e2f66518c0ca src/driver.rs::Driver::cursor_block
 spec 26748d278430 src/driver.rs::Driver::walk
 spec fe304b98d969 src/driver.rs::Driver::recover_via_bisection
-spec 0062bb712777 src/driver.rs::Driver::tick
+spec 33abfe57ebbc src/driver.rs::Driver::tick
 spec f4cdf96e984a src/driver.rs::Driver::checkpoint
 spec 420d850dd60c src/driver.rs::Driver::status
 spec 9c80f78786c8 src/driver.rs::all_in
@@ -591,7 +591,7 @@ spec 46d9001d8ce5 src/driver.rs::Driver::source_log
 spec fe83048f5e5d src/driver.rs::Driver::source_infallible
 spec f405ac92a1f1 src/driver.rs::Driver::batch_view
 spec ff29f0e6d6d8 src/driver.rs::Driver::tip_view
-spec c3efbb8d57a4 src/driver.rs::Driver::tip_end_view
+spec 852e425f7faa src/driver.rs::Driver::tip_same
 spec e9b6f0337788 src/driver.rs::Driver::unanchored
 spec 3144e8fb0bf1 src/driver.rs::Driver::caught_up_view
 spec c96f5c04f1f2 src/driver.rs::Driver::durability_lost_view
