@@ -41,6 +41,16 @@ Usage: verus-gates.py <crate-dir>
     and the gate config: every [features] entry, the Verus run's cfgs, the
     scope lists and trusted-traits. `--results` checks a Verus run against the
     same file: the verified count and the exact set of fns Verus verified.
+(d) Each dependency name the manifest pins builds that crate from crates.io.
+    Cargo would build other code under it with `[source]` replacement (a
+    vendored copy), `[patch]`, `paths` or `include` in a `.cargo/config(.toml)`
+    anywhere in the workspace or in `$CARGO_HOME`, `[patch]` or `[replace]` in
+    any Cargo.toml, `package`, `path`, `git` or `registry` on a dependency
+    entry (the crate itself as a dev-dependency is allowed), Cargo source or
+    patch config in the environment, or `--config`, `CARGO_HOME` or Cargo
+    source config in a workflow that runs these gates. Source replacement keeps
+    the registry name in `cargo metadata`, so `--check-toolchain` does not see
+    it, and the `--no-cheating` run never reads a dependency.
 
 Config lives in the crate's Cargo.toml:
 
@@ -69,6 +79,7 @@ Review the manifest diff: each line names the item that changed.
 
 import hashlib
 import json
+import os
 import re
 import sys
 import tempfile
@@ -117,6 +128,10 @@ FEATURES = {"proc_macro_hygiene", "cfg_eval", "allocator_api", "doc_cfg"}
 # `load` derives them from the crate's [features].
 VERUS_CFG = {"verus_keep_ghost", "verus_keep_ghost_body"}
 VERIFYING = ("verus_spec", "verus_verify")
+# Cargo config keys, and dependency keys, that build a crate from other code than its name on
+# crates.io: a vendored or local copy, a patch, a path, a git repo, another registry or package.
+CONFIG_SWAPS = {"source", "patch", "paths", "include"}
+DEP_SWAPS = {"package", "path", "git", "registry", "registry-index"}
 USE = re.compile(r"\s*(pub(\s*\([^)]*\))?\s+)?use\b")
 # What a `verus!` item can start with; a `}` followed by one of these ends the item.
 ITEM_START = re.compile(
@@ -503,12 +518,71 @@ def workspace(crate: Path) -> Path:
     return crate
 
 
-def dep_lines(toml: dict) -> list[str]:
-    """One line per entry of every dependency table: the table and name."""
+def dep_tables(toml: dict) -> list[tuple[str, dict]]:
+    """Every dependency table (target, build and dev ones too), by name."""
     kinds = ("dependencies", "build-dependencies", "dev-dependencies", "build_dependencies", "dev_dependencies")
     tables = [(k, toml.get(k, {})) for k in kinds]
-    tables += [(f"target.{cfg}.{k}", t.get(k, {})) for cfg, t in toml.get("target", {}).items() for k in kinds]
-    return sorted("dep " + re.sub(r"\s+", "", f"{table}/{name}") for table, entries in tables for name in entries)
+    return tables + [(f"target.{cfg}.{k}", t.get(k, {})) for cfg, t in toml.get("target", {}).items() for k in kinds]
+
+
+def dep_lines(toml: dict) -> list[str]:
+    """One line per entry of every dependency table: the table and name."""
+    pairs = [(table, name) for table, entries in dep_tables(toml) for name in entries]
+    return sorted("dep " + re.sub(r"\s+", "", f"{table}/{name}") for table, name in pairs)
+
+
+def swaps(crate: Path, env: dict) -> list[str]:
+    """Each way the repo or the environment can make Cargo build other code under a dependency
+    name the manifest pins. Source replacement is invisible to `cargo metadata` and to
+    `--check-toolchain`, and the `--no-cheating` run never reads dependencies."""
+    root = workspace(crate).resolve()
+    errors = []
+
+    def toml_of(path: Path) -> dict:
+        try:
+            return tomllib.loads(path.read_text())
+        except (OSError, tomllib.TOMLDecodeError) as error:
+            errors.append(f"{show(path)}: {error}")
+            return {}
+
+    def show(path: Path) -> Path:
+        return path.relative_to(root) if path.is_relative_to(root) else path
+
+    configs, manifests = [], []
+    for d, dirs, files in os.walk(root):
+        dirs[:] = [x for x in dirs if x != ".git" and Path(d, x) != root / "target"]
+        configs += [Path(d, f) for f in files if Path(d).name == ".cargo" and f in ("config", "config.toml")]
+        manifests += [Path(d, f) for f in files if f == "Cargo.toml"]
+    if "CARGO_HOME" in env:
+        configs += [p for p in (Path(env["CARGO_HOME"], f) for f in ("config", "config.toml")) if p.is_file()]
+    for path in configs:
+        for key in CONFIG_SWAPS & toml_of(path).keys():
+            errors.append(f"{show(path)}: `{key}` in Cargo config can swap a dependency's source")
+    for path in manifests:
+        for key in ("patch", "replace") & toml_of(path).keys():
+            errors.append(f"{show(path)}: `[{key}]` can swap a dependency's source")
+    for key in env:
+        if re.fullmatch(r"CARGO_(SOURCE|PATCH)_\w+|CARGO_PATHS", key):
+            errors.append(f"environment: `{key}` is Cargo config that can swap a dependency's source")
+    for path in sorted((root / ".github/workflows").glob("*.y*ml")):
+        text = path.read_text()
+        if "verus-gates.py" in text:
+            for m in re.finditer(r"--config\b|\.cargo/config|\bCARGO_(HOME|PATHS|SOURCE_\w+|PATCH_\w+)\b", text):
+                errors.append(f"{show(path)}:{line_of(text, m.start())}: `{m.group(0)}` can swap a dependency's source")
+
+    toml = toml_of(crate / "Cargo.toml")
+    inherited = toml_of(root / "Cargo.toml").get("workspace", {}).get("dependencies", {})
+    for table, entries in dep_tables(toml):
+        for name, entry in entries.items():
+            entry = entry if isinstance(entry, dict) else {}
+            shared = inherited.get(name) if entry.get("workspace") else None
+            for e in (entry, shared if isinstance(shared, dict) else {}):
+                for key in DEP_SWAPS & e.keys():
+                    if key == "path" and e is entry and (crate / e[key]).resolve() == crate.resolve():
+                        continue  # the crate itself, as a dev-dependency
+                    where = show(crate.resolve() / "Cargo.toml" if e is entry else root / "Cargo.toml")
+                    errors.append(f"{where}: `{table}/{name}` sets `{key}`, so its pinned name can be other code")
+    return errors
 
 
 def static_manifest(crate: Path, config: dict, toml: dict) -> list[str]:
@@ -577,6 +651,7 @@ def check(crate: Path) -> list[str]:
         errors.append("a build script can generate code these gates never read")
     if toml.get("lib", {}).get("path", "src/lib.rs") != "src/lib.rs":
         errors.append("[lib] path must be src/lib.rs")
+    errors += swaps(crate, dict(os.environ))
 
     in_scope = set(config.get("in-scope", []))
     out_files = dict(config.get("out-of-scope-files", {}))
@@ -914,8 +989,12 @@ mod tests { fn helper() {} }
     toml = '[package]\nname = "t"\n[package.metadata.verus-gates]\nin-scope = ["src/a.rs"]\ntrusted-traits = ["T"]\n'
     toml += 'features = ["verus"]\n'
     toml += '[features]\nverus = []\nstd = []\n'
+    toml += '[dev-dependencies]\nt = { path = "." }\n'
     toml += '[dependencies]\ncrc = { version = "3.4", default-features = false }\nwincode = { workspace = true }\n'
     root = '[workspace]\nmembers = ["c"]\n[workspace.dependencies]\nwincode = "0.6"\n'
+    env = '[env]\nRUST_MIN_STACK = "8388608"\n'
+    vendored = '[source.crates-io]\nreplace-with = "v"\n[source.v]\ndirectory = "vendor"\n'
+    patch = '[patch.crates-io]\nvstd = { path = "v" }\n'
     pinned = {
         "tcb_added_item": ("src/verus/tcb.rs", tcb + "verus! { pub proof fn z() ensures false { assume(false); } }\n"),
         "tcb_changed_item": ("src/verus/tcb.rs", tcb.replace("-> u8", "-> u16")),
@@ -947,6 +1026,27 @@ mod tests { fn helper() {} }
             toml.replace('["T"]', '["T", "O"]'),
         ),
         "feature_changed": ("Cargo.toml", toml.replace("verus = []", 'verus = ["std"]')),
+        # Other code under a name the manifest pins: Cargo builds it, the manifest does not change.
+        "source_replaced": ("../.cargo/config.toml", env + vendored),
+        "source_replaced_nested": ("../x/.cargo/config", vendored),
+        "config_patch": ("../.cargo/config.toml", env + patch),
+        "config_paths": ("../.cargo/config.toml", 'paths = ["v"]\n' + env),
+        "patch": ("../Cargo.toml", root + patch),
+        "patch_member": ("Cargo.toml", toml + patch),
+        "replace": ("../Cargo.toml", root + '[replace]\n"vstd:0.0.0" = { path = "v" }\n'),
+        "dep_renamed": ("Cargo.toml", toml.replace("crc = {", 'crc = { package = "evil",')),
+        "dep_path": ("Cargo.toml", toml.replace("crc = {", 'crc = { path = "../v",')),
+        "dep_git": ("Cargo.toml", toml.replace("crc = {", 'crc = { git = "https://x",')),
+        "dep_renamed_in_workspace": ("../Cargo.toml", root.replace('"0.6"', '{ version = "1", package = "evil" }')),
+        "workflow_config": (
+            "../.github/workflows/ci.yml",
+            "run: |\n  python3 .github/scripts/verus-gates.py c\n"
+            "  cargo verus verify --config source.crates-io.replace-with=v\n",
+        ),
+        "workflow_cargo_home": (
+            "../.github/workflows/ci.yml",
+            "env:\n  CARGO_HOME: h\nrun: python3 .github/scripts/verus-gates.py c\n",
+        ),
     }
     for name, change in pinned.items():
         with tempfile.TemporaryDirectory() as tmp:
@@ -956,11 +1056,28 @@ mod tests { fn helper() {} }
             (crate / "src/a.rs").write_text(body)
             (crate / "Cargo.toml").write_text(toml)
             (crate / "../Cargo.toml").write_text(root)
+            (crate / "../.cargo").mkdir()
+            (crate / "../.cargo/config.toml").write_text(env)
             update(crate, None)
             assert not check(crate), f"self-test `{name}` before: {check(crate)}"
             for rel, text in zip(change[::2], change[1::2]):
+                (crate / rel).parent.mkdir(parents=True, exist_ok=True)
                 (crate / rel).write_text(text)
             assert check(crate), f"self-test `{name}`: not caught"
+    # Cargo also reads its config from the environment and from $CARGO_HOME.
+    with tempfile.TemporaryDirectory() as tmp:
+        crate = Path(tmp)
+        (crate / "Cargo.toml").write_text('[package]\nname = "t"\n')
+        (crate / "home").mkdir()
+        (crate / "home/config.toml").write_text(vendored)
+        assert not swaps(crate, {"CARGO_TERM_COLOR": "always"}), "self-test `env_ok`"
+        for key, value in [
+            ("CARGO_SOURCE_CRATES_IO_REPLACE_WITH", "v"),
+            ("CARGO_PATCH_CRATES_IO_VSTD_PATH", "v"),
+            ("CARGO_PATHS", "v"),
+            ("CARGO_HOME", str(crate / "home")),
+        ]:
+            assert swaps(crate, {key: value}), f"self-test `env {key}`: not caught"
 
     def report(verified: int, errors: int, fns: list[str]) -> str:
         breakdown = [{"function": f, "mode:": "exec", "success": True} for f in fns]
