@@ -1242,8 +1242,11 @@ where
                     batch: final(self).batch,
                     scratch: final(self).scratch,
                     tip: final(self).tip,
+                    last_checkpoint_block: final(self).last_checkpoint_block,
+                    last_snapshot_block: final(self).last_snapshot_block,
                     ..*old(self)
                 })
+                &&& marks_lowered(*old(self), *final(self), r is Ok)
                 &&& l0 < hist.len()
                 &&& grew::<S, S::Event>(sview_log::<S>(&old(self).source), hist)
                 &&& !(r matches Ok(Scan::Batch { .. })) ==> final(self).tip == old(self).tip
@@ -1360,6 +1363,13 @@ where
                     });
                 }
             }
+        } else {
+            // No tip, as `engine_mut` leaves it, so the scan walks from the cursor. A rollback
+            // through `engine_mut` leaves the cadence marks above the cursor: lower them, as
+            // `roll_back_to` does, so neither the next checkpoint nor the next offer waits.
+            // At or below the cursor they stay as they are.
+            self.last_checkpoint_block = clamp(self.last_checkpoint_block, cursor);
+            self.last_snapshot_block = clamp(self.last_snapshot_block, cursor);
         }
         // Every rung above needs a head above the tip, so a head below it, or below the
         // cursor block, lands here without another call.
@@ -3884,6 +3894,42 @@ mod tests {
     }
 
     #[test]
+    fn a_rollback_through_engine_mut_keeps_the_checkpoint_cadence() {
+        // given a driver at the defaults, synced over 5,000 one-event blocks and then 300
+        // more read one block a poll, so it holds its four checkpoints 64 blocks apart
+        let mut chain = ScriptedChain::new(1);
+        for value in 1..=5_000u64 {
+            chain.push_block(&[value]);
+        }
+        let mut driver =
+            new_driver(chain, EngineConfig::default(), DriverConfig::from_block(1));
+        run_to_idle(&mut driver);
+        for value in 5_001..=5_300u64 {
+            driver.source.push_block(&[value]);
+            run_to_idle(&mut driver);
+        }
+        assert_eq!(driver.engine().checkpoint_count(), 4);
+        // when the caller rolls back past a checkpoint through engine_mut, and the driver
+        // refolds to the head
+        let to = driver.engine_mut().rollback_at_or_below(5_200).unwrap();
+        assert_eq!(to, Some(Position::new(5_192, 0)));
+        run_to_idle(&mut driver);
+        // then the refold takes a checkpoint at the head, 108 blocks above the restore point
+        assert_eq!(driver.engine().cursor(), Some(Position::new(5_300, 0)));
+        assert_eq!(driver.last_checkpoint_block, Some(5_300));
+        // and a rollback to that checkpoint 40 blocks later takes none on the 40-block refold
+        for value in 5_301..=5_340u64 {
+            driver.source.push_block(&[value]);
+            run_to_idle(&mut driver);
+        }
+        let to = driver.engine_mut().rollback_at_or_below(5_339).unwrap();
+        assert_eq!(to, Some(Position::new(5_300, 0)));
+        run_to_idle(&mut driver);
+        assert_eq!(driver.engine().cursor(), Some(Position::new(5_340, 0)));
+        assert_eq!(driver.last_checkpoint_block, Some(5_300));
+    }
+
+    #[test]
     fn halt_is_terminal_and_recoverable_via_engine_mut() {
         // given a fold that halts at block 3 after a checkpoint taken at block 2
         let mut chain = ScriptedChain::new(1);
@@ -5712,6 +5758,26 @@ pub open spec fn clamp_spec(mark: Option<u64>, to: Option<Position>) -> Option<u
     match (mark, to) {
         (Some(m), Some(t)) => Some(if m <= t.block { m } else { t.block }),
         _ => None,
+    }
+}
+
+/// `scan`'s cadence marks: with no tip, lowered to the cursor once the head is read
+/// (always when the scan is `ok`), else as they were.
+spec fn marks_lowered<F: Fold, S: Source<Event = F::Event>, K: SnapshotSink<F>>(
+    pre: Driver<F, S, K>,
+    post: Driver<F, S, K>,
+    ok: bool,
+) -> bool {
+    let kept = post.last_checkpoint_block == pre.last_checkpoint_block && post.last_snapshot_block
+        == pre.last_snapshot_block;
+    let lowered = post.last_checkpoint_block == clamp_spec(pre.last_checkpoint_block, pre.engine@.cursor)
+        && post.last_snapshot_block == clamp_spec(pre.last_snapshot_block, pre.engine@.cursor);
+    if pre.tip is Some {
+        kept
+    } else if ok {
+        lowered
+    } else {
+        kept || lowered
     }
 }
 

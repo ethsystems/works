@@ -513,7 +513,7 @@ spec 460f2c103d7b src/driver.rs::Driver::reconcile_reset
 spec 9ba9a901eb78 src/driver.rs::Driver::reconcile_reset_slow
 spec 3603f0136232 src/driver.rs::Driver::step
 spec d131dfa1840f src/driver.rs::Driver::poll_apply
-spec 57cfb2efa848 src/driver.rs::Driver::scan
+spec 01f6c059ea42 src/driver.rs::Driver::scan
 spec 33a9880643b2 src/driver.rs::Driver::ring_agrees
 spec ea4a2f04450b src/driver.rs::Driver::next_block
 spec 4b87042ed1f8 src/driver.rs::Driver::above_tip
@@ -532,6 +532,7 @@ spec e90b7e83b270 src/driver.rs::take_floor
 spec 022f3f9b64d1 src/driver.rs::descending
 spec ed2cd9830c07 src/driver.rs::group_into
 spec 70d5b0f602c9 src/driver.rs::clamp_spec
+spec b4c705ef82d3 src/driver.rs::marks_lowered
 spec c5c8e113698e src/driver.rs::floor_ok
 spec eac4e894af9e src/driver.rs::resynced
 spec fa73b02c50d9 src/driver.rs::recovered
