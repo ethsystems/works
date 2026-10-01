@@ -230,7 +230,11 @@ pub struct Flusher<V: Vfs + Send + 'static> {
 
 impl<V: Vfs + Send + 'static> Flusher<V> {
     /// Spawns the background fsync thread over an opened store.
+    ///
+    /// `queue_depth` is the number of jobs admitted before an offer blocks. A depth of 0
+    /// counts as 1, since no slot would ever free up for the first job.
     pub fn spawn(store: SnapshotStore<V>, queue_depth: usize) -> Self {
+        let queue_depth = queue_depth.max(1);
         let (sender, receiver) = mpsc::sync_channel::<Job>(queue_depth);
         let shared = Arc::new(Shared::new(queue_depth, store.durable_cursor()));
         let thread_shared = Arc::clone(&shared);
@@ -669,6 +673,27 @@ mod tests {
         assert_eq!(first.wait(), Ok(()));
         let second = handle.join().unwrap().unwrap();
         assert_eq!(second.wait(), Ok(()));
+    }
+
+    #[test]
+    fn queue_depth_zero_admits_a_job() {
+        // given a flusher spawned with queue_depth 0
+        let (store, _) = SnapshotStore::open(
+            config(PathBuf::from("/flusher-zero"), 1),
+            CrashVfs::new(),
+        )
+        .unwrap();
+        let flusher = Flusher::spawn(store, 0);
+        // when a first job is submitted from another thread
+        let (done_tx, done_rx) = mpsc::channel();
+        thread::spawn(move || {
+            let token = flusher
+                .submit(b"first".to_vec(), Some(Position::new(1, 0)))
+                .unwrap();
+            done_tx.send(token.wait()).unwrap();
+        });
+        // then it commits instead of blocking forever
+        assert_eq!(done_rx.recv_timeout(Duration::from_secs(5)), Ok(Ok(())));
     }
 
     #[test]
