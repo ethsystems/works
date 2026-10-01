@@ -1,6 +1,6 @@
 # Checked by .github/scripts/verus-gates.py; regenerate it with `--update` (see there).
 # tcb and spec lines: hash of the normalized text, then the item. fn lines: from Verus.
-verified 360
+verified 361
 fn exec chainfold::batch::Batch::blocks_within
 fn exec chainfold::batch::Batch::clear
 fn exec chainfold::batch::Batch::clone
@@ -191,6 +191,7 @@ fn proof chainfold::driver::lemma_kept_none
 fn proof chainfold::driver::lemma_lost_moved
 fn proof chainfold::driver::lemma_one_view_sub
 fn proof chainfold::driver::lemma_parent
+fn proof chainfold::driver::lemma_parent_hash
 fn proof chainfold::driver::lemma_poll_t7
 fn proof chainfold::driver::lemma_push_desc
 fn proof chainfold::driver::lemma_push_desc_indices
@@ -516,8 +517,8 @@ spec d131dfa1840f src/driver.rs::Driver::poll_apply
 spec e20d0687fd4f src/driver.rs::Driver::scan
 spec 33a9880643b2 src/driver.rs::Driver::ring_agrees
 spec ea4a2f04450b src/driver.rs::Driver::next_block
-spec 4b87042ed1f8 src/driver.rs::Driver::above_tip
-spec 72bb872468af src/driver.rs::Driver::cursor_walk
+spec d5d338a68ddd src/driver.rs::Driver::above_tip
+spec 9d25d7e737cb src/driver.rs::Driver::cursor_walk
 spec ccd3449dabb4 src/driver.rs::Driver::resuming
 spec e2f66518c0ca src/driver.rs::Driver::cursor_block
 spec f58160041e4b src/driver.rs::Driver::walk
@@ -549,12 +550,16 @@ spec 7cb534cb7fbe src/driver.rs::kept
 spec b838a3490b76 src/driver.rs::fkept
 spec fe1dc9ecdfc8 src/driver.rs::walked
 spec 6cb3378adb3f src/driver.rs::scanned
-spec 6dc42da035e1 src/driver.rs::scan_view
-spec d25ceb300e9d src/driver.rs::anchored
+spec 3fdd69e39399 src/driver.rs::scan_view
+spec ca1fe1ac8dc9 src/driver.rs::anchored
+spec 77ae3df7520a src/driver.rs::parent_hash
+spec a4f234881257 src/driver.rs::lemma_parent_hash
+spec 3b67d4e9c517 src/driver.rs::pa
+spec 51c8cf8fe08d src/driver.rs::pa_done
 spec ed51b2a243f2 src/driver.rs::views_ok
 spec 77cc5c44941a src/driver.rs::mark_ok
 spec ae06d4926182 src/driver.rs::mark_vouched
-spec a67e40e80698 src/driver.rs::mark_seen
+spec ff3e4d265662 src/driver.rs::mark_seen
 spec 6d3355f85e81 src/driver.rs::carries
 spec 13cf9f9e0d77 src/driver.rs::no_aba
 spec 1faa90f9766b src/driver.rs::from_start
@@ -574,15 +579,15 @@ spec c257faeaa987 src/driver.rs::lemma_wins_bounds
 spec 23714cb7aec1 src/driver.rs::lemma_walk_empty
 spec de6911d4422b src/driver.rs::lemma_floor
 spec 08a2d8cf6af6 src/driver.rs::lemma_walk_core
-spec 9d4f1dbf3c0b src/driver.rs::lemma_rung_walk
-spec 2f85f28b9c5c src/driver.rs::lemma_rung_gap
+spec dab164de188b src/driver.rs::lemma_rung_walk
+spec fa7b1c5d5422 src/driver.rs::lemma_rung_gap
 spec 14ad5e645ba2 src/driver.rs::lemma_rung_same
 spec d267e8f9c624 src/driver.rs::lemma_parent
 spec 565bb8ecd2f0 src/driver.rs::lemma_carries
-spec 9f2d843d0170 src/driver.rs::lemma_rung_next
-spec ac25759e0794 src/driver.rs::lemma_tip_view
+spec 1fc03fb07eda src/driver.rs::lemma_rung_next
+spec 0e9271dfdf49 src/driver.rs::lemma_tip_view
 spec 4d53aeae794f src/driver.rs::lemma_anchor
-spec 84806bac13b6 src/driver.rs::lemma_tip_step
+spec 6c0815fafb86 src/driver.rs::lemma_tip_step
 spec 85d12453a9c3 src/driver.rs::lemma_triples_ignore_boundary
 spec f14419ef3938 src/driver.rs::horizon_refused
 spec 49846cefc37f src/driver.rs::snapshot_due
