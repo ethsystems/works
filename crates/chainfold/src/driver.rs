@@ -863,7 +863,8 @@ where
                 sview_log::<S>(&old(self).source).len() as int,
             ),
             r is Behind ==> final(self).engine_view() == old(self).engine_view() && final(self).tip_view()
-                == old(self).tip_view() && exists|hd: Head| #[trigger] behind(
+                == old(self).tip_view() && final(self).tip_end_view() == old(self).tip_end_view()
+                && exists|hd: Head| #[trigger] behind(
                 hd,
                 old(self).tip_view(),
                 old(self).engine_view().cursor,
@@ -936,7 +937,8 @@ where
                 sview_log::<S>(&old(self).source).len() as int,
             ),
             r is Behind ==> final(self).engine_view() == old(self).engine_view() && final(self).tip_view()
-                == old(self).tip_view() && exists|hd: Head| #[trigger] behind(
+                == old(self).tip_view() && final(self).tip_end_view() == old(self).tip_end_view()
+                && exists|hd: Head| #[trigger] behind(
                 hd,
                 old(self).tip_view(),
                 old(self).engine_view().cursor,
@@ -2252,7 +2254,8 @@ where
                 old(self).source_log().len() as int,
             ),
             r is Behind ==> final(self).engine_view() == old(self).engine_view() && final(self).tip_view()
-                == old(self).tip_view() && exists|hd: Head| #[trigger] behind(
+                == old(self).tip_view() && final(self).tip_end_view() == old(self).tip_end_view()
+                && exists|hd: Head| #[trigger] behind(
                 hd,
                 old(self).tip_view(),
                 old(self).engine_view().cursor,
@@ -6567,6 +6570,15 @@ impl<F: Fold, S: Source<Event = F::Event>, K: SnapshotSink<F>> Driver<F, S, K> {
     pub closed spec fn tip_view(&self) -> Option<BlockRef> {
         match self.tip {
             Some(m) => Some(m.at),
+            None => None,
+        }
+    }
+
+    /// The last block the scan tip covers; below the tip's head when a walk was cut at
+    /// its cap.
+    pub closed spec fn tip_end_view(&self) -> Option<u64> {
+        match self.tip {
+            Some(m) => Some(m.done),
             None => None,
         }
     }
