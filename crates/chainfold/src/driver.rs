@@ -541,7 +541,10 @@ where
     /// True once the most recent applied poll read up to the head and found nothing new;
     /// a `Behind` or `SourceError` tick leaves it as it was, and a `Terminal` tick clears
     /// it.
-    #[cfg_attr(verus_keep_ghost, verus_verify)]
+    #[cfg_attr(verus_keep_ghost, verus_spec(r =>
+        ensures
+            r == self.caught_up_view(),
+    ))]
     pub fn is_caught_up(&self) -> bool {
         self.caught_up
     }
@@ -866,6 +869,9 @@ where
                 sview_log::<S>(&final(self).source),
                 sview_log::<S>(&old(self).source).len() as int,
             ),
+            r is Idle ==> final(self).caught_up_view(),
+            r is Progressed || r is RolledBack || r is Resynced || r is Terminal ==> !final(self).caught_up_view(),
+            r is Behind || r is SourceError ==> final(self).caught_up_view() == old(self).caught_up_view(),
             r is Behind ==> final(self).engine_view() == old(self).engine_view() && final(self).tip_view()
                 == old(self).tip_view() && final(self).tip_end_view() == old(self).tip_end_view()
                 && exists|hd: Head| #[trigger] behind(
@@ -938,6 +944,9 @@ where
                 sview_log::<S>(&final(self).source),
                 sview_log::<S>(&old(self).source).len() as int,
             ),
+            r is Idle ==> final(self).caught_up_view(),
+            r is Progressed || r is RolledBack || r is Resynced || r is Terminal ==> !final(self).caught_up_view(),
+            r is Behind || r is SourceError ==> final(self).caught_up_view() == old(self).caught_up_view(),
             r is Behind ==> final(self).engine_view() == old(self).engine_view() && final(self).tip_view()
                 == old(self).tip_view() && final(self).tip_end_view() == old(self).tip_end_view()
                 && exists|hd: Head| #[trigger] behind(
@@ -978,6 +987,7 @@ where
                     #[trigger] old(self).dinv(log, h) implies t7_tick(*old(self), *self, Tick::Behind, log, h) by {
                     assert(self.dinv(log, h));
                 }
+                assert(self.caught_up_view() == old(self).caught_up_view());
             }
             return Tick::Behind;
         }
@@ -990,6 +1000,7 @@ where
                     #[trigger] old(self).dinv(log, h) implies t7_tick(*old(self), *self, Tick::SourceError, log, h) by {
                     assert(self.dinv(log, h));
                 }
+                assert(self.caught_up_view() == old(self).caught_up_view());
             }
             return Tick::SourceError;
         }
@@ -1159,6 +1170,9 @@ where
                 #[cfg(verus_keep_ghost)]
                 proof! {
                     lemma_recover_t7(*old(self), pre, *self, tick);
+                    if tick is SourceError {
+                        assert(self.caught_up_view() == old(self).caught_up_view());
+                    }
                     if tick is Resynced {
                         self.engine.lemma_wf();
                         lemma_fresh_dinv::<F, S, F::Event, F::Error>(
@@ -2255,6 +2269,9 @@ where
                 final(self).source_log(),
                 old(self).source_log().len() as int,
             ),
+            r is Idle ==> final(self).caught_up_view(),
+            r is Progressed || r is RolledBack || r is Resynced || r is Terminal ==> !final(self).caught_up_view(),
+            r is Behind || r is SourceError ==> final(self).caught_up_view() == old(self).caught_up_view(),
             r is Behind ==> final(self).engine_view() == old(self).engine_view() && final(self).tip_view()
                 == old(self).tip_view() && final(self).tip_end_view() == old(self).tip_end_view()
                 && exists|hd: Head| #[trigger] behind(
@@ -5087,6 +5104,31 @@ mod tests {
             driver.engine().fold().applied,
             vec![(Position::new(10, 0), 11)]
         );
+    }
+
+    #[test]
+    fn a_lagging_or_failed_poll_does_not_report_caught_up() {
+        // given a driver on node a that has just folded a new block's event, so it is not
+        // caught up; node b is a without that block
+        let mut driver = pool_driver(&[]);
+        run_to_idle(&mut driver);
+        driver.source.b = driver.source.a.clone();
+        driver.source.a.push_block(&[7]);
+        let progressed = driver.tick();
+        assert!(matches!(progressed, Tick::Progressed(_)));
+        assert!(!driver.is_caught_up());
+        // when the next head call goes to b
+        driver.source.route = b"B".to_vec();
+        let lagging = driver.tick();
+        // and the poll after that fails
+        driver.source.route.clear();
+        driver.source.a.fail_next_polls(1);
+        let failed = driver.tick();
+        // then neither the lagging head nor the failure reports the driver caught up
+        assert_eq!(lagging, Tick::Behind);
+        assert_eq!(failed, Tick::SourceError);
+        assert!(!driver.is_caught_up());
+        assert!(!driver.status().caught_up);
     }
 
     #[test]
