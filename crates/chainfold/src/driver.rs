@@ -1946,8 +1946,8 @@ where
     /// entry above the floor into the batch. With `floor`, the floor is block `from` itself:
     /// its entries are dropped and the first answer's header for it is returned. Also
     /// returns the windows read, capped at 2, and whether the last one reached `hi`.
-    /// `Ok(None)` when an answer holds an entry outside its window; the batch is then
-    /// empty.
+    /// `Ok(None)` when an answer holds an entry outside its window, or two headers at the
+    /// floor; the batch is then empty.
     #[cfg_attr(verus_keep_ghost, verus_spec(r =>
         requires
             old(self).wf(),
@@ -2106,6 +2106,10 @@ where
             if floor && reads == 0 {
                 let (floor_at, below) = take_floor(&mut self.scratch, next);
                 if below {
+                    #[cfg(verus_keep_ghost)]
+                    proof! {
+                        lemma_floor::<S, S::Event>(v, next, to, got, self.scratch@);
+                    }
                     return Ok(None);
                 }
                 at = floor_at;
@@ -2432,7 +2436,8 @@ fn capped(from: u64, hi: u64, span: u64, window: u64) -> u64 {
 }
 
 /// Drops the entries at or below block `floor`, in place and out of order, and returns the
-/// header one of them carried at `floor`, and whether one lay below `floor`.
+/// header one of them carried at `floor`, and whether the answer is refused: one lay below
+/// `floor`, or two carried different headers at it.
 #[cfg_attr(verus_keep_ghost, verus_verify)]
 #[cfg_attr(verus_keep_ghost, verus_spec(r =>
     ensures
@@ -2442,8 +2447,17 @@ fn capped(from: u64, hi: u64, span: u64, window: u64) -> u64 {
             0 <= i < old(entries)@.len() && #[trigger] old(entries)@[i].0 == b,
         r.0 is None ==> forall|i: int| 0 <= i < old(entries)@.len() ==> #[trigger] old(entries)@[i].0.number != floor,
         !r.1 ==> forall|i: int| 0 <= i < old(entries)@.len() ==> (#[trigger] old(entries)@[i]).0.number >= floor,
-        r.1 ==> exists|i: int| 0 <= i < old(entries)@.len() && (#[trigger] old(entries)@[i]).0.number < floor,
+        !r.1 ==> (r.0 matches Some(b) ==> forall|i: int|
+            0 <= i < old(entries)@.len() && (#[trigger] old(entries)@[i]).0.number == floor ==> old(entries)@[i].0 == b),
+        r.1 ==> (exists|i: int| 0 <= i < old(entries)@.len() && (#[trigger] old(entries)@[i]).0.number < floor) || exists|
+            i: int,
+            j: int,
+        |
+            0 <= i < old(entries)@.len() && 0 <= j < old(entries)@.len() && (#[trigger] old(entries)@[i]).0.number
+                == floor && (#[trigger] old(entries)@[j]).0.number == floor && old(entries)@[i].0 != old(entries)@[j].0,
 ))]
+// A nested `if let`, not a `let` chain: Verus does not take `let` chains.
+#[allow(clippy::collapsible_if)]
 fn take_floor<E>(
     entries: &mut Vec<(BlockRef, u32, E)>,
     floor: u64,
@@ -2471,7 +2485,11 @@ fn take_floor<E>(
             at matches Some(b) ==> b.number == floor && exists|j: int| i <= j < s.len() && #[trigger] s[j].0 == b,
             at is None ==> forall|j: int| i <= j < s.len() ==> #[trigger] s[j].0.number != floor,
             !below ==> forall|j: int| i <= j < s.len() ==> (#[trigger] s[j]).0.number >= floor,
-            below ==> exists|j: int| i <= j < s.len() && (#[trigger] s[j]).0.number < floor,
+            !below ==> (at matches Some(b) ==> forall|j: int|
+                i <= j < s.len() && (#[trigger] s[j]).0.number == floor ==> s[j].0 == b),
+            below ==> (exists|j: int| i <= j < s.len() && (#[trigger] s[j]).0.number < floor) || exists|j: int, k: int|
+                i <= j < s.len() && i <= k < s.len() && (#[trigger] s[j]).0.number == floor && (#[trigger] s[k]).0.number
+                    == floor && s[j].0 != s[k].0,
         decreases i,
     ))]
     while i > 0 {
@@ -2479,6 +2497,12 @@ fn take_floor<E>(
         if entries[i].0.number <= floor {
             let block = entries[i].0;
             if block.number == floor {
+                // Two headers at the floor are two blocks at one height in one answer.
+                if let Some(seen) = at {
+                    if seen != block {
+                        below = true;
+                    }
+                }
                 at = Some(block);
             } else {
                 below = true;
@@ -2928,6 +2952,59 @@ mod tests {
             } else {
                 (false, &mut self.a)
             }
+        }
+    }
+
+    /// Node a, with node b's logs added to every range b holds, listed after a's or
+    /// first.
+    struct Merge {
+        a: ScriptedChain,
+        b: ScriptedChain,
+        merge: bool,
+        b_first: bool,
+    }
+
+    impl Source for Merge {
+        type Event = u64;
+        type Error = PollFailure;
+
+        fn head(&mut self) -> Result<Head, PollFailure> {
+            self.a.head()
+        }
+
+        fn header_at(&mut self, number: u64) -> Result<Option<BlockRef>, PollFailure> {
+            self.a.header_at(number)
+        }
+
+        fn events_in(
+            &mut self,
+            from: u64,
+            to: u64,
+            out: &mut Vec<(BlockRef, u32, u64)>,
+        ) -> Result<(), PollFailure> {
+            let top = self.b.tip().map_or(0, |tip| tip.number);
+            if !self.merge || to > top {
+                return self.a.events_in(from, to, out);
+            }
+            if self.b_first {
+                self.b.events_in(from, to, out)?;
+                self.a.events_in(from, to, out)
+            } else {
+                self.a.events_in(from, to, out)?;
+                self.b.events_in(from, to, out)
+            }
+        }
+
+        fn events_at(
+            &mut self,
+            block: &BlockRef,
+            out: &mut Vec<(BlockRef, u32, u64)>,
+        ) -> Result<(), PollFailure> {
+            self.a.events_at(block, out)
+        }
+
+        fn window(&self) -> u64 {
+            self.a.window()
         }
     }
 
@@ -5129,6 +5206,53 @@ mod tests {
         assert_eq!(failed, Tick::SourceError);
         assert!(!driver.is_caught_up());
         assert!(!driver.status().caught_up);
+    }
+
+    #[test]
+    fn a_second_hash_at_the_cursor_block_is_refused() {
+        for b_first in [false, true] {
+            // given a driver caught up on node a, blocks 0..=9 with events at 0 and 1, so
+            // the cursor is block 1; node b shares block 0, then holds 1' and 2' [666]
+            let mut base = ScriptedChain::new(0);
+            base.push_block(&[10]);
+            let mut a = base.clone();
+            a.push_block(&[11]);
+            let mut b = base.clone();
+            // A push that a reorg drops, so `b`'s blocks from 1 get other hashes than `a`'s.
+            b.push_block(&[]);
+            b.reorg(1, &[&[99], &[666]]);
+            for _ in 2..=9 {
+                a.push_block(&[]);
+            }
+            assert_ne!(a.header(1), b.header(1));
+            a.set_window(2);
+            let source = Merge {
+                a,
+                b,
+                merge: false,
+                b_first,
+            };
+            let mut driver = Driver::new(
+                RecordingFold::default(),
+                source,
+                engine_config(2),
+                DriverConfig::from_block(0),
+            )
+            .unwrap();
+            run_to_idle(&mut driver);
+            assert_eq!(driver.engine().cursor().map(|c| c.block), Some(1));
+            let before = driver.engine().fold().clone();
+            // when one answer holds both nodes' logs for blocks 1 and 2
+            driver.source_mut().merge = true;
+            driver.source.a.push_block(&[]);
+            let merged = driver.tick();
+            // then the answer is refused, and node b's events are not folded
+            assert_eq!(merged, Tick::SourceError);
+            assert_eq!(driver.engine().fold(), &before);
+            driver.source.merge = false;
+            run_to_idle(&mut driver);
+            assert_eq!(driver.engine().fold(), &before);
+        }
     }
 
     #[test]

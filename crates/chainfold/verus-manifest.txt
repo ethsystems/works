@@ -524,7 +524,7 @@ spec 420d850dd60c src/driver.rs::Driver::status
 spec 9c80f78786c8 src/driver.rs::all_in
 spec 88f30a0d6a49 src/driver.rs::walk_calls
 spec c415fd3a769c src/driver.rs::capped
-spec 4215bf35e4c0 src/driver.rs::take_floor
+spec 6fc523bc320f src/driver.rs::take_floor
 spec 022f3f9b64d1 src/driver.rs::descending
 spec ed2cd9830c07 src/driver.rs::group_into
 spec 70d5b0f602c9 src/driver.rs::clamp_spec
