@@ -1025,6 +1025,12 @@ where
             }
             return tick;
         }
+        #[cfg(verus_keep_ghost)]
+        proof_decl! {
+            let tracked mut seen = Ghost(arbitrary::<Head>());
+        }
+        #[cfg(verus_keep_ghost)]
+        proof_with! {Tracked(&mut seen)}
         let read = self.scan();
         if matches!(read, Ok(Scan::Behind)) {
             self.consecutive_errors = 0;
@@ -1266,8 +1272,10 @@ where
     // to holds nothing left to fold above the cursor up to it (A1), so a view that holds
     // the tip needs no events or boundary read below it. Every walk ends by reading the
     // head block again, so under no ABA every call between the two reads saw the head's
-    // chain.
+    // chain. `seen` is the head the source answered.
     #[cfg_attr(verus_keep_ghost, verus_spec(r =>
+        with
+            Tracked(seen): Tracked<&mut Ghost<Head>>,
         requires
             old(self).wf(),
         ensures
@@ -1293,12 +1301,12 @@ where
                 &&& infallible::<S>(&old(self).source) ==> r is Ok && infallible::<S>(&final(self).source)
                 &&& r matches Ok(Scan::Moved) ==> moved(hist, l0)
                 &&& r matches Ok(Scan::Behind) ==> final(self).batch@.ends.len() == 0
-                    && final(self).batch@.boundary is None && exists|hd: Head| #[trigger] behind(
-                    hd,
+                    && final(self).batch@.boundary is None && behind(
+                    (*final(seen))@,
                     old(self).tip_view(),
                     old(self).engine@.cursor,
                     old(self).engine@.ring,
-                ) && head_read(hist[l0], hd)
+                ) && head_read(hist[l0], (*final(seen))@)
                 &&& r matches Ok(Scan::Batch { .. }) ==> shaped_at(final(self).batch@, old(self).engine@.cursor)
                 &&& r matches Ok(Scan::Batch { .. }) ==> boundary_read(
                     hist,
@@ -1342,6 +1350,7 @@ where
             let ghost h1 = sview_log::<S>(&self.source);
             lemma_grew_next::<S, S::Event>(sview_log::<S>(&old(self).source), h1);
             assert(header(h1[l0], head.block.number) == Some(head.block));
+            *seen = Ghost(head);
         }
         if let Some(tip) = tip {
             let full = tip.done == tip.at.number;
@@ -1422,10 +1431,6 @@ where
             None => false,
         };
         if (below_tip || below_cursor) && self.ring_agrees(head) {
-            #[cfg(verus_keep_ghost)]
-            proof! {
-                assert(behind(head, self.tip_view(), cursor, self.engine@.ring));
-            }
             return Ok(Scan::Behind);
         }
         #[cfg(verus_keep_ghost)]
@@ -5561,6 +5566,27 @@ mod tests {
             driver.engine().fold().applied,
             vec![(Position::new(0, 0), 1), (Position::new(2, 0), 9)]
         );
+    }
+
+    #[test]
+    fn a_head_at_the_cursor_block_without_a_tip_is_not_behind() {
+        // given a driver at the tip of blocks 0..=5, events at 0 and 5, so the cursor is the
+        // head block 5, and an engine_mut call that clears the tip
+        let mut chain = ScriptedChain::new(0);
+        chain.push_block(&[1]);
+        for _ in 1..5 {
+            chain.push_block(&[]);
+        }
+        chain.push_block(&[5]);
+        let mut driver = new_driver(chain, engine_config(2), DriverConfig::from_block(0));
+        run_to_idle(&mut driver);
+        assert_eq!(driver.engine().cursor(), Some(Position::new(5, 0)));
+        driver.engine_mut();
+        // when polled with the head still at the cursor block
+        let tick = driver.tick();
+        // then the head is not taken as a lagging node: the driver is caught up
+        assert_eq!(tick, Tick::Idle);
+        assert!(driver.is_caught_up());
     }
 
     #[test]

@@ -513,7 +513,7 @@ spec 460f2c103d7b src/driver.rs::Driver::reconcile_reset
 spec 9ba9a901eb78 src/driver.rs::Driver::reconcile_reset_slow
 spec 3603f0136232 src/driver.rs::Driver::step
 spec d131dfa1840f src/driver.rs::Driver::poll_apply
-spec 01f6c059ea42 src/driver.rs::Driver::scan
+spec e20d0687fd4f src/driver.rs::Driver::scan
 spec 33a9880643b2 src/driver.rs::Driver::ring_agrees
 spec ea4a2f04450b src/driver.rs::Driver::next_block
 spec 4b87042ed1f8 src/driver.rs::Driver::above_tip
