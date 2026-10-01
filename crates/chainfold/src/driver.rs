@@ -298,6 +298,10 @@ where
     /// `genesis` is the fold a resync restarts from, so it is empty state rather than
     /// the recovered state.
     ///
+    /// With `checkpoint_interval` set, an engine that has a cursor and no live checkpoint,
+    /// such as a decoded snapshot, takes one at its cursor here. A reorg of the blocks
+    /// the first ticks read then rolls back to it rather than resyncing.
+    ///
     /// The proved end-to-end claim (T7 in the README) covers the resumed driver when the
     /// engine is `Active`, its fold is the fold of the source chain's events through its
     /// cursor, that cursor ends its block in the chain, and its ring names blocks of the
@@ -308,7 +312,7 @@ where
         requires
             engine.wf(),
         ensures
-            r matches Ok(d) ==> d.wf() && d.synced() && d.engine_view() == engine@ && d.durable_ok(),
+            r matches Ok(d) ==> d.wf() && d.synced() && d.engine_view() == resumed(engine@, config) && d.durable_ok(),
             r matches Ok(d) ==> forall|log: Seq<(Position, F::Event)>, h: ChainView|
                 #[trigger] dinv::<F, S, F::Event, F::Error>(engine@, fview::<F>(&genesis), config.start_block, log, h)
                     ==> d.dinv(log, h),
@@ -369,7 +373,7 @@ where
         requires
             engine.wf(),
         ensures
-            r matches Ok(d) ==> d.wf() && d.synced() && d.engine_view() == engine@
+            r matches Ok(d) ==> d.wf() && d.synced() && d.engine_view() == resumed(engine@, config)
                 && (floor_ok(sink_offered::<K>(&sink), engine@) ==> d.durable_ok()),
             r matches Ok(d) ==> forall|log: Seq<(Position, F::Event)>, h: ChainView|
                 #[trigger] dinv::<F, S, F::Event, F::Error>(engine@, fview::<F>(&genesis), config.start_block, log, h)
@@ -424,12 +428,20 @@ where
             r matches Ok(d) ==> {
                 &&& d.wf()
                 &&& d.synced()
-                &&& d.engine == engine
+                &&& d.engine@ == resumed(engine@, driver_config)
                 &&& d.source == source
                 &&& d.initial == initial
                 &&& d.config == driver_config
                 &&& d.batch@.ends.len() == 0 && d.batch@.boundary is None
-                &&& d.last_checkpoint_block is None && d.last_snapshot_block is None
+                &&& d.last_checkpoint_block == if resume_checkpoint(engine@, driver_config) {
+                    Some(engine@.cursor.unwrap().block)
+                } else {
+                    None
+                }
+                &&& d.last_snapshot_block is None
+                &&& forall|log: Seq<(Position, F::Event)>, h: ChainView|
+                    #[trigger] dinv::<F, S, F::Event, F::Error>(engine@, fview::<F>(&initial), driver_config.start_block, log, h)
+                        ==> dinv::<F, S, F::Event, F::Error>(d.engine@, fview::<F>(&initial), driver_config.start_block, log, h)
                 &&& !d.durability_lost && !d.caught_up && d.consecutive_errors == 0 && d.tip is None
                 // `durable_ok` holds when the sink was reset, else when it offered
                 // nothing past the engine's state.
@@ -458,7 +470,7 @@ where
             sink.reset();
         }
         let seen_resets = engine.resets();
-        Ok(Self {
+        let mut driver = Self {
             engine,
             source,
             sink,
@@ -476,7 +488,35 @@ where
             seen_resets,
             tip: None,
             span: MAX_SPAN,
-        })
+        };
+        // A decoded engine holds no checkpoint, so a reorg of the blocks read after a
+        // restart would resync. One at the cursor lets it roll back there.
+        if driver.config.checkpoint_interval.is_some()
+            && driver.engine.cursor().is_some()
+            && driver.engine.checkpoint_count() == 0
+        {
+            #[cfg(verus_keep_ghost)]
+            proof_decl! {
+                let ghost pre = driver.engine@;
+                driver.engine.lemma_wf();
+            }
+            driver.run_checkpoint();
+            #[cfg(verus_keep_ghost)]
+            proof! {
+                assert forall|log: Seq<(Position, F::Event)>, h: ChainView|
+                    #[trigger] dinv::<F, S, F::Event, F::Error>(pre, fview::<F>(&driver.initial), driver.config.start_block, log, h)
+                        implies dinv::<F, S, F::Event, F::Error>(
+                        driver.engine@,
+                        fview::<F>(&driver.initial),
+                        driver.config.start_block,
+                        log,
+                        h,
+                    ) by {
+                    lemma_checkpoint_dinv::<F, S, F::Event, F::Error>(pre, fview::<F>(&driver.initial), driver.config.start_block, log, h);
+                }
+            }
+        }
+        Ok(driver)
     }
 }
 
@@ -5387,6 +5427,48 @@ mod tests {
         assert_folded_once(resumed.engine().fold());
     }
 
+    #[cfg(feature = "wincode")]
+    #[test]
+    fn a_reorg_of_the_head_right_after_a_restart_rolls_back() {
+        // given a driver at the defaults over a 500-block window, synced over 5,000
+        // one-event blocks and then 300 more read one block a poll
+        let mut chain = ScriptedChain::new(1);
+        chain.set_window(500);
+        for value in 1..=5_000u64 {
+            chain.push_block(&[value]);
+        }
+        let mut driver =
+            new_driver(chain, EngineConfig::default(), DriverConfig::from_block(1));
+        run_to_idle(&mut driver);
+        for value in 5_001..=5_300u64 {
+            driver.source.push_block(&[value]);
+            run_to_idle(&mut driver);
+        }
+        // when it restarts from its durable snapshot, its oldest checkpoint, and reads
+        // back to the head
+        let mut bytes = Vec::new();
+        let point = driver.engine().encode_durable_snapshot(&mut bytes).unwrap();
+        assert_eq!(point, Some(Position::new(5_055, 0)));
+        let engine = Engine::decode_snapshot(&bytes, EngineConfig::default()).unwrap();
+        let mut resumed = Driver::resume(
+            engine,
+            driver.source.clone(),
+            RecordingFold::default(),
+            DriverConfig::from_block(1),
+        )
+        .unwrap();
+        run_to_idle(&mut resumed);
+        // then a reorg of the head block rolls back to the restored cursor, not to the
+        // start block
+        resumed.source.reorg(1, &[&[5_300]]);
+        assert_eq!(
+            resumed.tick(),
+            Tick::RolledBack {
+                to: Some(Position::new(5_055, 0))
+            }
+        );
+    }
+
     #[test]
     fn a_partial_block_fed_before_resume_is_folded_once() {
         // given an engine fed blocks 1..=9 and the first event of block 10
@@ -5880,6 +5962,23 @@ pub open spec fn due_spec(last: Option<u64>, block: u64, interval: u64) -> bool 
     match last {
         Some(l) => block >= l.saturating_add(interval),
         None => true,
+    }
+}
+
+/// A driver built around engine `e` takes a checkpoint: checkpoints are on, and `e` has a
+/// cursor and no live checkpoint.
+pub open spec fn resume_checkpoint(e: EngineView, c: DriverConfig) -> bool {
+    &&& c.checkpoint_interval is Some
+    &&& e.cursor is Some
+    &&& live_count(e.slots, e.ring, e.slots.len() as int) == 0
+}
+
+/// The engine a driver built around engine `e` holds.
+pub open spec fn resumed(e: EngineView, c: DriverConfig) -> EngineView {
+    if resume_checkpoint(e, c) {
+        checkpointed(e)
+    } else {
+        e
     }
 }
 

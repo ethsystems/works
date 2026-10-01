@@ -492,11 +492,11 @@ spec d7869691e79c src/driver.rs::due
 spec 91bcbf557d85 src/driver.rs::clamp
 spec 749b1c08c305 src/driver.rs::DriverStatus::is_terminal
 spec 71fef1995e03 src/driver.rs::Driver::new
-spec f77e516aadfb src/driver.rs::Driver::resume
+spec 17dd3f4b7ff3 src/driver.rs::Driver::resume
 spec bdea1a067e82 src/driver.rs::Driver::with_sink
-spec f3bbb76f709a src/driver.rs::Driver::resume_with_sink
+spec 7cb786e21e1b src/driver.rs::Driver::resume_with_sink
 spec 989f3fb62e8b src/driver.rs::Driver::build
-spec c44c7fd42ea7 src/driver.rs::Driver::around
+spec 628c344eb68f src/driver.rs::Driver::around
 spec d031062247f1 src/driver.rs::Driver::engine
 spec 48378bad1f06 src/driver.rs::Driver::engine_mut
 spec 6c7514319c8b src/driver.rs::Driver::source_mut
@@ -538,6 +538,8 @@ spec eac4e894af9e src/driver.rs::resynced
 spec fa73b02c50d9 src/driver.rs::recovered
 spec e365ca34ec86 src/driver.rs::rolled_back
 spec d10a1aafbd53 src/driver.rs::due_spec
+spec b936a2de862e src/driver.rs::resume_checkpoint
+spec 7c1033d09594 src/driver.rs::resumed
 spec c4ec99a8e050 src/driver.rs::checkpointed
 spec cbaf986c0230 src/driver.rs::scan_floor
 spec c39b050fcbde src/driver.rs::scan_windows
