@@ -1263,8 +1263,9 @@ where
     /// lags the tip or the cursor block; the batch is then empty. Every result but a batch
     /// keeps the tip.
     ///
-    /// Cheapest first: a head equal to the tip is one call; a head whose parent is the tip
-    /// reads its own block by hash; a gap past the tip, when that costs fewer calls than
+    /// Cheapest first: a head equal to the tip is one call; a head whose parent is the tip,
+    /// or a sibling of the tip above the cursor block, reads its own block by hash; a gap
+    /// past the tip, when that costs fewer calls than
     /// the cursor walk, reads above the tip and then the tip; otherwise the walk starts at
     /// the cursor block, whose header the first answer carries. A walk reads at most `span`
     /// windows; one cut there with nothing found leaves a tip short of its head, and the
@@ -1389,8 +1390,13 @@ where
                 }
                 lemma_parent_hash(head);
             }
-            if parent && full {
-                if self.next_block(head)? {
+            // A full tip's sibling differs from the tip's chain only in its own block, so
+            // above the cursor block it too needs only that block.
+            if full && (parent || sibling(&tip, &head) && from < head.block.number) {
+                #[cfg(verus_keep_ghost)]
+                proof_with! {Ghost(tip)}
+                let taken = self.next_block(head)?;
+                if taken {
                     return Ok(Scan::Batch { capped: false });
                 }
             } else if tip.done < head.block.number
@@ -1505,11 +1511,14 @@ where
         true
     }
 
-    /// `scan` with the head one block on top of the tip: reads the head block by its hash,
+    /// `scan` with the head one block on top of the tip, or the tip's sibling: reads the
+    /// head block by its hash,
     /// and takes it only when every entry carries that hash. `Ok(false)` when some entry
     /// does not; the batch is then empty. The check catches a source that breaks A2 (ii) by
     /// answering another block's logs; T7 does not rest on it.
     #[cfg_attr(verus_keep_ghost, verus_spec(r =>
+        with
+            Ghost(tip): Ghost<Mark>,
         requires
             old(self).wf(),
             old(self).batch@.ends.len() == 0,
@@ -1518,6 +1527,12 @@ where
             header(sview_log::<S>(&old(self).source).last(), head.block.number) == Some(head.block),
             head.block.number > 0 ==> anc(head.block.hash, (head.block.number - 1) as u64).hash == head.parent,
             a1::<S, S::Event>(sview_log::<S>(&old(self).source).last()),
+            tip.done == tip.at.number,
+            (tip.at.hash == head.parent && tip.at.number + 1 == head.block.number) || (tip.up == head.parent
+                && tip.at.number == head.block.number && tip.at != head.block && tip.at.number >= 1 && scan_floor(
+                old(self).engine@.cursor,
+                old(self).config.start_block,
+            ) <= tip.at.number),
         ensures
             final(self).wf(),
             *final(self) == (Driver {
@@ -1536,17 +1551,15 @@ where
                 Some(_) => Some(old(self).engine@.ring.last()),
                 None => None,
             },
-            r matches Ok(true) ==> forall|tip: Mark|
-                tip.at.hash == head.parent && tip.at.number + 1 == head.block.number && tip.done == tip.at.number
-                    ==> #[trigger] scanned::<S, S::Event>(
-                    sview_log::<S>(&final(self).source),
-                    sview_log::<S>(&old(self).source).len() - 1,
-                    old(self).config.start_block,
-                    old(self).engine@.cursor,
-                    Some(tip),
-                    final(self).tip,
-                    final(self).batch@,
-                ),
+            r matches Ok(true) ==> scanned::<S, S::Event>(
+                sview_log::<S>(&final(self).source),
+                sview_log::<S>(&old(self).source).len() - 1,
+                old(self).config.start_block,
+                old(self).engine@.cursor,
+                Some(tip),
+                final(self).tip,
+                final(self).batch@,
+            ),
     ))]
     fn next_block(&mut self, head: Head) -> Result<bool, S::Error> {
         #[cfg(verus_keep_ghost)]
@@ -1590,13 +1603,10 @@ where
             crate::batch::lemma_batch_view(b0);
             crate::batch::lemma_batch_view(self.batch);
             lemma_triples_ignore_boundary(self.batch@, b0@, b0@.ends.len() as int);
-            assert forall|tip: Mark|
-                tip.at.hash == head.parent && tip.at.number + 1 == head.block.number && tip.done == tip.at.number
-                    implies #[trigger] scanned::<
-                S,
-                S::Event,
-            >(h2, l0, self.config.start_block, self.engine@.cursor, Some(tip), self.tip, self.batch@) by {
+            if tip.at.hash == head.parent && tip.at.number + 1 == head.block.number {
                 lemma_rung_next::<S, F::Event>(h2, l0, self.config.start_block, self.engine@.cursor, tip, self.batch@, head, got);
+            } else {
+                lemma_rung_sibling::<S, F::Event>(h2, l0, self.config.start_block, self.engine@.cursor, tip, self.batch@, head, got);
             }
         }
         Ok(true)
@@ -5886,6 +5896,91 @@ mod tests {
         assert_eq!(driver.engine().fold().applied, canonical_fold(chain));
     }
 
+    /// A pool over node a, block 0 with an event and then 20 empty blocks, two per window,
+    /// and node b, a with its last block replaced by `last` (or, with `deep`, its last two
+    /// by empty blocks), caught up on a.
+    fn sibling_pool(last: &[u64], deep: bool) -> Driver<RecordingFold, Pool> {
+        let mut a = ScriptedChain::new(0);
+        a.set_window(2);
+        a.push_block(&[1]);
+        for _ in 1..=20 {
+            a.push_block(&[]);
+        }
+        let mut b = a.clone();
+        if deep {
+            b.reorg(2, &[&[], &[]]);
+        } else {
+            b.reorg(1, &[last]);
+        }
+        let mut driver = Driver::new(
+            RecordingFold::default(),
+            Pool::new(a, b),
+            engine_config(2),
+            DriverConfig::from_block(0),
+        )
+        .unwrap();
+        run_to_idle(&mut driver);
+        driver
+    }
+
+    /// One tick with every call on node b.
+    fn b_tick(driver: &mut Driver<RecordingFold, Pool>) -> (Tick, u32) {
+        driver.source.route = [b'B'; 100].to_vec();
+        let tick = pool_tick(driver);
+        driver.source.route.clear();
+        tick
+    }
+
+    #[test]
+    fn sibling_heads_in_turn_read_only_the_head_block() {
+        // given a synced driver whose pool nodes hold sibling empty heads at block 20
+        let mut driver = sibling_pool(&[], false);
+        let canonical = pool_canonical(&driver);
+        for _ in 0..10 {
+            // when the head flips to b's sibling and back to a's
+            let to_b = b_tick(&mut driver);
+            let to_a = pool_tick(&mut driver);
+            // then each flip reads the head and the head block's logs, and the fold holds
+            assert_eq!(to_b, (Tick::Idle, 2));
+            assert_eq!(to_a, (Tick::Idle, 2));
+            assert_eq!(driver.engine().fold().applied, canonical);
+        }
+    }
+
+    #[test]
+    fn a_head_at_the_tip_height_off_its_parent_walks_from_the_cursor() {
+        // given a synced driver whose node b replaces a's last two blocks
+        let mut driver = sibling_pool(&[], true);
+        // when the head comes from b
+        let tick = b_tick(&mut driver);
+        // then the head is no sibling, and the walk reads the head, 11 windows from the
+        // cursor block and the head block's header
+        assert_eq!(tick, (Tick::Idle, 13));
+        assert_eq!(driver.engine().fold().applied, pool_canonical(&driver));
+    }
+
+    #[test]
+    fn a_sibling_of_a_folded_block_walks_from_the_cursor() {
+        // given a synced driver whose node b's sibling head carries an event
+        let mut driver = sibling_pool(&[7], false);
+        // when the head flips to b's sibling, which folds it, and back to a's
+        let to_b = b_tick(&mut driver);
+        assert!(
+            driver
+                .engine()
+                .fold()
+                .applied
+                .contains(&(Position::new(20, 0), 7))
+        );
+        let to_a = pool_tick(&mut driver);
+        // then the flip to b reads only the head block, and the flip back walks from the
+        // cursor block, which is the tip's, and rolls it back
+        assert_eq!(to_b.1, 2);
+        assert!(to_a.1 > 2);
+        run_to_idle(&mut driver);
+        assert_eq!(driver.engine().fold().applied, pool_canonical(&driver));
+    }
+
     #[test]
     fn a_head_at_a_partial_tips_height_off_its_parent_walks_from_the_cursor() {
         // given a driver caught up on block 1, then 64 empty blocks, one per window, and a
@@ -7123,6 +7218,66 @@ proof fn lemma_rung_next<S, E>(
             reveal(views_ok);
             assert(from_start(v0, start));
             lemma_parent::<S, E>(v0, hd, head.parent, tip.at, start);
+        }
+        assert(anchored(hist, l0, c, Some(tip), b.boundary, start, n));
+    }
+    assert(range_entries::<S, E>(v0, n, n - 1) =~= Seq::empty());
+    assert(scan_view::<S, E>(hist, l0, start, c, Some(tip), t1, b, (l0, hd, n, n, n, l0, n, false)));
+}
+
+/// `scan` with the head a full tip's sibling above the floor: the head's view `hist[l0]`
+/// holds the tip's parent, and `got`, the head block's entries read by hash, are that
+/// view's entries at the head.
+proof fn lemma_rung_sibling<S, E>(
+    hist: Seq<ChainView>,
+    l0: int,
+    start: u64,
+    c: Option<Position>,
+    tip: Mark,
+    b: BatchView<E>,
+    head: Head,
+    got: Seq<(BlockRef, u32, E)>,
+)
+    requires
+        0 <= l0 < hist.len(),
+        header(hist[l0], head.block.number) == Some(head.block),
+        head.block.number > 0 ==> anc(head.block.hash, (head.block.number - 1) as u64).hash == head.parent,
+        head.parent == tip.up,
+        tip.at.number == head.block.number,
+        tip.at != head.block,
+        tip.at.number >= 1,
+        tip.done == tip.at.number,
+        scan_floor(c, start) <= tip.at.number,
+        a1::<S, E>(hist[l0]),
+        got.to_multiset() == range_entries::<S, E>(
+            hist[l0],
+            head.block.number as int,
+            head.block.number as int,
+        ).to_multiset(),
+        b.triples().to_multiset() == got.to_multiset(),
+    ensures
+        scanned::<S, E>(
+            hist,
+            l0,
+            start,
+            c,
+            Some(tip),
+            Some(Mark { at: head.block, done: head.block.number, up: head.parent }),
+            b,
+        ),
+{
+    let hd = head.block;
+    let n = hd.number as int;
+    let v0 = hist[l0];
+    vstd::seq_lib::to_multiset_len(b.triples());
+    vstd::seq_lib::to_multiset_len(range_entries::<S, E>(v0, n, n));
+    let t1 = Some(Mark { at: hd, done: hd.number, up: head.parent });
+    lemma_parent_hash(head);
+    if views_ok(hist, l0, start) && (c matches Some(p) ==> p.block >= start) && tip.done + 1 >= start {
+        if tip.at.number > start {
+            reveal(views_ok);
+            assert(from_start(v0, start));
+            lemma_parent::<S, E>(v0, hd, head.parent, pa(tip), start);
         }
         assert(anchored(hist, l0, c, Some(tip), b.boundary, start, n));
     }

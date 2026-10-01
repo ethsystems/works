@@ -1,6 +1,6 @@
 # Checked by .github/scripts/verus-gates.py; regenerate it with `--update` (see there).
 # tcb and spec lines: hash of the normalized text, then the item. fn lines: from Verus.
-verified 363
+verified 364
 fn exec chainfold::batch::Batch::blocks_within
 fn exec chainfold::batch::Batch::clear
 fn exec chainfold::batch::Batch::clone
@@ -207,6 +207,7 @@ fn proof chainfold::driver::lemma_rollback_t7
 fn proof chainfold::driver::lemma_rung_gap
 fn proof chainfold::driver::lemma_rung_next
 fn proof chainfold::driver::lemma_rung_same
+fn proof chainfold::driver::lemma_rung_sibling
 fn proof chainfold::driver::lemma_rung_walk
 fn proof chainfold::driver::lemma_scan_t7
 fn proof chainfold::driver::lemma_sorted_desc
@@ -518,7 +519,7 @@ spec 3603f0136232 src/driver.rs::Driver::step
 spec d131dfa1840f src/driver.rs::Driver::poll_apply
 spec e20d0687fd4f src/driver.rs::Driver::scan
 spec 33a9880643b2 src/driver.rs::Driver::ring_agrees
-spec ea4a2f04450b src/driver.rs::Driver::next_block
+spec eaf26eed0734 src/driver.rs::Driver::next_block
 spec 7e0697667901 src/driver.rs::Driver::above_tip
 spec 9d25d7e737cb src/driver.rs::Driver::cursor_walk
 spec ccd3449dabb4 src/driver.rs::Driver::resuming
@@ -590,6 +591,7 @@ spec 14ad5e645ba2 src/driver.rs::lemma_rung_same
 spec d267e8f9c624 src/driver.rs::lemma_parent
 spec 565bb8ecd2f0 src/driver.rs::lemma_carries
 spec 1fc03fb07eda src/driver.rs::lemma_rung_next
+spec 7005f73d1543 src/driver.rs::lemma_rung_sibling
 spec 0e9271dfdf49 src/driver.rs::lemma_tip_view
 spec 4d53aeae794f src/driver.rs::lemma_anchor
 spec 6c0815fafb86 src/driver.rs::lemma_tip_step
