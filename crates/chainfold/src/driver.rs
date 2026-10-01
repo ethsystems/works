@@ -869,9 +869,7 @@ where
                 old(self).tip_view(),
                 old(self).engine_view().cursor,
                 old(self).engine_view().ring,
-            ) && header(final(self).source_log()[old(self).source_log().len() as int], hd.block.number) == Some(
-                hd.block,
-            ),
+            ) && head_read(final(self).source_log()[old(self).source_log().len() as int], hd),
     ))]
     fn step(&mut self) -> Tick {
         self.reconcile_reset();
@@ -943,9 +941,7 @@ where
                 old(self).tip_view(),
                 old(self).engine_view().cursor,
                 old(self).engine_view().ring,
-            ) && header(final(self).source_log()[old(self).source_log().len() as int], hd.block.number) == Some(
-                hd.block,
-            ),
+            ) && head_read(final(self).source_log()[old(self).source_log().len() as int], hd),
     ))]
     #[cfg_attr(verus_keep_ghost, verifier::spinoff_prover)]
     #[cfg_attr(verus_keep_ghost, verifier::rlimit(20))]
@@ -1246,7 +1242,7 @@ where
                     old(self).tip_view(),
                     old(self).engine@.cursor,
                     old(self).engine@.ring,
-                ) && header(hist[l0], hd.block.number) == Some(hd.block)
+                ) && head_read(hist[l0], hd)
                 &&& r matches Ok(Scan::Batch { .. }) ==> shaped_at(final(self).batch@, old(self).engine@.cursor)
                 &&& r matches Ok(Scan::Batch { .. }) ==> boundary_read(
                     hist,
@@ -2260,9 +2256,7 @@ where
                 old(self).tip_view(),
                 old(self).engine_view().cursor,
                 old(self).engine_view().ring,
-            ) && header(final(self).source_log()[old(self).source_log().len() as int], hd.block.number) == Some(
-                hd.block,
-            ),
+            ) && head_read(final(self).source_log()[old(self).source_log().len() as int], hd),
     ))]
     pub fn tick(&mut self) -> Tick {
         self.step()
@@ -5084,6 +5078,36 @@ mod tests {
     }
 
     #[test]
+    fn a_lower_head_off_the_cursor_block_is_not_behind() {
+        // given a driver at the tip of blocks 0..=10, events at 0 and 2, so the cursor is
+        // block 2 and the tip block 10
+        let mut chain = ScriptedChain::new(0);
+        chain.push_block(&[1]);
+        chain.push_block(&[]);
+        chain.push_block(&[2]);
+        for _ in 3..=10 {
+            chain.push_block(&[]);
+        }
+        let mut driver = new_driver(chain, engine_config(2), DriverConfig::from_block(0));
+        run_to_idle(&mut driver);
+        assert_eq!(driver.engine().cursor().map(|c| c.block), Some(2));
+        // when the chain reorgs to a shorter one that replaces the cursor block: its head
+        // is block 3, whose parent is not the block 2 the ring holds
+        driver.source.reorg(9, &[&[9], &[]]);
+        let first = driver.tick();
+        // then the head is not taken as a lagging node, and the fold follows the new chain
+        assert_ne!(first, Tick::Behind);
+        let mut n = 0;
+        while driver.tick() != Tick::Idle && n < 20 {
+            n += 1;
+        }
+        assert_eq!(
+            driver.engine().fold().applied,
+            vec![(Position::new(0, 0), 1), (Position::new(2, 0), 9)]
+        );
+    }
+
+    #[test]
     fn an_error_mid_walk_does_not_livelock() {
         // given a driver that folded block 0's event, over 1000 empty blocks and then an
         // event at block 1001, ten blocks per window, on a source whose every 25th call fails
@@ -5711,6 +5735,13 @@ pub open spec fn behind(hd: Head, t: Option<BlockRef>, c: Option<Position>, ring
 
 /// Every hash `ring` holds at head `hd`'s height is `hd`'s, and every one at the height
 /// below is its parent's.
+/// `hd` is a head read from view `v`: its block is `v`'s block at its height, and its
+/// parent is the block that block's hash commits to.
+pub open spec fn head_read(v: ChainView, hd: Head) -> bool {
+    &&& header(v, hd.block.number) == Some(hd.block)
+    &&& hd.block.number > 0 ==> anc(hd.block.hash, (hd.block.number - 1) as u64).hash == hd.parent
+}
+
 pub open spec fn ring_agrees(hd: Head, ring: Seq<BlockRef>) -> bool {
     &&& forall|i: int|
         0 <= i < ring.len() && (#[trigger] ring[i]).number == hd.block.number ==> ring[i].hash == hd.block.hash
