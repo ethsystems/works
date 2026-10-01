@@ -1268,8 +1268,9 @@ where
     /// the cursor walk, reads above the tip and then the tip; otherwise the walk starts at
     /// the cursor block, whose header the first answer carries. A walk reads at most `span`
     /// windows; one cut there with nothing found leaves a tip short of its head, and the
-    /// next scan walks on from the tip's end, with no read of the tip when the head is the
-    /// tip or its child.
+    /// next scan walks on from the tip's end. Such a tip vouches only below its head, so
+    /// the scan reads back the head's parent, not the head, and reads nothing back when the
+    /// head is the tip, its child or its sibling.
     // One answer is one view. A tip is a head a scan covered: the chain its hash commits
     // to holds nothing left to fold above the cursor up to it (A1), so a view that holds
     // the tip needs no events or boundary read below it. Every walk ends by reading the
@@ -1373,19 +1374,18 @@ where
                 }
                 return Ok(Scan::Batch { capped: false });
             }
-            let parent = head.parent == tip.at.hash
+            let parent = same_hash(&head.parent, &tip.at.hash)
                 && tip.at.number.checked_add(1) == Some(head.block.number);
             // The head's own view holds the tip when the tip is the head or its parent, so a
-            // walk above the tip then needs no read of it.
-            let implied = parent || head.block == tip.at;
+            // walk above the tip then needs no read of it. It holds a partial tip's parent,
+            // which anchors that tip, when the head is the tip's sibling.
+            let implied = parent || head.block == tip.at || !full && sibling(&tip, &head);
             #[cfg(verus_keep_ghost)]
             proof! {
-                broadcast use vstd::array::group_array_axioms;
-                if parent {
-                    assert(head.parent =~= tip.at.hash);
-                }
-                if implied {
+                if parent || head.block == tip.at {
                     lemma_carries::<S, S::Event>(head, tip.at, self.config.start_block);
+                } else if implied {
+                    lemma_carries::<S, S::Event>(head, pa(tip), self.config.start_block);
                 }
                 lemma_parent_hash(head);
             }
@@ -1394,7 +1394,8 @@ where
                     return Ok(Scan::Batch { capped: false });
                 }
             } else if tip.done < head.block.number
-                // A head at the tip's height with another hash disproves the tip.
+                // A head at the tip's height with another hash disproves the tip, unless the
+                // tip is partial and the head is its sibling.
                 && (implied || tip.at.number < head.block.number)
                 && walk_calls(tip.done + 1, head.block.number, window)
                     .saturating_add(if implied { 0 } else { 1 })
@@ -1601,9 +1602,9 @@ where
         Ok(true)
     }
 
-    /// `scan` with a gap past the tip: walks above the tip, then reads the tip back unless
-    /// `implied`, and the head block again. `Ok(None)` when the tip is gone; the batch is
-    /// then empty.
+    /// `scan` with a gap past the tip: walks above the tip, then reads the tip back (its
+    /// parent, for a tip short of its head) unless `implied`, and the head block again.
+    /// `Ok(None)` when that block is gone; the batch is then empty.
     #[cfg_attr(verus_keep_ghost, verus_spec(r =>
         requires
             old(self).wf(),
@@ -1612,7 +1613,10 @@ where
             tip.done < head.number,
             tip.at.number <= head.number,
             window >= 1,
-            implied ==> carries::<S, S::Event>(head, tip.at, old(self).config.start_block),
+            implied ==> carries::<S, S::Event>(head, tip.at, old(self).config.start_block) || carries::<
+                S,
+                S::Event,
+            >(head, anchor_of(tip), old(self).config.start_block),
             parent_hash(head, up),
         ensures
             final(self).wf(),
@@ -1698,13 +1702,24 @@ where
             lemma_grew_refl::<S, S::Event>(h2);
             lemma_grew_next::<S, S::Event>(h2, h2);
         }
-        if !implied && self.source.header_at(tip.at.number)? != Some(tip.at) {
+        // A partial tip vouches only below its head, so the head's parent anchors it, and a
+        // replaced head block does not lose it.
+        let anchor = if tip.done < tip.at.number {
+            BlockRef {
+                number: tip.at.number - 1,
+                hash: tip.up,
+            }
+        } else {
+            tip.at
+        };
+        if !implied && self.source.header_at(anchor.number)? != Some(anchor) {
             self.batch.clear();
             return Ok(None);
         }
         #[cfg(verus_keep_ghost)]
         proof_decl! {
             let ghost h3 = sview_log::<S>(&self.source);
+            assert(anchor == anchor_of(tip));
             lemma_grew_next::<S, S::Event>(h1, h3);
             lemma_grew_next::<S, S::Event>(h2, h3);
             lemma_grew_refl::<S, S::Event>(h3);
@@ -2496,6 +2511,36 @@ fn all_in<E>(entries: &[(BlockRef, u32, E)], block: BlockRef) -> bool {
 /// A walk's result: the first answer's header for the floor block, the windows read (at
 /// most 2), and whether the last one reached the walk's end.
 type Walk = (Option<BlockRef>, u8, bool);
+
+/// `a == b`, for hashes.
+#[cfg_attr(verus_keep_ghost, verus_spec(r =>
+    ensures
+        r == (*a == *b),
+))]
+fn same_hash(a: &[u8; 32], b: &[u8; 32]) -> bool {
+    let r = a == b;
+    #[cfg(verus_keep_ghost)]
+    proof! {
+        broadcast use vstd::array::group_array_axioms;
+        if r {
+            assert(*a =~= *b);
+        }
+    }
+    r
+}
+
+/// True when `head` is at `tip`'s height with another hash, on `tip`'s parent.
+#[cfg_attr(verus_keep_ghost, verus_spec(r =>
+    ensures
+        r ==> head.block.number == tip.at.number && head.block != tip.at && head.parent == tip.up
+            && tip.at.number >= 1,
+))]
+fn sibling(tip: &Mark, head: &Head) -> bool {
+    head.block.number == tip.at.number
+        && head.block != tip.at
+        && same_hash(&head.parent, &tip.up)
+        && tip.at.number >= 1
+}
 
 /// `events_in` calls a walk over `from..=hi` makes, plus the head read that follows.
 #[cfg_attr(verus_keep_ghost, verus_spec(
@@ -5793,10 +5838,75 @@ mod tests {
         driver.source.route = [b'B'; 100].to_vec();
         let sibling = pool_tick(&mut driver);
         driver.source.route.clear();
-        // then the head disproves the tip, and the walk starts again at the cursor block
+        // then the head is the partial tip's sibling, so its view holds the tip's parent,
+        // and the walk goes on above the tip with no read of it
         assert_eq!(sibling, (Tick::Progressed(ApplySummary::default()), 66));
         run_to_idle(&mut driver);
         assert_eq!(driver.engine().fold().applied, pool_canonical(&driver));
+    }
+
+    #[test]
+    fn a_partial_tip_survives_a_replaced_head() {
+        // given a driver caught up on block 1, then 200 empty blocks, one per window, and a
+        // first tick that walks 64 windows from the cursor block
+        let mut driver = counted_driver(one_event_chain(1));
+        run_to_idle(&mut driver);
+        for _ in 2..=201 {
+            driver.source.inner.push_block(&[]);
+        }
+        counted_tick(&mut driver);
+        assert_eq!(driver.tip.map(|t| t.done), Some(64));
+        // when the head block it read is replaced and one block lands on the new one
+        driver.source.inner.reorg(1, &[&[], &[]]);
+        let above = counted_tick(&mut driver);
+        // then the walk resumes at block 65: the head, 64 windows, the tip's parent and the
+        // head block's header
+        let progressed = Tick::Progressed(ApplySummary::default());
+        assert_eq!(above, (progressed, 67));
+        let chain = &driver.source.inner;
+        let head = chain.tip().unwrap();
+        let up = chain.header(201).unwrap().hash;
+        assert_eq!(
+            driver.tip,
+            Some(Mark {
+                at: head,
+                done: 128,
+                up
+            })
+        );
+        // when the head block is replaced again, at the same height
+        driver.source.inner.reorg(1, &[&[]]);
+        let sibling = counted_tick(&mut driver);
+        // then the walk resumes at block 129 with no read of the tip: the head, 64 windows
+        // and the head block's header
+        assert_eq!(sibling, (progressed, 66));
+        assert_eq!(driver.tip.map(|t| t.done), Some(192));
+        run_to_idle(&mut driver);
+        let chain = driver.source.inner.clone();
+        assert_eq!(driver.engine().fold().applied, canonical_fold(chain));
+    }
+
+    #[test]
+    fn a_head_at_a_partial_tips_height_off_its_parent_walks_from_the_cursor() {
+        // given a driver caught up on block 1, then 64 empty blocks, one per window, and a
+        // first tick that walks 64 windows from the cursor block and stops one block short
+        // of the head
+        let mut driver = counted_driver(one_event_chain(1));
+        run_to_idle(&mut driver);
+        for _ in 2..=65 {
+            driver.source.inner.push_block(&[]);
+        }
+        counted_tick(&mut driver);
+        assert_eq!(driver.tip.map(|t| (t.at.number, t.done)), Some((65, 64)));
+        // when the head block and its parent are replaced, the parent with an event
+        driver.source.inner.reorg(2, &[&[9], &[]]);
+        let tick = counted_tick(&mut driver);
+        // then the head is no sibling of the tip, and the walk starts again at the cursor
+        // block: the head, 64 windows and the head block's header
+        assert_eq!(tick.1, 66);
+        run_to_idle(&mut driver);
+        let chain = driver.source.inner.clone();
+        assert_eq!(driver.engine().fold().applied, canonical_fold(chain));
     }
 
     #[test]
@@ -6239,6 +6349,16 @@ proof fn lemma_parent_hash(hd: Head)
 /// The block below tip `m`'s head, by the parent hash of the head the scan read.
 spec fn pa(m: Mark) -> BlockRef {
     BlockRef { number: (m.at.number - 1) as u64, hash: m.up }
+}
+
+/// The block a walk above tip `m` reads back: its parent when the tip is partial, since
+/// the tip vouches only below its head then, else its head.
+spec fn anchor_of(m: Mark) -> BlockRef {
+    if m.done < m.at.number {
+        pa(m)
+    } else {
+        m.at
+    }
 }
 
 /// The last height tip `m` vouches for in a view that holds `pa(m)`: its `done`, or the
@@ -6830,8 +6950,8 @@ proof fn lemma_rung_gap<S, E>(
         tip.at.number <= hd.number,
         walked::<S, E>(h2, w0, (tip.done + 1) as u64, hi, w, false, 0, wins, b.triples(), None, n, reached),
         h3.len() == h2.len() + if implied { 0int } else { 1int },
-        implied ==> carries::<S, E>(hd, tip.at, start),
-        !implied ==> header(h3.last(), tip.at.number) == Some(tip.at),
+        implied ==> carries::<S, E>(hd, tip.at, start) || carries::<S, E>(hd, anchor_of(tip), start),
+        !implied ==> header(h3.last(), anchor_of(tip).number) == Some(anchor_of(tip)),
         hist.len() == h3.len() + 1,
         header(hist.last(), hd.number) == Some(hd),
         parent_hash(hd, up),
@@ -6857,15 +6977,29 @@ proof fn lemma_rung_gap<S, E>(
     assert(hist[p] == h3.last());
     if views_ok(hist, l0, start) && (c matches Some(q) ==> q.block >= start) && tip.done + 1 >= start {
         assert(header(hist[l0], hd.number) == header(vk, hd.number));
-        if tip.at.number >= start {
+        let q = (tip.at.number - 1) as u64;
+        if tip.done == tip.at.number || implied && carries::<S, E>(hd, tip.at, start) {
+            if tip.at.number >= start {
+                if implied && carries::<S, E>(hd, tip.at, start) {
+                    reveal(views_ok);
+                    reveal(carries);
+                    assert(from_start(hist[l0], start));
+                    assert(header(hist[l0], tip.at.number) == Some(tip.at));
+                    assert(header(hist[l0], tip.at.number) == header(vk, tip.at.number));
+                } else {
+                    assert(header(hist[p], tip.at.number) == header(vk, tip.at.number));
+                }
+            }
+        } else if tip.at.number > start {
+            // A partial tip, anchored on its parent.
             if implied {
                 reveal(views_ok);
                 reveal(carries);
                 assert(from_start(hist[l0], start));
-                assert(header(hist[l0], tip.at.number) == Some(tip.at));
-                assert(header(hist[l0], tip.at.number) == header(vk, tip.at.number));
+                assert(header(hist[l0], q) == Some(pa(tip)));
+                assert(header(hist[l0], q) == header(vk, q));
             } else {
-                assert(header(hist[p], tip.at.number) == header(vk, tip.at.number));
+                assert(header(hist[p], q) == header(vk, q));
             }
         }
         assert(anchored(hist, k, c, t0, b.boundary, start, a));

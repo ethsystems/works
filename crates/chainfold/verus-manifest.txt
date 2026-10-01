@@ -1,6 +1,6 @@
 # Checked by .github/scripts/verus-gates.py; regenerate it with `--update` (see there).
 # tcb and spec lines: hash of the normalized text, then the item. fn lines: from Verus.
-verified 361
+verified 363
 fn exec chainfold::batch::Batch::blocks_within
 fn exec chainfold::batch::Batch::clear
 fn exec chainfold::batch::Batch::clone
@@ -76,6 +76,8 @@ fn exec chainfold::driver::clamp
 fn exec chainfold::driver::descending
 fn exec chainfold::driver::due
 fn exec chainfold::driver::group_into
+fn exec chainfold::driver::same_hash
+fn exec chainfold::driver::sibling
 fn exec chainfold::driver::take_floor
 fn exec chainfold::driver::walk_calls
 fn exec chainfold::engine::ApplySummary::clone
@@ -517,7 +519,7 @@ spec d131dfa1840f src/driver.rs::Driver::poll_apply
 spec e20d0687fd4f src/driver.rs::Driver::scan
 spec 33a9880643b2 src/driver.rs::Driver::ring_agrees
 spec ea4a2f04450b src/driver.rs::Driver::next_block
-spec d5d338a68ddd src/driver.rs::Driver::above_tip
+spec 7e0697667901 src/driver.rs::Driver::above_tip
 spec 9d25d7e737cb src/driver.rs::Driver::cursor_walk
 spec ccd3449dabb4 src/driver.rs::Driver::resuming
 spec e2f66518c0ca src/driver.rs::Driver::cursor_block
@@ -527,6 +529,8 @@ spec 33abfe57ebbc src/driver.rs::Driver::tick
 spec f4cdf96e984a src/driver.rs::Driver::checkpoint
 spec 420d850dd60c src/driver.rs::Driver::status
 spec 9c80f78786c8 src/driver.rs::all_in
+spec 00c479f711ca src/driver.rs::same_hash
+spec e011732cf33e src/driver.rs::sibling
 spec 88f30a0d6a49 src/driver.rs::walk_calls
 spec c415fd3a769c src/driver.rs::capped
 spec e90b7e83b270 src/driver.rs::take_floor
@@ -555,6 +559,7 @@ spec ca1fe1ac8dc9 src/driver.rs::anchored
 spec 77ae3df7520a src/driver.rs::parent_hash
 spec a4f234881257 src/driver.rs::lemma_parent_hash
 spec 3b67d4e9c517 src/driver.rs::pa
+spec cbace1a7bcda src/driver.rs::anchor_of
 spec 51c8cf8fe08d src/driver.rs::pa_done
 spec ed51b2a243f2 src/driver.rs::views_ok
 spec 77cc5c44941a src/driver.rs::mark_ok
@@ -580,7 +585,7 @@ spec 23714cb7aec1 src/driver.rs::lemma_walk_empty
 spec de6911d4422b src/driver.rs::lemma_floor
 spec 08a2d8cf6af6 src/driver.rs::lemma_walk_core
 spec dab164de188b src/driver.rs::lemma_rung_walk
-spec fa7b1c5d5422 src/driver.rs::lemma_rung_gap
+spec 892ae5ce644c src/driver.rs::lemma_rung_gap
 spec 14ad5e645ba2 src/driver.rs::lemma_rung_same
 spec d267e8f9c624 src/driver.rs::lemma_parent
 spec 565bb8ecd2f0 src/driver.rs::lemma_carries
