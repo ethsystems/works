@@ -2691,7 +2691,7 @@ proof fn lemma_span_sorted<E>(bv: BatchView<E>, i: int)
     }
 }
 
-/// The `setup` facts every loop lemma uses; `shaped` stays hidden, since its span-bound
+/// The `setup` facts every loop lemma uses; `shaped` stays hidden, since its log-index
 /// clause instantiates itself through `start(i) == ends[i - 1]`.
 proof fn lemma_setup<E>(v0: EngineView, bv: BatchView<E>, w: int, i0: int)
     requires

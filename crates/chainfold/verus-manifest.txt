@@ -1,6 +1,6 @@
 # Checked by .github/scripts/verus-gates.py; regenerate it with `--update` (see there).
 # tcb and spec lines: hash of the normalized text, then the item. fn lines: from Verus.
-verified 359
+verified 360
 fn exec chainfold::batch::Batch::blocks_within
 fn exec chainfold::batch::Batch::clear
 fn exec chainfold::batch::Batch::clone
@@ -191,6 +191,7 @@ fn proof chainfold::driver::lemma_kept_none
 fn proof chainfold::driver::lemma_lost_moved
 fn proof chainfold::driver::lemma_one_view_sub
 fn proof chainfold::driver::lemma_parent
+fn proof chainfold::driver::lemma_poll_t7
 fn proof chainfold::driver::lemma_push_desc
 fn proof chainfold::driver::lemma_push_desc_indices
 fn proof chainfold::driver::lemma_push_triples
@@ -579,7 +580,7 @@ spec 9f2d843d0170 src/driver.rs::lemma_rung_next
 spec ac25759e0794 src/driver.rs::lemma_tip_view
 spec 4d53aeae794f src/driver.rs::lemma_anchor
 spec 84806bac13b6 src/driver.rs::lemma_tip_step
-spec 3daec36eff36 src/driver.rs::lemma_triples_ignore_boundary
+spec 85d12453a9c3 src/driver.rs::lemma_triples_ignore_boundary
 spec f14419ef3938 src/driver.rs::horizon_refused
 spec 49846cefc37f src/driver.rs::snapshot_due
 spec 874d77f823de src/driver.rs::checkpoint_due
@@ -611,6 +612,7 @@ spec 0607b9b53f6c src/driver.rs::lemma_flat_triples
 spec 8acb3a0daecf src/driver.rs::lemma_triples_at
 spec c79256f2565c src/driver.rs::lemma_batch_range
 spec c94a38a7ae83 src/driver.rs::lemma_ring_after_in
+spec 98d043d17c88 src/driver.rs::lemma_poll_t7
 spec ce42b3ee9392 src/driver.rs::lemma_scan_t7
 spec a1ec6b1034c5 src/driver.rs::lemma_kept_none
 spec 54a5e9b643cd src/driver.rs::lemma_apply_empty
@@ -839,7 +841,7 @@ spec 1ea9b32de600 src/verus/model.rs::BatchView
 spec 41cfc7f6ba5b src/verus/model.rs::BatchView::wf
 spec 482cb45463a7 src/verus/model.rs::BatchView::start
 spec a39099253e1b src/verus/model.rs::BatchView::block
-spec 38e46e4fce04 src/verus/model.rs::BatchView::shaped
+spec 6ba194970499 src/verus/model.rs::BatchView::shaped
 spec b900b7f445aa src/verus/model.rs::BatchView::span_events
 spec 3dbb4a3949e1 src/verus/model.rs::BatchView::flat_upto
 spec a8338c475e21 src/verus/model.rs::BatchView::flat

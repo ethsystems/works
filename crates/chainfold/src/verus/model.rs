@@ -458,7 +458,8 @@ impl<E> BatchView<E> {
         &&& forall|i: int, j: int|
             #![trigger self.blocks[i], self.blocks[j]]
             0 <= i < j < self.blocks.len() ==> self.blocks[i] < self.blocks[j]
-        &&& forall|i: int| 0 <= i < self.ends.len() ==> self.start(i) < #[trigger] self.ends[i]
+        // On `ends[i]`, this would instantiate itself through `start(i) == ends[i - 1]`.
+        &&& forall|i: int| #![trigger self.start(i)] 0 <= i < self.ends.len() ==> self.start(i) < self.ends[i]
         &&& forall|i: int, j: int, k: int|
             #![trigger self.ends[i], self.log_indices[j], self.log_indices[k]]
             0 <= i < self.ends.len() && self.start(i) <= j < k < self.ends[i]

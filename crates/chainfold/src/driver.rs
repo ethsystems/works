@@ -1022,16 +1022,6 @@ where
             let ghost (l0, hist) = (sview_log::<S>(&old(self).source).len() as int, sview_log::<S>(&self.source));
             let ghost start = self.config.start_block;
             let ghost (t0, t1) = (old(self).tip, self.tip);
-            let ghost sv = choose|sv: (int, BlockRef, int, int, int, int, int, bool)| #[trigger] scan_view::<S, F::Event>(
-                hist,
-                l0,
-                start,
-                v.cursor,
-                t0,
-                t1,
-                bv,
-                sv,
-            );
         }
         #[cfg(verus_keep_ghost)]
         proof! {
@@ -1050,6 +1040,18 @@ where
                 #[cfg(verus_keep_ghost)]
                 proof_decl! {
                     let ghost post = self.engine@;
+                    let ghost k = lemma_poll_t7::<F, S, F::Event, F::Error>(
+                        v,
+                        post,
+                        bv,
+                        w,
+                        fview::<F>(&self.initial),
+                        start,
+                        sview_log::<S>(&old(self).source),
+                        hist,
+                        t0,
+                        t1,
+                    );
                 }
                 #[cfg(verus_keep_ghost)]
                 proof! {
@@ -1062,34 +1064,18 @@ where
                         fview::<F>(&self.initial),
                         start,
                         log + cl,
-                        if bv.ends.len() > 0 { hist[sv.0] } else { h },
+                        if bv.ends.len() > 0 { hist[k] } else { h },
                     ) && t7_state::<F, S, F::Event, F::Error>(
                         post,
                         fview::<F>(&self.initial),
                         start,
-                        hist[sv.0],
+                        hist[k],
                     ) && mark_ok::<S, F::Event>(
                         t1,
                         post.cursor,
-                        if bv.ends.len() > 0 { hist[sv.0] } else { h },
+                        if bv.ends.len() > 0 { hist[k] } else { h },
                         start,
-                    ) by {
-                        lemma_scan_t7::<F, S, F::Event, F::Error>(
-                            v,
-                            post,
-                            bv,
-                            w,
-                            fview::<F>(&self.initial),
-                            start,
-                            log,
-                            h,
-                            sview_log::<S>(&old(self).source),
-                            hist,
-                            t0,
-                            t1,
-                            sv,
-                        );
-                    }
+                    ) by {}
                 }
                 if self.span < MAX_SPAN {
                     self.span = (self.span * 2).min(MAX_SPAN);
@@ -1126,7 +1112,7 @@ where
                         assert forall|log: Seq<(Position, F::Event)>, h: ChainView|
                             #[trigger] old(self).dinv(log, h) implies t7_tick(*old(self), *self, tick, log, h) by {
                             if views_ok(hist, l0, start) {
-                                let h2 = if bv.ends.len() > 0 { hist[sv.0] } else { h };
+                                let h2 = if bv.ends.len() > 0 { hist[k] } else { h };
                                 assert(dinv::<F, S, F::Event, F::Error>(post, fview::<F>(&self.initial), start, log + cl, h2));
                                 assert(self.dinv(log + cl, h2));
                             }
@@ -1149,14 +1135,14 @@ where
                     assert forall|log: Seq<(Position, F::Event)>, h: ChainView|
                         #[trigger] old(self).dinv(log, h) implies t7_tick(*old(self), *self, tick, log, h) by {
                         if views_ok(hist, l0, start) {
-                            let h2 = if bv.ends.len() > 0 { hist[sv.0] } else { h };
+                            let h2 = if bv.ends.len() > 0 { hist[k] } else { h };
                             assert(dinv::<F, S, F::Event, F::Error>(post, fview::<F>(&self.initial), start, log + cl, h2));
                             assert(self.dinv(log + cl, h2));
                             assert(t7_state::<F, S, F::Event, F::Error>(
                                 self.engine@,
                                 fview::<F>(&self.initial),
                                 start,
-                                hist[sv.0],
+                                hist[k],
                             ));
                         }
                     }
@@ -6853,14 +6839,20 @@ proof fn lemma_tip_step<S, E>(vk: ChainView, wlo: int, hd: BlockRef, start: u64)
     lemma_tip_view::<S, E>(Mark { at: hd, done: hd.number }, Some(c2), vk, start, vk);
 }
 
-/// The batch's entries do not read its boundary.
+/// The batch's entries and shape do not read its boundary.
 proof fn lemma_triples_ignore_boundary<E>(a: BatchView<E>, b: BatchView<E>, n: int)
     requires
         a == (BatchView { boundary: a.boundary, ..b }),
     ensures
         a.triples_upto(n) == b.triples_upto(n),
+        b.shaped() ==> a.shaped(),
     decreases n,
 {
+    if b.shaped() {
+        assert forall|i: int| 0 <= i < a.ends.len() implies a.start(i) < a.ends[i] by {
+            assert(a.start(i) == b.start(i));
+        }
+    }
     if n > 0 {
         lemma_triples_ignore_boundary(a, b, n - 1);
         assert(a.span_triples(n - 1) =~= b.span_triples(n - 1));
@@ -7275,6 +7267,78 @@ proof fn lemma_ring_after_in<E>(
             assert(b.blocks[i0 + q] == x.number);
         }
     }
+}
+
+/// `lemma_scan_t7` for every log and view `h` a tick may start from, at the view `k` of
+/// one witness of `scanned`.
+proof fn lemma_poll_t7<F: ?Sized, S, E, Er>(
+    v: EngineView,
+    post: EngineView,
+    b: BatchView<E>,
+    w: int,
+    init: int,
+    start: u64,
+    old: Seq<ChainView>,
+    hist: Seq<ChainView>,
+    t0: Option<Mark>,
+    t1: Option<Mark>,
+) -> (k: int)
+    requires
+        v.wf(),
+        post.wf(),
+        b.wf(),
+        0 < w,
+        v.status is Active,
+        grew::<S, E>(old, hist),
+        accepted(v, b),
+        !stopped::<F, E, Er>(v, b),
+        post.cursor == cursor_after(v.cursor, ok_calls::<F, E, Er>(v, b)),
+        ring_after(v, post, b, w),
+        post.slots == v.slots,
+        post.status == v.status,
+        forall|log: Seq<(Position, E)>|
+            #[trigger] v.inv::<F, E, Er>(init, log) ==> post.inv::<F, E, Er>(init, log + calls::<F, E, Er>(v, b)),
+        scanned::<S, E>(hist, old.len() as int, start, v.cursor, t0, t1, b),
+    ensures
+        old.len() <= k < hist.len(),
+        forall|log: Seq<(Position, E)>, h: ChainView|
+            #[trigger] dinv::<F, S, E, Er>(v, init, start, log, h) && mark_ok::<S, E>(t0, v.cursor, h, start)
+                && views_ok(hist, old.len() as int, start) ==> {
+                let h2 = if b.ends.len() > 0 {
+                    hist[k]
+                } else {
+                    h
+                };
+                &&& dinv::<F, S, E, Er>(post, init, start, log + calls::<F, E, Er>(v, b), h2)
+                &&& t7_state::<F, S, E, Er>(post, init, start, hist[k])
+                &&& mark_ok::<S, E>(t1, post.cursor, h2, start)
+            },
+{
+    let sv = choose|sv: (int, BlockRef, int, int, int, int, int, bool)| #[trigger] scan_view::<S, E>(
+        hist,
+        old.len() as int,
+        start,
+        v.cursor,
+        t0,
+        t1,
+        b,
+        sv,
+    );
+    assert forall|log: Seq<(Position, E)>, h: ChainView|
+        #[trigger] dinv::<F, S, E, Er>(v, init, start, log, h) && mark_ok::<S, E>(t0, v.cursor, h, start)
+            && views_ok(hist, old.len() as int, start) implies {
+            let h2 = if b.ends.len() > 0 {
+                hist[sv.0]
+            } else {
+                h
+            };
+            &&& dinv::<F, S, E, Er>(post, init, start, log + calls::<F, E, Er>(v, b), h2)
+            &&& t7_state::<F, S, E, Er>(post, init, start, hist[sv.0])
+            &&& mark_ok::<S, E>(t1, post.cursor, h2, start)
+        } by {
+        lemma_scan_t7::<F, S, E, Er>(v, post, b, w, init, start, log, h, old, hist, t0, t1, sv);
+    }
+    sv.0
 }
 
 /// `dinv`, the tick's conclusion, and the new tip for an accepted apply that did not
