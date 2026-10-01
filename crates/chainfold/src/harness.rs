@@ -1,6 +1,10 @@
 //! Tokio harness: runs a `Driver` on its own thread and publishes status into a watch.
 
 use std::{
+    panic::{
+        self,
+        AssertUnwindSafe,
+    },
     sync::{
         Arc,
         Condvar,
@@ -29,6 +33,11 @@ struct HarnessState {
 }
 
 /// Runs a `Driver` on a dedicated thread, bridging its status into a tokio watch channel.
+///
+/// The loop stops at the first terminal status, which it publishes. A panic in
+/// `Fold::apply` is one: the engine is Poisoned, the waits return that status, and
+/// `shutdown` returns the driver. Any other panic ends the loop thread, and `shutdown`
+/// panics.
 pub fn spawn<F, S, K>(mut driver: Driver<F, S, K>) -> Handle<Driver<F, S, K>>
 where
     F: Fold + Clone + Send + 'static,
@@ -53,13 +62,23 @@ where
                     loop_state.0.lock().expect("harness state mutex poisoned");
                 std::mem::take(&mut guard.checkpoint_requests)
             };
-            // Requests coalesce into one checkpoint, keeping the K slots at K cursors.
-            if requests > 0 {
-                driver.checkpoint();
-            }
-            driver.tick();
+            // A panic out of `Fold::apply` leaves the engine Poisoned, so it ends the loop
+            // through the terminal status below, as a refused event does. Any other panic
+            // leaves no terminal status and still ends the thread.
+            let ticked = panic::catch_unwind(AssertUnwindSafe(|| {
+                // Requests coalesce into one checkpoint, keeping the K slots at K cursors.
+                if requests > 0 {
+                    driver.checkpoint();
+                }
+                driver.tick();
+            }));
             let status = driver.status();
             let _ = status_tx.send(status);
+            if let Err(payload) = ticked
+                && !status.is_terminal()
+            {
+                panic::resume_unwind(payload);
+            }
             let stop = loop_state
                 .0
                 .lock()
@@ -180,6 +199,10 @@ mod tests {
             DriverConfig,
         },
         engine::EngineConfig,
+        error::{
+            EngineStatus,
+            FoldError,
+        },
         test_util::{
             FailKind,
             RecordingFold,
@@ -338,6 +361,49 @@ mod tests {
         let status = timeout(handle.wait_caught_up()).await;
         // then the wait resolves with a terminal status instead of hanging
         assert!(status.is_terminal());
+    }
+
+    /// Panics on the event at `panic_at`.
+    #[derive(Clone)]
+    struct PanicFold {
+        panic_at: Position,
+    }
+
+    impl Fold for PanicFold {
+        type Event = u64;
+        type Error = core::convert::Infallible;
+
+        fn apply(
+            &mut self,
+            pos: Position,
+            _event: &Self::Event,
+        ) -> Result<(), FoldError<Self::Error>> {
+            assert_ne!(pos, self.panic_at, "scripted fold panic");
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_fold_panic_publishes_a_terminal_status() {
+        // given a fold that panics on the event at block 10 of 20
+        let mut chain = ScriptedChain::new(1);
+        for value in 1..=20u64 {
+            chain.push_block(&[value]);
+        }
+        let fold = PanicFold {
+            panic_at: Position::new(10, 0),
+        };
+        let driver = Driver::new(fold, chain, engine_config(0), fast_config()).unwrap();
+        let mut handle = spawn(driver);
+        // when awaiting caught up, then a cursor the fold never reaches
+        let caught = timeout(handle.wait_caught_up()).await;
+        let past = timeout(handle.wait_past(Position::new(20, 0))).await;
+        // then both waits resolve with the Poisoned status, not the stale Active one
+        assert!(matches!(caught.engine, EngineStatus::Poisoned { .. }));
+        assert_eq!(past.engine, caught.engine);
+        // and shutdown returns the driver, as after any other terminal tick
+        let driver = handle.shutdown().await;
+        assert_eq!(driver.engine().status(), caught.engine);
     }
 
     #[tokio::test]
