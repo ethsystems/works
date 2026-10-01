@@ -297,6 +297,13 @@ where
     ///
     /// `genesis` is the fold a resync restarts from, so it is empty state rather than
     /// the recovered state.
+    ///
+    /// The proved end-to-end claim (T7 in the README) covers the resumed driver when the
+    /// engine is `Active`, its fold is the fold of the source chain's events through its
+    /// cursor, that cursor ends its block in the chain, and its ring names blocks of the
+    /// chain the source holds. An engine whose cursor is inside a block, such as one
+    /// decoded from a `Halted` snapshot or fed part of a block by the caller, gets the rest
+    /// of that block folded. Tests check that case; no proof covers it.
     #[cfg_attr(verus_keep_ghost, verus_spec(r =>
         requires
             engine.wf(),
@@ -356,6 +363,8 @@ where
     }
 
     /// Resumes from a recovered engine, offering durable snapshots to the sink.
+    ///
+    /// What the proofs cover of a resumed driver is as for [`Driver::resume`].
     #[cfg_attr(verus_keep_ghost, verus_spec(r =>
         requires
             engine.wf(),
@@ -1013,7 +1022,7 @@ where
             let ghost (l0, hist) = (sview_log::<S>(&old(self).source).len() as int, sview_log::<S>(&self.source));
             let ghost start = self.config.start_block;
             let ghost (t0, t1) = (old(self).tip, self.tip);
-            let ghost sv = choose|sv: (int, BlockRef, int, int, int, int, int)| #[trigger] scan_view::<S, F::Event>(
+            let ghost sv = choose|sv: (int, BlockRef, int, int, int, int, int, bool)| #[trigger] scan_view::<S, F::Event>(
                 hist,
                 l0,
                 start,
@@ -1611,7 +1620,8 @@ where
             lemma_grew_next::<S, S::Event>(h1, h1);
         }
         let end = capped(tip.done + 1, head.number, self.span, window);
-        let Some((_at, _reads, reached)) = self.walk(tip.done + 1, end, window, false)?
+        let Some((_at, _reads, reached)) =
+            self.walk(tip.done + 1, end, window, false, 0)?
         else {
             return Ok(Some(false));
         };
@@ -1626,6 +1636,7 @@ where
                 end,
                 window,
                 false,
+                0,
                 wins,
                 d2.batch@.triples(),
                 _at,
@@ -1782,8 +1793,12 @@ where
             lemma_grew_next::<S, S::Event>(hw, hw);
         }
         let end = capped(from, head.number, self.span, window);
+        let after = match cursor {
+            Some(c) => c.log_index,
+            None => 0,
+        };
         let Some((at, reads, reached)) =
-            self.walk(from, end, window, cursor.is_some())?
+            self.walk(from, end, window, cursor.is_some(), after)?
         else {
             return Ok(false);
         };
@@ -1798,6 +1813,7 @@ where
                 end,
                 window,
                 cursor is Some,
+                after,
                 wins,
                 d2.batch@.triples(),
                 at,
@@ -1891,6 +1907,7 @@ where
                     from,
                     end,
                     window,
+                    after,
                     wins,
                     at,
                     reads,
@@ -1942,7 +1959,8 @@ where
 
     /// Reads `events_in` windows from `from` through `hi` and groups the first one with an
     /// entry above the floor into the batch. With `floor`, the floor is block `from` itself:
-    /// its entries are dropped and the first answer's header for it is returned. Also
+    /// its entries up to log index `after` are dropped and the first answer's header for it
+    /// is returned. Also
     /// returns the windows read, capped at 2, and whether the last one reached `hi`.
     /// `Ok(None)` when an answer holds an entry outside its window, or two headers at the
     /// floor; the batch is then empty.
@@ -1975,6 +1993,7 @@ where
                     hi,
                     window,
                     floor,
+                    after,
                     wins,
                     final(self).batch@.triples(),
                     p.0,
@@ -1989,6 +2008,7 @@ where
         hi: u64,
         window: u64,
         floor: bool,
+        after: u64,
     ) -> Result<Option<Walk>, S::Error> {
         let mut next = from;
         let mut at: Option<BlockRef> = None;
@@ -2045,7 +2065,12 @@ where
                     sview_log::<S>(&self.source)[l0 + wins.len() - 1],
                     wlo(wins, floor, wins.len() - 1),
                     wins.last().1,
-                ).to_multiset(),
+                ).to_multiset().add(fkept::<S, S::Event>(
+                    sview_log::<S>(&self.source)[l0 + wins.len() - 1],
+                    floor && wins.len() == 1,
+                    from,
+                    after,
+                )),
             ensures
                 self.batch@.wf(),
                 self.batch@.shaped(),
@@ -2077,7 +2102,12 @@ where
                     sview_log::<S>(&self.source)[l0 + wins.len() - 1],
                     wlo(wins, floor, wins.len() - 1),
                     wins.last().1,
-                ).to_multiset(),
+                ).to_multiset().add(fkept::<S, S::Event>(
+                    sview_log::<S>(&self.source)[l0 + wins.len() - 1],
+                    floor && wins.len() == 1,
+                    from,
+                    after,
+                )),
                 wins.len() == 0 ==> self.batch@.triples().len() == 0 && from > hi,
                 self.batch@.triples().len() == 0 && wins.len() > 0 ==> wins.last().1 == hi,
             decreases hi as int + 1 - next as int,
@@ -2102,18 +2132,18 @@ where
                 lemma_answer_within::<S, S::Event>(v, next as int, to as int, got);
             }
             if floor && reads == 0 {
-                let (floor_at, below) = take_floor(&mut self.scratch, next);
+                let (floor_at, below) = take_floor(&mut self.scratch, next, after);
                 if below {
                     #[cfg(verus_keep_ghost)]
                     proof! {
-                        lemma_floor::<S, S::Event>(v, next, to, got, self.scratch@);
+                        lemma_floor::<S, S::Event>(v, next, to, got, self.scratch@, after);
                     }
                     return Ok(None);
                 }
                 at = floor_at;
                 #[cfg(verus_keep_ghost)]
                 proof! {
-                    lemma_floor::<S, S::Event>(v, next, to, got, self.scratch@);
+                    lemma_floor::<S, S::Event>(v, next, to, got, self.scratch@, after);
                     assert(wlo(wins, floor, 0) == next + 1);
                     if let Some(b) = at {
                         let i = choose|i: int| 0 <= i < got.len() && #[trigger] got[i].0 == b;
@@ -2123,33 +2153,44 @@ where
             }
             #[cfg(verus_keep_ghost)]
             proof! {
-                assert(self.scratch@.to_multiset() == range_entries::<S, S::Event>(
+                broadcast use vstd::multiset::group_multiset_axioms;
+                let fk = fkept::<S, S::Event>(v, floor && wins.len() == 1, from, after);
+                if !(floor && wins.len() == 1) {
+                    assert(fk =~= vstd::multiset::Multiset::empty());
+                }
+                assert(self.scratch@.to_multiset() =~= range_entries::<S, S::Event>(
                     v,
                     wlo(wins, floor, wins.len() - 1),
                     to as int,
-                ).to_multiset());
+                ).to_multiset().add(fk));
+                assert(forall|x: (BlockRef, u32, S::Event)| #[trigger] self.scratch@.to_multiset().count(x)
+                    <= got.to_multiset().count(x));
                 vstd::seq_lib::to_multiset_len(self.scratch@);
                 vstd::seq_lib::to_multiset_len(range_entries::<S, S::Event>(
                     v,
                     wlo(wins, floor, wins.len() - 1),
                     to as int,
                 ));
-                lemma_re_one_view::<S, S::Event>(v, wlo(wins, floor, wins.len() - 1), to as int);
+                lemma_re_one_view::<S, S::Event>(v, next as int, to as int);
+                lemma_one_view_sub(got.to_multiset(), self.scratch@.to_multiset());
             }
             if reads < 2 {
                 reads += 1;
             }
             if !self.scratch.is_empty() {
+                #[cfg(verus_keep_ghost)]
+                proof_decl! {
+                    let ghost sc = self.scratch@;
+                }
                 group_into(&mut self.batch, &mut self.scratch);
                 #[cfg(verus_keep_ghost)]
                 proof! {
                     vstd::seq_lib::to_multiset_len(self.batch@.triples());
-                    lemma_answer_within::<S, S::Event>(
-                        v,
-                        wlo(wins, floor, wins.len() - 1),
-                        to as int,
-                        self.batch@.triples(),
-                    );
+                    assert(forall|x: (BlockRef, u32, S::Event)| #[trigger] self.batch@.triples().to_multiset().count(x)
+                        <= got.to_multiset().count(x)) by {
+                        assert(self.batch@.triples().to_multiset() == sc.to_multiset());
+                    }
+                    lemma_sub_within(next as int, to as int, got, self.batch@.triples());
                     lemma_triples_within(self.batch@, next, to);
                 }
                 if !self.batch.blocks_within(next, to) {
@@ -2176,6 +2217,7 @@ where
                 hi,
                 window,
                 floor,
+                after,
                 wins,
                 self.batch@.triples(),
                 at,
@@ -2195,6 +2237,7 @@ where
                 hi,
                 window,
                 floor,
+                after,
                 wins,
                 self.batch@.triples(),
                 read.0,
@@ -2432,14 +2475,15 @@ fn capped(from: u64, hi: u64, span: u64, window: u64) -> u64 {
     hi.min(from.saturating_add(span.saturating_mul(window) - 1))
 }
 
-/// Drops the entries at or below block `floor`, in place and out of order, and returns the
-/// header one of them carried at `floor`, and whether the answer is refused: one lay below
-/// `floor`, or two carried different headers at it.
+/// Drops the entries at or below block `floor`, except those at `floor` after log index
+/// `after`, in place and out of order, and returns the header one of them carried at
+/// `floor`, and whether the answer is refused: one lay below `floor`, or two carried
+/// different headers at it.
 #[cfg_attr(verus_keep_ghost, verus_verify)]
 #[cfg_attr(verus_keep_ghost, verus_spec(r =>
     ensures
         forall|x: (BlockRef, u32, E)| #[trigger] final(entries)@.to_multiset().count(x)
-            == if x.0.number > floor { old(entries)@.to_multiset().count(x) } else { 0 },
+            == if past_floor(x, floor, after) { old(entries)@.to_multiset().count(x) } else { 0 },
         r.0 matches Some(b) ==> b.number == floor && exists|i: int|
             0 <= i < old(entries)@.len() && #[trigger] old(entries)@[i].0 == b,
         r.0 is None ==> forall|i: int| 0 <= i < old(entries)@.len() ==> #[trigger] old(entries)@[i].0.number != floor,
@@ -2458,6 +2502,7 @@ fn capped(from: u64, hi: u64, span: u64, window: u64) -> u64 {
 fn take_floor<E>(
     entries: &mut Vec<(BlockRef, u32, E)>,
     floor: u64,
+    after: u64,
 ) -> (Option<BlockRef>, bool) {
     let mut at: Option<BlockRef> = None;
     let mut below = false;
@@ -2476,8 +2521,8 @@ fn take_floor<E>(
             i <= entries@.len() <= s.len(),
             s == old(entries)@,
             entries@.subrange(0, i as int) == s.subrange(0, i as int),
-            forall|j: int| i <= j < entries@.len() ==> (#[trigger] entries@[j]).0.number > floor,
-            forall|j: int| 0 <= j < gone.len() ==> (#[trigger] gone[j]).0.number <= floor,
+            forall|j: int| i <= j < entries@.len() ==> past_floor(#[trigger] entries@[j], floor, after),
+            forall|j: int| 0 <= j < gone.len() ==> !past_floor(#[trigger] gone[j], floor, after),
             entries@.to_multiset().add(gone.to_multiset()) == s.to_multiset(),
             at matches Some(b) ==> b.number == floor && exists|j: int| i <= j < s.len() && #[trigger] s[j].0 == b,
             at is None ==> forall|j: int| i <= j < s.len() ==> #[trigger] s[j].0.number != floor,
@@ -2491,19 +2536,26 @@ fn take_floor<E>(
     ))]
     while i > 0 {
         i -= 1;
+        let mut gone_now = false;
         if entries[i].0.number <= floor {
-            let block = entries[i].0;
-            if block.number == floor {
+            if entries[i].0.number == floor {
                 // Two headers at the floor are two blocks at one height in one answer.
-                if let Some(seen) = at {
-                    if seen != block {
-                        below = true;
+                match at {
+                    Some(seen) => {
+                        if seen != entries[i].0 {
+                            below = true;
+                        }
                     }
+                    None => at = Some(entries[i].0),
                 }
-                at = Some(block);
+                // An entry after the cursor is one the engine has not folded yet.
+                gone_now = entries[i].1 as u64 <= after;
             } else {
                 below = true;
+                gone_now = true;
             }
+        }
+        if gone_now {
             #[cfg(verus_keep_ghost)]
             proof_decl! {
                 let ghost pre = entries@;
@@ -2548,10 +2600,10 @@ fn take_floor<E>(
     proof! {
         broadcast use vstd::multiset::group_multiset_axioms;
         assert forall|x: (BlockRef, u32, E)| #[trigger] entries@.to_multiset().count(x)
-            == if x.0.number > floor { s.to_multiset().count(x) } else { 0 } by {
+            == if past_floor(x, floor, after) { s.to_multiset().count(x) } else { 0 } by {
             vstd::seq_lib::to_multiset_contains(entries@, x);
             vstd::seq_lib::to_multiset_contains(gone, x);
-            if x.0.number > floor {
+            if past_floor(x, floor, after) {
                 if gone.contains(x) {
                     let j = choose|j: int| 0 <= j < gone.len() && gone[j] == x;
                 }
@@ -5252,6 +5304,84 @@ mod tests {
         }
     }
 
+    /// Blocks 1..=20, each with three events.
+    fn three_event_chain() -> ScriptedChain {
+        let mut chain = ScriptedChain::new(1);
+        for _ in 1..=20 {
+            chain.push_block(&[7, 8, 9]);
+        }
+        chain
+    }
+
+    /// Asserts the fold took every event of `three_event_chain` once, in order.
+    fn assert_folded_once(fold: &RecordingFold) {
+        let want: Vec<Position> = (1..=20u64)
+            .flat_map(|block| (0..3).map(move |index| Position::new(block, index)))
+            .collect();
+        let got: Vec<Position> = fold.applied.iter().map(|(at, _)| *at).collect();
+        assert_eq!(got, want);
+    }
+
+    #[cfg(feature = "wincode")]
+    #[test]
+    fn a_halted_snapshot_resumes_with_the_rest_of_its_block() {
+        // given a driver halted at the second event of block 10, so its cursor is (10, 0)
+        let fold = RecordingFold {
+            fail_at: Some((Position::new(10, 1), FailKind::Halt)),
+            ..RecordingFold::default()
+        };
+        let mut driver = Driver::new(
+            fold,
+            three_event_chain(),
+            EngineConfig::default(),
+            DriverConfig::from_block(1),
+        )
+        .unwrap();
+        while !matches!(driver.tick(), Tick::Terminal(_)) {}
+        assert_eq!(driver.engine().cursor(), Some(Position::new(10, 0)));
+        // when its snapshot is resumed with a fixed fold (decoding clears `fail_at`)
+        let mut bytes = Vec::new();
+        driver.engine().encode_snapshot(&mut bytes).unwrap();
+        let engine = Engine::decode_snapshot(&bytes, EngineConfig::default()).unwrap();
+        let mut resumed = Driver::resume(
+            engine,
+            three_event_chain(),
+            RecordingFold::default(),
+            DriverConfig::from_block(1),
+        )
+        .unwrap();
+        run_to_idle(&mut resumed);
+        // then the fold holds every event once, the rest of block 10 too
+        assert_folded_once(resumed.engine().fold());
+    }
+
+    #[test]
+    fn a_partial_block_fed_before_resume_is_folded_once() {
+        // given an engine fed blocks 1..=9 and the first event of block 10
+        let chain = three_event_chain();
+        let mut engine =
+            Engine::new(RecordingFold::default(), EngineConfig::default()).unwrap();
+        let mut batch = Batch::new();
+        for block in 1..=9 {
+            batch
+                .push_block(chain.header(block).unwrap(), [(0u32, 7u64), (1, 8), (2, 9)]);
+        }
+        batch.push_block(chain.header(10).unwrap(), [(0u32, 7u64)]);
+        engine.apply_batch(&batch).unwrap();
+        assert_eq!(engine.cursor(), Some(Position::new(10, 0)));
+        // when a driver resumes it and polls to the head
+        let mut driver = Driver::resume(
+            engine,
+            chain,
+            RecordingFold::default(),
+            DriverConfig::from_block(1),
+        )
+        .unwrap();
+        run_to_idle(&mut driver);
+        // then the fold holds every event once
+        assert_folded_once(driver.engine().fold());
+    }
+
     #[test]
     fn a_head_below_the_cursor_changes_nothing() {
         // given a driver caught up on node a, blocks 0..=3 with events at 0, 2 and 3; node
@@ -5747,9 +5877,33 @@ pub open spec fn wlo(wins: Seq<(int, int)>, floor: bool, i: int) -> int {
     }
 }
 
+/// `take_floor` keeps entry `x`: it lies above block `floor`, or at it after log index
+/// `after`.
+pub open spec fn past_floor<E>(x: (BlockRef, u32, E), floor: u64, after: u64) -> bool {
+    x.0.number > floor || (x.0.number == floor && x.1 as u64 > after)
+}
+
+/// Entries of view `v`'s block `p.block` after `p`: none when `p` ends its block.
+pub open spec fn kept<S, E>(v: ChainView, p: Position) -> vstd::multiset::Multiset<(BlockRef, u32, E)> {
+    block_entries::<S, E>(v, p.block).to_multiset().filter(|x: (BlockRef, u32, E)| x.1 as u64 > p.log_index)
+}
+
+/// What a walk keeps of its first window's floor block `from` in view `v`: the entries
+/// after log index `after`, for a walk with a floor.
+pub open spec fn fkept<S, E>(v: ChainView, floor: bool, from: u64, after: u64) -> vstd::multiset::Multiset<
+    (BlockRef, u32, E),
+> {
+    if floor {
+        kept::<S, E>(v, Position { block: from, log_index: after })
+    } else {
+        vstd::multiset::Multiset::empty()
+    }
+}
+
 /// `walk`'s Ok result over `hist` from `l0`, one view per window `wins` from `from`: the
 /// windows before the last hold no entry from their `wlo` on, the batch's entries `t` are
-/// the last window's from its `wlo` on, and an empty batch's windows reach `hi`. `at` is
+/// the last window's from its `wlo` on, plus, for a first window with a floor, the floor
+/// block's entries after log index `after`, and an empty batch's windows reach `hi`. `at` is
 /// the first answer's header for block `from`; without `at`, that answer had no entry there.
 pub open spec fn walked<S, E>(
     hist: Seq<ChainView>,
@@ -5758,6 +5912,7 @@ pub open spec fn walked<S, E>(
     hi: u64,
     w: u64,
     floor: bool,
+    after: u64,
     wins: Seq<(int, int)>,
     t: Seq<(BlockRef, u32, E)>,
     at: Option<BlockRef>,
@@ -5776,7 +5931,7 @@ pub open spec fn walked<S, E>(
         hist[l0 + m - 1],
         wlo(wins, floor, m - 1),
         wins[m - 1].1,
-    ).to_multiset()
+    ).to_multiset().add(fkept::<S, E>(hist[l0 + m - 1], floor && m == 1, from, after))
     &&& m == 0 ==> t.len() == 0 && from > hi
     &&& t.len() == 0 && m > 0 ==> wins[m - 1].1 == hi
     &&& at matches Some(b) ==> floor && m > 0 && header(hist[l0], from) == Some(b)
@@ -5794,12 +5949,13 @@ spec fn scanned<S, E>(
     t1: Option<Mark>,
     b: BatchView<E>,
 ) -> bool {
-    exists|s: (int, BlockRef, int, int, int, int, int)| #[trigger] scan_view::<S, E>(hist, l0, start, c, t0, t1, b, s)
+    exists|s: (int, BlockRef, int, int, int, int, int, bool)| #[trigger] scan_view::<S, E>(hist, l0, start, c, t0, t1, b, s)
 }
 
 /// One witness of `scanned`. `s.0` names the view the tick concludes in, `s.1` the head
 /// block the first call read, `s.2` that view's anchor height, `[s.3, s.4]` the batch's
-/// window, and `s.5`, `s.6` the view and anchor height that vouch for a new tip. Under
+/// window, and `s.5`, `s.6` the view and anchor height that vouch for a new tip; with
+/// `s.7`, the batch also holds the cursor block's entries after the cursor. Under
 /// `views_ok`, the view is anchored, holds nothing from the anchor to the window, and holds
 /// the batch's entries as the window's. A new tip has the head at its `done` or above,
 /// and the vouching view holds the head: with a batch, that view is the tick's, its window
@@ -5813,9 +5969,9 @@ spec fn scan_view<S, E>(
     t0: Option<Mark>,
     t1: Option<Mark>,
     b: BatchView<E>,
-    s: (int, BlockRef, int, int, int, int, int),
+    s: (int, BlockRef, int, int, int, int, int, bool),
 ) -> bool {
-    let (k, hd, a, wlo, whi, j, aj) = s;
+    let (k, hd, a, wlo, whi, j, aj, f) = s;
     &&& l0 <= k < hist.len()
     &&& l0 <= j < hist.len()
     &&& header(hist[l0], hd.number) == Some(hd)
@@ -5828,7 +5984,13 @@ spec fn scan_view<S, E>(
         >= start) ==> {
         &&& anchored(hist, k, c, t0, b.boundary, start, a)
         &&& range_entries::<S, E>(hist[k], a, wlo - 1).len() == 0
-        &&& b.triples().to_multiset() == range_entries::<S, E>(hist[k], wlo, whi).to_multiset()
+        &&& if f && c is Some {
+            b.triples().to_multiset() == range_entries::<S, E>(hist[k], wlo, whi).to_multiset().add(
+                kept::<S, E>(hist[k], c.unwrap()),
+            )
+        } else {
+            b.triples().to_multiset() == range_entries::<S, E>(hist[k], wlo, whi).to_multiset()
+        }
         &&& t1 is Some && t1 != t0 ==> {
             &&& header(hist[j], hd.number) == Some(hd)
             &&& if b.triples().len() > 0 {
@@ -6097,15 +6259,18 @@ proof fn lemma_floor<S, E>(
     hi: u64,
     pre: Seq<(BlockRef, u32, E)>,
     post: Seq<(BlockRef, u32, E)>,
+    after: u64,
 )
     requires
         chain(v),
         lo <= hi,
         pre.to_multiset() == range_entries::<S, E>(v, lo as int, hi as int).to_multiset(),
         forall|x: (BlockRef, u32, E)| #[trigger] post.to_multiset().count(x)
-            == if x.0.number > lo { pre.to_multiset().count(x) } else { 0 },
+            == if past_floor(x, lo, after) { pre.to_multiset().count(x) } else { 0 },
     ensures
-        post.to_multiset() == range_entries::<S, E>(v, lo + 1, hi as int).to_multiset(),
+        post.to_multiset() == range_entries::<S, E>(v, lo + 1, hi as int).to_multiset().add(
+            kept::<S, E>(v, Position { block: lo, log_index: after }),
+        ),
         forall|i: int| 0 <= i < pre.len() && pre[i].0.number == lo ==> header(v, lo) == Some(#[trigger] pre[i].0),
         (forall|i: int| 0 <= i < pre.len() ==> #[trigger] pre[i].0.number != lo) ==> block_entries::<S, E>(
             v,
@@ -6119,8 +6284,13 @@ proof fn lemma_floor<S, E>(
     vstd::seq_lib::lemma_multiset_commutative(a, b);
     lemma_re_facts::<S, E>(v, lo as int, lo as int);
     lemma_re_facts::<S, E>(v, lo + 1, hi as int);
-    assert(post.to_multiset() =~= b.to_multiset()) by {
-        assert forall|x: (BlockRef, u32, E)| post.to_multiset().count(x) == b.to_multiset().count(x) by {
+    let kp = kept::<S, E>(v, Position { block: lo, log_index: after });
+    assert(a =~= block_entries::<S, E>(v, lo)) by {
+        assert(range_entries::<S, E>(v, lo as int, lo as int) =~= range_entries::<S, E>(v, lo as int, lo - 1)
+            + block_entries::<S, E>(v, lo));
+    }
+    assert(post.to_multiset() =~= b.to_multiset().add(kp)) by {
+        assert forall|x: (BlockRef, u32, E)| post.to_multiset().count(x) == b.to_multiset().add(kp).count(x) by {
             vstd::seq_lib::to_multiset_contains(a, x);
             vstd::seq_lib::to_multiset_contains(b, x);
             if a.contains(x) {
@@ -6173,6 +6343,7 @@ proof fn lemma_walk_core<S, E>(
     hi: u64,
     w: u64,
     floor: bool,
+    after: u64,
     wins: Seq<(int, int)>,
     t: Seq<(BlockRef, u32, E)>,
     at: Option<BlockRef>,
@@ -6186,7 +6357,7 @@ proof fn lemma_walk_core<S, E>(
         header(hist[l0], hd.number) == Some(hd),
         forall|q: int| l0 <= q < hist.len() ==> a1::<S, E>(#[trigger] hist[q]),
         hi <= hd.number,
-        walked::<S, E>(h2, w0, from, hi, w, floor, wins, t, at, n, reached),
+        walked::<S, E>(h2, w0, from, hi, w, floor, after, wins, t, at, n, reached),
         n > 0 ==> hist.len() > h2.len() && header(hist.last(), hd.number) == Some(hd),
     ensures
         ({
@@ -6198,11 +6369,16 @@ proof fn lemma_walk_core<S, E>(
                 &&& wins[m - 1].1 <= hi
                 &&& from <= hi
                 &&& hist[k] == h2[k]
-                &&& t.to_multiset() == range_entries::<S, E>(
+                &&& !(floor && m == 1) ==> t.to_multiset() == range_entries::<S, E>(
                     hist[k],
                     wlo(wins, floor, m - 1),
                     wins[m - 1].1,
                 ).to_multiset()
+                &&& floor && m == 1 ==> t.to_multiset() == range_entries::<S, E>(
+                    hist[k],
+                    wlo(wins, floor, m - 1),
+                    wins[m - 1].1,
+                ).to_multiset().add(kept::<S, E>(hist[k], Position { block: from, log_index: after }))
                 &&& reached == (wins[m - 1].1 == hi)
                 &&& t.len() == 0 ==> reached
                 &&& views_ok(hist, l0, start) && from >= start ==> range_entries::<S, E>(
@@ -6226,6 +6402,11 @@ proof fn lemma_walk_core<S, E>(
         lemma_wins_bounds(wins, from as int, w, hi, 0);
         lemma_wins_bounds(wins, from as int, w, hi, m - 1);
         assert(hist[k] == h2[k]);
+        if !(floor && m == 1) {
+            broadcast use vstd::multiset::group_multiset_axioms;
+            let r = range_entries::<S, E>(hist[k], wlo(wins, floor, m - 1), wins[m - 1].1).to_multiset();
+            assert(r.add(fkept::<S, E>(hist[k], false, from, after)) =~= r);
+        }
         if views_ok(hist, l0, start) && from >= start {
             reveal(views_ok);
             let vk = hist[k];
@@ -6281,6 +6462,7 @@ proof fn lemma_rung_walk<S, E>(
     from: u64,
     hi: u64,
     w: u64,
+    after: u64,
     wins: Seq<(int, int)>,
     at: Option<BlockRef>,
     n: u8,
@@ -6294,7 +6476,8 @@ proof fn lemma_rung_walk<S, E>(
         header(hist[l0], hd.number) == Some(hd),
         forall|q: int| l0 <= q < hist.len() ==> a1::<S, E>(#[trigger] hist[q]),
         hi <= hd.number,
-        walked::<S, E>(h2, w0, from, hi, w, c is Some, wins, b.triples(), at, n, reached),
+        walked::<S, E>(h2, w0, from, hi, w, c is Some, after, wins, b.triples(), at, n, reached),
+        c matches Some(p) ==> after == p.log_index,
         from == match c {
             Some(p) => p.block,
             None => start,
@@ -6320,10 +6503,11 @@ proof fn lemma_rung_walk<S, E>(
 {
     let m = wins.len() as int;
     let floor = c is Some;
+    let f = m == 1 && floor;
     let lo = scan_floor(c, start);
     lemma_grew_next::<S, E>(h2, h3);
     lemma_grew_next::<S, E>(h3, hist);
-    lemma_walk_core::<S, E>(hist, h2, l0, w0, start, hd, from, hi, w, floor, wins, b.triples(), at, n, reached);
+    lemma_walk_core::<S, E>(hist, h2, l0, w0, start, hd, from, hi, w, floor, after, wins, b.triples(), at, n, reached);
     let k = if m > 0 { w0 + m - 1 } else { hist.len() - 1 };
     let (wl, wh) = if m > 0 { (wlo(wins, floor, m - 1), wins[m - 1].1) } else { (lo, lo - 1) };
     let vk = hist[k];
@@ -6359,13 +6543,17 @@ proof fn lemma_rung_walk<S, E>(
             assert(range_entries::<S, E>(vk, lo, wl - 1) =~= Seq::empty());
             assert(b.triples() =~= range_entries::<S, E>(vk, wl, wh));
         }
+        if f {
+            assert(Position { block: from, log_index: after } == c.unwrap());
+        }
         if t1 is Some && b.triples().len() == 0 {
+            broadcast use vstd::multiset::group_multiset_axioms;
             vstd::seq_lib::to_multiset_len(b.triples());
             vstd::seq_lib::to_multiset_len(range_entries::<S, E>(vk, wl, wh));
             lemma_re_split::<S, E>(vk, lo, wl - 1, hi as int);
         }
     }
-    assert(scan_view::<S, E>(hist, l0, start, c, t0, t1, b, (k, hd, lo, wl, wh, k, lo)));
+    assert(scan_view::<S, E>(hist, l0, start, c, t0, t1, b, (k, hd, lo, wl, wh, k, lo, f)));
 }
 
 /// `scan`'s walk above the tip through `hi` assembles into `scanned`: the head's view
@@ -6400,7 +6588,7 @@ proof fn lemma_rung_gap<S, E>(
         forall|q: int| l0 <= q < hist.len() ==> a1::<S, E>(#[trigger] hist[q]),
         tip.done < hi <= hd.number,
         tip.at.number <= hd.number,
-        walked::<S, E>(h2, w0, (tip.done + 1) as u64, hi, w, false, wins, b.triples(), None, n, reached),
+        walked::<S, E>(h2, w0, (tip.done + 1) as u64, hi, w, false, 0, wins, b.triples(), None, n, reached),
         h3.len() == h2.len() + if implied { 0int } else { 1int },
         implied ==> carries::<S, E>(hd, tip.at, start),
         !implied ==> header(h3.last(), tip.at.number) == Some(tip.at),
@@ -6419,7 +6607,7 @@ proof fn lemma_rung_gap<S, E>(
     let t0 = Some(tip);
     lemma_grew_next::<S, E>(h2, h3);
     lemma_grew_next::<S, E>(h3, hist);
-    lemma_walk_core::<S, E>(hist, h2, l0, w0, start, hd, from, hi, w, false, wins, b.triples(), None, n, reached);
+    lemma_walk_core::<S, E>(hist, h2, l0, w0, start, hd, from, hi, w, false, 0, wins, b.triples(), None, n, reached);
     let k = w0 + m - 1;
     let (wl, wh) = (wlo(wins, false, m - 1), wins[m - 1].1);
     let vk = hist[k];
@@ -6446,7 +6634,7 @@ proof fn lemma_rung_gap<S, E>(
             lemma_re_split::<S, E>(vk, a, wl - 1, hi as int);
         }
     }
-    assert(scan_view::<S, E>(hist, l0, start, c, t0, t1, b, (k, hd, a, wl, wh, k, a)));
+    assert(scan_view::<S, E>(hist, l0, start, c, t0, t1, b, (k, hd, a, wl, wh, k, a, false)));
 }
 
 /// `scan` with the head equal to the tip's: its one view holds the tip's head.
@@ -6472,7 +6660,7 @@ proof fn lemma_rung_same<S, E>(
     assert(anchored(hist, l0, c, Some(tip), b.boundary, start, a));
     assert(range_entries::<S, E>(hist[l0], a, a - 1) =~= Seq::empty());
     assert(b.triples() =~= range_entries::<S, E>(hist[l0], a, a - 1));
-    assert(scan_view::<S, E>(hist, l0, start, c, Some(tip), Some(tip), b, (l0, hd, a, a, a - 1, l0, a)));
+    assert(scan_view::<S, E>(hist, l0, start, c, Some(tip), Some(tip), b, (l0, hd, a, a, a - 1, l0, a, false)));
 }
 
 /// A view holding head `hd`, whose parent hash is the tip's, holds the tip.
@@ -6555,7 +6743,7 @@ proof fn lemma_rung_next<S, E>(
         assert(anchored(hist, l0, c, Some(tip), b.boundary, start, n));
     }
     assert(range_entries::<S, E>(v0, n, n - 1) =~= Seq::empty());
-    assert(scan_view::<S, E>(hist, l0, start, c, Some(tip), t1, b, (l0, hd, n, n, n, l0, n)));
+    assert(scan_view::<S, E>(hist, l0, start, c, Some(tip), t1, b, (l0, hd, n, n, n, l0, n, false)));
 }
 
 /// A view that holds tip `m`'s head, agrees with `h` below the floor and holds nothing from
@@ -7104,7 +7292,7 @@ proof fn lemma_scan_t7<F: ?Sized, S, E, Er>(
     hist: Seq<ChainView>,
     t0: Option<Mark>,
     t1: Option<Mark>,
-    sv: (int, BlockRef, int, int, int, int, int),
+    sv: (int, BlockRef, int, int, int, int, int, bool),
 )
     requires
         v.wf(),
@@ -7136,7 +7324,7 @@ proof fn lemma_scan_t7<F: ?Sized, S, E, Er>(
             &&& mark_ok::<S, E>(t1, post.cursor, h2, start)
         }),
 {
-    let (k, hd, a, wlo, whi, j, aj) = sv;
+    let (k, hd, a, wlo, whi, j, aj, f) = sv;
     let vk = hist[k];
     let c = v.cursor;
     let lo = scan_floor(c, start);
@@ -7150,6 +7338,16 @@ proof fn lemma_scan_t7<F: ?Sized, S, E, Er>(
         assert(r[r.len() - 1].number >= start);
     }
     lemma_anchor::<S, E>(v, start, h, t0, hist, k, b.boundary, a);
+    if f && c is Some {
+        // The cursor ends its block in `h`, which `vk` agrees with there.
+        let p = c.unwrap();
+        assert(header(h, p.block) == header(vk, p.block));
+        lemma_kept_none::<S, E>(h, vk, p);
+        let r = range_entries::<S, E>(vk, wlo, whi).to_multiset();
+        assert(r.add(kept::<S, E>(vk, p)) =~= r) by {
+            broadcast use vstd::multiset::group_multiset_axioms;
+        }
+    }
     lemma_re_split::<S, E>(vk, lo, a - 1, wlo - 1);
     if b.ends.len() == 0 {
         lemma_apply_empty::<F, S, E, Er>(v, post, b, w, init, start, log, h, vk);
@@ -7174,6 +7372,27 @@ proof fn lemma_scan_t7<F: ?Sized, S, E, Er>(
                 }
             }
             lemma_tip_view::<S, E>(m, c, h, start, hist[j]);
+        }
+    }
+}
+
+/// A view that agrees with `h` at block `p.block`, where `p` ends its block in `h`, holds
+/// no entry of that block after `p`.
+proof fn lemma_kept_none<S, E>(h: ChainView, v: ChainView, p: Position)
+    requires
+        complete::<S, E>(h, p),
+        header(h, p.block) == header(v, p.block),
+    ensures
+        kept::<S, E>(v, p) =~= vstd::multiset::Multiset::empty(),
+{
+    broadcast use vstd::multiset::group_multiset_axioms;
+    let be = block_entries::<S, E>(v, p.block);
+    assert(be == block_entries::<S, E>(h, p.block));
+    assert forall|x: (BlockRef, u32, E)| kept::<S, E>(v, p).count(x) == 0 by {
+        vstd::seq_lib::to_multiset_contains(be, x);
+        if x.1 as u64 > p.log_index && be.contains(x) {
+            let i = choose|i: int| 0 <= i < be.len() && be[i] == x;
+            assert(be[i].1 as u64 <= p.log_index);
         }
     }
 }
@@ -7796,6 +8015,43 @@ proof fn lemma_re_ascending<S, E>(v: ChainView, lo: int, hi: int)
                 assert(l[i - r0.len()].0 < l[j - r0.len()].0);
             }
         }
+    }
+}
+
+/// Entries `t`, each at most as often as in `got`, lie where `got`'s do.
+proof fn lemma_sub_within<E>(lo: int, hi: int, got: Seq<(BlockRef, u32, E)>, t: Seq<(BlockRef, u32, E)>)
+    requires
+        forall|i: int| 0 <= i < got.len() ==> lo <= (#[trigger] got[i]).0.number <= hi,
+        forall|x: (BlockRef, u32, E)| #[trigger] t.to_multiset().count(x) <= got.to_multiset().count(x),
+    ensures
+        forall|i: int| 0 <= i < t.len() ==> lo <= (#[trigger] t[i]).0.number <= hi,
+{
+    assert forall|i: int| 0 <= i < t.len() implies lo <= (#[trigger] t[i]).0.number <= hi by {
+        vstd::seq_lib::to_multiset_contains(t, t[i]);
+        assert(t.contains(t[i]));
+        assert(t.to_multiset().count(t[i]) <= got.to_multiset().count(t[i]));
+        vstd::seq_lib::to_multiset_contains(got, t[i]);
+        let j = choose|j: int| 0 <= j < got.len() && got[j] == t[i];
+    }
+}
+
+/// A multiset with no entry more often than in a one-view multiset is one view too.
+proof fn lemma_one_view_sub<E>(
+    m: vstd::multiset::Multiset<(BlockRef, u32, E)>,
+    n: vstd::multiset::Multiset<(BlockRef, u32, E)>,
+)
+    requires
+        one_view(m),
+        forall|x: (BlockRef, u32, E)| #[trigger] n.count(x) <= m.count(x),
+    ensures
+        one_view(n),
+{
+    assert forall|x: (BlockRef, u32, E), y: (BlockRef, u32, E)|
+        #![trigger n.count(x), n.count(y)]
+        n.count(x) > 0 && n.count(y) > 0 && x.0.number == y.0.number implies x.0 == y.0 && (x.1 == y.1 ==> x == y
+            && n.count(x) == 1) by {
+        assert(n.count(x) <= m.count(x) && n.count(y) <= m.count(y));
+        assert(m.count(x) > 0 && m.count(y) > 0);
     }
 }
 
