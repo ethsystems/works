@@ -744,7 +744,7 @@ spec 04badaf25cb1 src/snapshot.rs::write_envelope
 spec d492637618ba src/snapshot.rs::ring_lanes
 spec 6820a6c0de0d src/snapshot.rs::cursor_fields
 spec bd5afb4b2f05 src/snapshot.rs::envelope
-spec 80e1537af239 src/snapshot.rs::Engine::encode_snapshot
+spec e09d3a83c4c7 src/snapshot.rs::Engine::encode_snapshot
 spec c00e8b8c9006 src/snapshot.rs::Engine::encode_durable_snapshot
 spec 653b2ca16c74 src/snapshot.rs::Engine::durable_envelope
 spec 2de41af9a9a5 src/snapshot.rs::Engine::decode_snapshot

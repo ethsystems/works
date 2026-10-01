@@ -13,7 +13,10 @@ use crate::{
         Engine,
         EngineConfig,
     },
-    error::ConfigError,
+    error::{
+        ConfigError,
+        EngineStatus,
+    },
     fold::Fold,
     position::{
         BlockRef,
@@ -25,7 +28,6 @@ use crate::{
 use {
     crate::{
         batch::lemma_ascending_pairwise,
-        error::EngineStatus,
         verus::model::{
             EngineView,
             SlotView,
@@ -327,6 +329,12 @@ pub enum SnapshotError<E> {
     /// Stored ring's newest block differs from the stored cursor block, or a
     /// cursorless snapshot carries ring entries.
     RingCursorMismatch,
+    /// Engine is `Poisoned`: its fold may have run on events past its cursor, so a
+    /// snapshot of it would fold them again.
+    Poisoned {
+        /// Position the engine poisoned at.
+        at: Position,
+    },
     /// Caller configuration is invalid.
     Config(ConfigError),
     /// Fold refused its own state bytes.
@@ -375,6 +383,11 @@ impl<E: fmt::Display> fmt::Display for SnapshotError<E> {
                     "snapshot ring does not end at the cursor block, or has entries without a cursor"
                 )
             }
+            Self::Poisoned { at } => write!(
+                f,
+                "engine poisoned at block {} log index {} has no snapshot",
+                at.block, at.log_index
+            ),
             Self::Config(error) => write!(f, "snapshot config invalid: {error}"),
             Self::State(error) => write!(f, "snapshot state failed to decode: {error}"),
         }
@@ -388,17 +401,29 @@ impl<E: fmt::Debug + fmt::Display> core::error::Error for SnapshotError<E> {}
 impl<F: Persist> Engine<F> {
     /// Appends the framed envelope: wincode payload plus a CRC32C trailer.
     ///
-    /// Fails with `TooLarge` when a field exceeds the engine-owned length ceiling,
-    /// leaving `out` as it found it.
+    /// Fails with `Poisoned` on a `Poisoned` engine, whose fold may have run on events
+    /// past its cursor, and with `TooLarge` when a field exceeds the engine-owned length
+    /// ceiling; both leave `out` as they found it. A `Halted` or `Unrecoverable` engine
+    /// encodes: its fold is the fold of the events through its cursor, and the decoded
+    /// engine is `Active`.
     // The envelope is `encodes(_, self@.cursor, self@.ring)` (`envelope`'s ensures).
-    #[cfg_attr(verus_keep_ghost, verus_spec(
+    #[cfg_attr(verus_keep_ghost, verus_spec(r =>
         requires
             self.wf(),
+        ensures
+            r is Ok ==> !(self@.status is Poisoned),
+            self@.status matches EngineStatus::Poisoned { at } ==> r == Err::<
+                (),
+                SnapshotError<F::PersistError>,
+            >(SnapshotError::Poisoned { at }) && final(out)@ == old(out)@,
     ))]
     pub fn encode_snapshot(
         &self,
         out: &mut Vec<u8>,
     ) -> Result<(), SnapshotError<F::PersistError>> {
+        if let EngineStatus::Poisoned { at } = self.status() {
+            return Err(SnapshotError::Poisoned { at });
+        }
         let ring = self.ring();
         write_envelope(&envelope(self.fold(), self.cursor(), ring, ring.len()), out)
     }
@@ -1024,7 +1049,10 @@ mod tests {
             Position,
         },
         snapshot::Persist,
-        test_util::RecordingFold,
+        test_util::{
+            FailKind,
+            RecordingFold,
+        },
     };
     #[cfg(not(feature = "std"))]
     use alloc::{
@@ -1111,6 +1139,34 @@ mod tests {
         let sum = crc32c(input);
         // then it is the published check value, so both backends frame the same bytes
         assert_eq!(sum, 0xe306_9283);
+    }
+
+    #[test]
+    fn a_poisoned_engine_has_no_snapshot() {
+        for (kind, encodes) in [(FailKind::Poison, false), (FailKind::Halt, true)] {
+            // given an engine whose fold fails at the second event of block 1
+            let mut engine = test_engine();
+            engine.fold_mut().fail_at = Some((Position::new(1, 1), kind));
+            let failed =
+                engine.apply_batch(&batch_of(None, vec![(block(1, 0), vec![0, 1])]));
+            assert!(failed.is_err());
+            // when it encodes a snapshot
+            let mut bytes = vec![7];
+            let result = engine.encode_snapshot(&mut bytes);
+            // then a Poisoned engine, whose fold ran on the event past its cursor, is
+            // refused and `out` is left as it was; a Halted one encodes
+            if encodes {
+                assert!(result.is_ok());
+            } else {
+                assert_eq!(
+                    result,
+                    Err(SnapshotError::Poisoned {
+                        at: Position::new(1, 1)
+                    })
+                );
+                assert_eq!(bytes, vec![7]);
+            }
+        }
     }
 
     #[test]
