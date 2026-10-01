@@ -240,24 +240,23 @@ provider's cap errs, and so does every walk that needs a full one. Set it per pr
   logs, geth nothing.
 
 A head below the tip or the cursor block, from a node behind the one the last poll read,
-and agreeing with every hash the ring holds, returns `Behind` and costs that one call;
-the fold and the tip stay. A failed call during the scan, or a head block that moved
-during the walk, returns `SourceError` and keeps the tip too, so the next poll goes on
-from it.
+and agreeing with every hash the ring holds at its height and its parent's, returns
+`Behind` and costs that one call; the fold and the tip stay. A failed call during the
+scan, or a head block that moved during the walk, returns `SourceError` and keeps the tip
+too, so the next poll goes on from it.
 
 One walk reads at most 64 windows. A walk cut there with nothing found returns
 `Progressed` with nothing applied, leaves `is_caught_up` false and `next_delay` zero, and
 keeps a tip that covers only the heights it read; the next tick walks on from there.
 After a tick whose scan fails or sees the head block move, that limit halves, down to
 one window; after each applied tick it doubles, up to 64. So a provider that fails every
-call of a tick past a burst still lets the driver catch up, in walks that fit the burst
-(see the second table below).
+call of a tick past a burst still lets the driver catch up (see the second table below).
 
-A reorg that replaces the tip block leaves the scan no anchor above the cursor. The next
-poll walks from the cursor block again, about (head − cursor) / window `events_in` calls,
-64 windows a walk. When the head is far enough above the tip that a walk above it is
-cheaper, that poll walks above the tip first, reads the tip's header back, finds it gone,
-and then walks from the cursor block: up to 128 windows in that tick.
+A reorg that replaces the tip block and its parent leaves the scan no anchor above the
+cursor. The next poll walks from the cursor block again, about (head − cursor) / window
+`events_in` calls, 64 windows a walk. When the head is far enough above the tip that a
+walk above it is cheaper, that poll walks above the tip first, reads the tip's header
+back, finds it gone, and then walks from the cursor block: up to 128 windows in that tick.
 
 Calls per scenario, counted with a counting source over `ScriptedChain`: window 10, the
 driver caught up at block 100. These are test sizes, not the defaults. One call is one
@@ -277,8 +276,8 @@ driver caught up at block 100. These are test sizes, not the defaults. One call 
 | tip 10 windows above the cursor: a failed `head` (that poll; then to idle) | 1; 1 |
 | reorg of the cursor block (ticks to idle) | 17 |
 | reorg before the second window of a 30-block walk (ticks to idle) | 14 |
-| reorg of the tip, 10 blocks above the cursor (ticks to idle) | 4 |
-| reorg of the tip, 100 and 1000 windows above the cursor (ticks to idle) | 105 in 2 ticks, 1,033 in 16 |
+| reorg of the tip, 10 blocks above the cursor (ticks to idle) | 2 |
+| reorg of the tip, 100 and 1000 windows above the cursor (ticks to idle) | 2 in 1 tick, 2 in 1 |
 | reorg below the tip and above the cursor that adds an event (ticks to idle) | 6 |
 | one new block, `events_at` to a node without it, lag clears after one tick (ticks to idle) | 5 |
 | one-window answer torn by a reorg, 5 blocks above the cursor (ticks to idle) | 7 |
@@ -295,7 +294,7 @@ one event a day (7,200 blocks), so the cursor sits the stated distance below the
 | 1/day, cursor 1 day below the head: 2, 5, 25 new blocks (one tick) | 4, 4, 4 |
 | 1/day, cursor 1 day below the head: 20 polls, `head` from a node 1 block behind on every other one | 20 |
 | 1/day, cursor 1 day below the head: a failed `head` (that poll; then to idle) | 1; 1 |
-| 1/day, cursor 1 hour, 1 day, 1 week below the head: depth-1 reorg of the tip (ticks to idle) | 3, 17, 105 in 2 ticks |
+| 1/day, cursor 1 hour, 1 day, 1 week below the head: depth-1 reorg of the tip (ticks to idle) | 2, 2, 2 |
 | first sync, deploy only, 1 week, 1 month, 1 year back (ticks to idle) | 108 in 3 ticks, 450 in 8, 5,430 in 84; at most 66 a tick |
 | first sync, deploy only, 1 year back, each call fails with chance 1% (median of 5 seeds) | median 7,174, median 191 ticks |
 | first sync, deploy only, 1 year back, every call of a tick past its 10th fails | 13,829 in 1,318 ticks; at most 11 a tick |
@@ -437,22 +436,20 @@ trusted items are in `src/verus/tcb.rs`.
   from the cursor up to the height the scan covered. That height is the head's, or lower
   when the walk stopped at its cap of windows with nothing found. Such a tick returns
   `Progressed` with nothing applied, and the fold claim above covers it as it does any
-  `Progressed` tick. It also leaves `is_caught_up` false (a test checks this; no proof
-  does). T7 takes A2 (iii) and (iv) only for the views of the tick itself, so a tick may
-  answer from a view older than one an earlier tick read. The test
+  `Progressed` tick. It also leaves `is_caught_up` false. T7 takes A2 (iii) and (iv)
+  only for the views of the tick itself, so a tick may answer from a view older than one
+  an earlier tick read. The test
   `a_tick_on_an_older_view_folds_what_a_fold_from_scratch_of_it_does` runs such ticks
   and checks each fold against a fold from scratch of the view that the tick read.
 
   A tick returns `SourceError` only if a source call failed or the chain changed during
-  the tick: some call answered from a view other than the first call's. The engine never
-  rejects the batch a scan builds, since the batch is shaped and its boundary is at the
-  cursor block. This needs no A2. `infallible` names a source whose calls all succeed.
+  the tick: some call answered from a view other than the first call's. This needs no
+  A2. `infallible` names a source whose calls all succeed.
 
-  No proof shows that a decoded snapshot is in `dinv`: that rests on the driver that
-  wrote it having been in it, on the state codec (A5), and on the source still holding
-  the chain its ring names. So a resumed driver has T7 only as far as its engine is in
-  `dinv`, and outright from its first `Resynced` tick on. `engine_mut` clears the tip.
-  After an edit through it, T7 covers the driver again from its next `Resynced` tick.
+  No proof shows that a decoded snapshot is in `dinv`. So a resumed driver has T7 only
+  as far as its engine is in `dinv`, and outright from its first `Resynced` tick on.
+  `engine_mut` clears the tip. After an edit through it, T7 covers the driver again from
+  its next `Resynced` tick.
 
 Verus checks every exec fn in the in-scope files for panics and overflow. The only
 exceptions are the fns listed as out of scope in `Cargo.toml`.

@@ -119,8 +119,8 @@ pub enum Tick {
     /// Source or its contract failed; the next delay backs off.
     SourceError,
     /// The source's head is below the tip or the cursor block, and no block the driver
-    /// holds contradicts it: a node behind the one the last poll read answered. Nothing
-    /// changes.
+    /// holds at its height or its parent's contradicts it: a node behind the one the last
+    /// poll read answered. Nothing changes.
     Behind,
     /// Sink refused a snapshot offer; reported once, folding continues unpersisted.
     DurabilityLost,
@@ -137,7 +137,7 @@ enum Scan {
     /// The head block moved during the scan; the batch is empty.
     Moved,
     /// The head is below the tip or the cursor block and contradicts no hash the ring
-    /// holds; the batch is empty.
+    /// holds at its height or its parent's; the batch is empty.
     Behind,
 }
 
