@@ -48,9 +48,19 @@ Usage: verus-gates.py <crate-dir>
     any Cargo.toml, `package`, `path`, `git` or `registry` on a dependency
     entry (the crate itself as a dev-dependency is allowed), Cargo source or
     patch config in the environment, or `--config`, `CARGO_HOME` or Cargo
-    source config in a workflow that runs these gates. Source replacement keeps
-    the registry name in `cargo metadata`, so `--check-toolchain` does not see
-    it, and the `--no-cheating` run never reads a dependency.
+    source config in a workflow job that runs these gates. Source replacement
+    keeps the registry name in `cargo metadata`, so `--check-toolchain` does
+    not see it, and the `--no-cheating` run never reads a dependency.
+    Nor can Cargo config change what the Verus run builds or checks: rustc
+    flags, a wrapper, another rustc, a target dir, nightly config. A Cargo
+    config in the workspace, in a directory above it or in `$CARGO_HOME`
+    (default `~/.cargo`) may hold only the keys on CONFIG_KEYS. The
+    environment may hold no `CARGO_*`, `__CARGO_*`, `RUSTC*` or `RUST*FLAGS`
+    but those on ENV_KEYS and `CARGO_HOME`, and a workflow job that runs these
+    gates, or its workflow-level part, may name none but those on ENV_KEYS.
+    Other jobs run on other runners. No Cargo.toml may set
+    `cargo-features`: `cargo verus` sets RUSTC_BOOTSTRAP=1, so Cargo would
+    take nightly manifest keys such as `[profile] rustflags`.
 
 Config lives in the crate's Cargo.toml:
 
@@ -132,6 +142,15 @@ VERIFYING = ("verus_spec", "verus_verify")
 # crates.io: a vendored or local copy, a patch, a path, a git repo, another registry or package.
 CONFIG_SWAPS = {"source", "patch", "paths", "include"}
 DEP_SWAPS = {"package", "path", "git", "registry", "registry-index"}
+# The only Cargo config the Verus run may read. Any other key can change what it builds or
+# checks: `build.rustflags`, `build.rustc-wrapper`, `target.<triple>.rustflags`, another `env`
+# var, `unstable` (`cargo verus` sets RUSTC_BOOTSTRAP=1, so Cargo takes nightly config).
+CONFIG_KEYS = {"env.RUST_MIN_STACK"}
+# Cargo reads each `CARGO_*` as config, and rustc flags and wrappers from the others. Allowed: the
+# ones CI and the local Verus setup export, which change no build output. `CARGO_HOME` is allowed
+# in the environment, where its config is read, but not in a workflow.
+CARGO_ENV = re.compile(r"\b(__CARGO_\w+|CARGO_\w+|RUSTC\w*|RUST\w*FLAGS)\b")
+ENV_KEYS = {"CARGO_TERM_COLOR", "CARGO_BUILD_JOBS"}
 USE = re.compile(r"\s*(pub(\s*\([^)]*\))?\s+)?use\b")
 # What a `verus!` item can start with; a `}` followed by one of these ends the item.
 ITEM_START = re.compile(
@@ -553,22 +572,55 @@ def swaps(crate: Path, env: dict) -> list[str]:
         dirs[:] = [x for x in dirs if x != ".git" and Path(d, x) != root / "target"]
         configs += [Path(d, f) for f in files if Path(d).name == ".cargo" and f in ("config", "config.toml")]
         manifests += [Path(d, f) for f in files if f == "Cargo.toml"]
-    if "CARGO_HOME" in env:
-        configs += [p for p in (Path(env["CARGO_HOME"], f) for f in ("config", "config.toml")) if p.is_file()]
-    for path in configs:
-        for key in CONFIG_SWAPS & toml_of(path).keys():
-            errors.append(f"{show(path)}: `{key}` in Cargo config can swap a dependency's source")
+    # Cargo also reads the config in each directory above the workspace, then `$CARGO_HOME`.
+    home = env["CARGO_HOME"] if "CARGO_HOME" in env else Path(env["HOME"], ".cargo") if "HOME" in env else None
+    for d in [*(p / ".cargo" for p in root.parents), *([home] if home else [])]:
+        configs += [p for p in (Path(d, f) for f in ("config", "config.toml")) if p.is_file()]
+
+    def unlisted(table: dict, prefix: str = "") -> list[str]:
+        """Each key of a Cargo config that is not on CONFIG_KEYS and holds none of them."""
+        keys = []
+        for key, value in table.items():
+            if prefix + key in CONFIG_KEYS:
+                continue
+            if isinstance(value, dict) and any(k.startswith(prefix + key + ".") for k in CONFIG_KEYS):
+                keys += unlisted(value, prefix + key + ".")
+            else:
+                keys.append(prefix + key)
+        return keys
+
+    swap, build = "can swap a dependency's source", "can change what the Verus run builds"
+    for path in dict.fromkeys(p.resolve() for p in configs):
+        for key in unlisted(toml_of(path)):
+            errors.append(f"{show(path)}: `{key}` in Cargo config {swap if key in CONFIG_SWAPS else build}")
     for path in manifests:
-        for key in ("patch", "replace") & toml_of(path).keys():
-            errors.append(f"{show(path)}: `[{key}]` can swap a dependency's source")
+        manifest = toml_of(path)
+        for key in ("patch", "replace") & manifest.keys():
+            errors.append(f"{show(path)}: `[{key}]` {swap}")
+        if "cargo-features" in manifest:
+            errors.append(f"{show(path)}: `cargo-features` {build}")
+    swap_env = re.compile(r"CARGO_(SOURCE|PATCH)_\w+|CARGO_PATHS")
     for key in env:
-        if re.fullmatch(r"CARGO_(SOURCE|PATCH)_\w+|CARGO_PATHS", key):
-            errors.append(f"environment: `{key}` is Cargo config that can swap a dependency's source")
+        if swap_env.fullmatch(key):
+            errors.append(f"environment: `{key}` is Cargo config that {swap}")
+        elif CARGO_ENV.fullmatch(key) and key not in ENV_KEYS | {"CARGO_HOME"}:
+            errors.append(f"environment: `{key}` {build}")
     for path in sorted((root / ".github/workflows").glob("*.y*ml")):
         text = path.read_text()
-        if "verus-gates.py" in text:
-            for m in re.finditer(r"--config\b|\.cargo/config|\bCARGO_(HOME|PATHS|SOURCE_\w+|PATCH_\w+)\b", text):
-                errors.append(f"{show(path)}:{line_of(text, m.start())}: `{m.group(0)}` can swap a dependency's source")
+        if "verus-gates.py" not in text:
+            continue
+        # The workflow-level part, and each job (a key two spaces in under `jobs:`) that runs these
+        # gates outside a comment.
+        top = m.end() if (m := re.search(r"^jobs:", text, re.M)) else len(text)
+        starts = [top, *(m.start() for m in re.compile(r"^  [^\s#]", re.M).finditer(text, top)), len(text)]
+        code = re.sub(r"(?m)^[ \t]*#.*$", lambda c: " " * len(c[0]), text)
+        parts = [(0, top), *((a, b) for a, b in zip(starts, starts[1:]) if "verus-gates.py" in code[a:b])]
+        swaps_at = re.finditer(r"--config\b|\.cargo/config|\bCARGO_(HOME|PATHS|SOURCE_\w+|PATCH_\w+)\b", text)
+        found = [(m, swap) for m in swaps_at]
+        found += [(m, build) for m in CARGO_ENV.finditer(text) if m[0] not in ENV_KEYS | {"CARGO_HOME"}]
+        for m, what in found:
+            if any(a <= m.start() < b for a, b in parts) and not (what == build and swap_env.fullmatch(m[0])):
+                errors.append(f"{show(path)}:{line_of(text, m.start())}: `{m[0]}` {what}")
 
     toml = toml_of(crate / "Cargo.toml")
     inherited = toml_of(root / "Cargo.toml").get("workspace", {}).get("dependencies", {})
@@ -995,6 +1047,7 @@ mod tests { fn helper() {} }
     env = '[env]\nRUST_MIN_STACK = "8388608"\n'
     vendored = '[source.crates-io]\nreplace-with = "v"\n[source.v]\ndirectory = "vendor"\n'
     patch = '[patch.crates-io]\nvstd = { path = "v" }\n'
+    rustflags = '[x]\nrustflags = ["--cfg", "x"]\n'
     pinned = {
         "tcb_added_item": ("src/verus/tcb.rs", tcb + "verus! { pub proof fn z() ensures false { assume(false); } }\n"),
         "tcb_changed_item": ("src/verus/tcb.rs", tcb.replace("-> u8", "-> u16")),
@@ -1047,6 +1100,29 @@ mod tests { fn helper() {} }
             "../.github/workflows/ci.yml",
             "env:\n  CARGO_HOME: h\nrun: python3 .github/scripts/verus-gates.py c\n",
         ),
+        # Config that changes what the Verus run builds or checks, not where a dependency comes from.
+        "config_rustflags": ("../.cargo/config.toml", env + rustflags.replace("x]", "build]")),
+        "config_wrapper": ("../.cargo/config.toml", env + '[build]\nrustc-wrapper = "w"\n'),
+        "config_target_dir": ("../x/.cargo/config", '[build]\ntarget-dir = "t"\n'),
+        "config_target": ("../.cargo/config.toml", env + rustflags.replace("x]", "target.'cfg(all())']")),
+        "config_env": ("../.cargo/config.toml", env + 'RUSTC_BOOTSTRAP = "1"\n'),
+        "config_unstable": ("../.cargo/config.toml", env + '[unstable]\nbuild-std = ["core"]\n'),
+        "config_profile": ("../.cargo/config.toml", env + "[profile.dev]\ndebug-assertions = false\n"),
+        "config_alias": ("../.cargo/config.toml", env + '[alias]\nverus = "check"\n'),
+        "config_registries": ("../.cargo/config.toml", env + '[registries.v]\nindex = "https://x"\n'),
+        "cargo_features": (
+            "../Cargo.toml",
+            'cargo-features = ["profile-rustflags"]\n' + root + rustflags.replace("x]", "profile.dev]"),
+        ),
+        "workflow_rustflags": (
+            "../.github/workflows/ci.yml",
+            "jobs:\n  verus:\n    env:\n      RUSTFLAGS: --cfg x\n"
+            "    steps:\n      - run: python3 .github/scripts/verus-gates.py c\n",
+        ),
+        "workflow_github_env": (
+            "../.github/workflows/ci.yml",
+            'run: |\n  python3 .github/scripts/verus-gates.py c\n  echo RUSTC_WRAPPER=w >> "$GITHUB_ENV"\n',
+        ),
     }
     for name, change in pinned.items():
         with tempfile.TemporaryDirectory() as tmp:
@@ -1066,18 +1142,45 @@ mod tests { fn helper() {} }
             assert check(crate), f"self-test `{name}`: not caught"
     # Cargo also reads its config from the environment and from $CARGO_HOME.
     with tempfile.TemporaryDirectory() as tmp:
-        crate = Path(tmp)
+        crate, home = Path(tmp, "w"), Path(tmp)
+        crate.mkdir()
         (crate / "Cargo.toml").write_text('[package]\nname = "t"\n')
-        (crate / "home").mkdir()
-        (crate / "home/config.toml").write_text(vendored)
-        assert not swaps(crate, {"CARGO_TERM_COLOR": "always"}), "self-test `env_ok`"
+        (home / "home").mkdir()
+        (home / "home/config.toml").write_text(vendored)
+        (home / "h/.cargo").mkdir(parents=True)
+        (home / "h/.cargo/config.toml").write_text(rustflags.replace("x]", "build]"))
+        assert not swaps(crate, {"CARGO_TERM_COLOR": "always", "CARGO_BUILD_JOBS": "4"}), "self-test `env_ok`"
         for key, value in [
             ("CARGO_SOURCE_CRATES_IO_REPLACE_WITH", "v"),
             ("CARGO_PATCH_CRATES_IO_VSTD_PATH", "v"),
             ("CARGO_PATHS", "v"),
-            ("CARGO_HOME", str(crate / "home")),
+            ("CARGO_HOME", str(home / "home")),
+            ("CARGO_HOME", str(home / "h/.cargo")),
+            ("HOME", str(home / "h")),
+            *((k, "--cfg x") for k in ("RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "RUSTDOCFLAGS")),
+            *((k, "w") for k in ("RUSTC", "RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER", "RUSTC_BOOTSTRAP")),
+            ("CARGO_BUILD_RUSTFLAGS", "--cfg x"),
+            ("CARGO_TARGET_DIR", "t"),
+            ("CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS", "--cfg x"),
+            ("CARGO_UNSTABLE_BUILD_STD", "core"),
+            ("CARGO_PROFILE_DEV_DEBUG_ASSERTIONS", "false"),
+            ("CARGO_ALIAS_VERUS", "check"),
+            ("__CARGO_TEST_CHANNEL_OVERRIDE_DO_NOT_USE_THIS", "nightly"),
         ]:
             assert swaps(crate, {key: value}), f"self-test `env {key}`: not caught"
+        # Only the workflow-level part and a job that runs these gates share their runner.
+        (crate / ".github/workflows").mkdir(parents=True)
+        job = "  {}:\n    env:\n      {}: -D warnings\n    steps:\n      - run: {}\n"
+        docs = job.format("docs", "RUSTDOCFLAGS", "cargo doc")
+        gate = "python3 .github/scripts/verus-gates.py c"
+        gates = "  # see verus-gates.py\n" + job.format("verus", "VERUS_VERSION", gate)
+        for name, text, want_ok in [
+            ("workflow_other_job", docs + gates, True),
+            ("workflow_gate_job", docs.replace("cargo doc", gate), False),
+        ]:
+            (crate / ".github/workflows/ci.yml").write_text("env:\n  CARGO_TERM_COLOR: always\njobs:\n" + text)
+            errors = swaps(crate, {})
+            assert (not errors) == want_ok, f"self-test `{name}`: {errors}"
 
     def report(verified: int, errors: int, fns: list[str]) -> str:
         breakdown = [{"function": f, "mode:": "exec", "success": True} for f in fns]
