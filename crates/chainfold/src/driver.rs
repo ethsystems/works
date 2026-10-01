@@ -152,7 +152,8 @@ pub struct DriverStatus {
     /// Engine status behind this driver.
     pub engine: EngineStatus,
     /// True once the most recent applied poll read up to the head and found nothing new;
-    /// a `Behind` or `SourceError` tick leaves it as it was.
+    /// a `Behind` or `SourceError` tick leaves it as it was, and a `Terminal` tick clears
+    /// it.
     pub caught_up: bool,
     /// Events the fold declared not its own.
     pub skips: u64,
@@ -538,7 +539,8 @@ where
     }
 
     /// True once the most recent applied poll read up to the head and found nothing new;
-    /// a `Behind` or `SourceError` tick leaves it as it was.
+    /// a `Behind` or `SourceError` tick leaves it as it was, and a `Terminal` tick clears
+    /// it.
     #[cfg_attr(verus_keep_ghost, verus_verify)]
     pub fn is_caught_up(&self) -> bool {
         self.caught_up
@@ -689,7 +691,7 @@ where
             old(self).durable_ok() ==> final(self).durable_ok(),
             r matches Tick::RolledBack { to } ==> rolled_back(*old(self), *final(self), ancestor, to),
             r is Resynced ==> resynced(*old(self), *final(self)),
-            r is Terminal ==> *final(self) == (Driver { engine: final(self).engine, ..*old(self) })
+            r is Terminal ==> *final(self) == (Driver { engine: final(self).engine, caught_up: false, ..*old(self) })
                 && final(self).engine@ == (EngineView { status: final(self).engine@.status, ..old(self).engine@ }),
             // The ladder: rollback, else resync or HorizonExceeded when no live slot
             // qualifies; an Unrecoverable engine stays so.
@@ -733,6 +735,7 @@ where
             }
             Err(RollbackError::NoCheckpointAtOrBelow { .. }) => self.resync_or_terminal(),
             Err(RollbackError::Unrecoverable { cause }) => {
+                self.caught_up = false;
                 Tick::Terminal(EngineStatus::Unrecoverable { cause })
             }
         }
@@ -751,7 +754,7 @@ where
             old(self).durable_ok() ==> final(self).durable_ok(),
             exists|h: ReplayHorizon| #[trigger] ladder_tail(old(self).config.start_block, h, r),
             r is Resynced ==> resynced(*old(self), *final(self)),
-            r is Terminal ==> *final(self) == (Driver { engine: final(self).engine, ..*old(self) })
+            r is Terminal ==> *final(self) == (Driver { engine: final(self).engine, caught_up: false, ..*old(self) })
                 && final(self).engine@ == (EngineView { status: final(self).engine@.status, ..old(self).engine@ }),
     ))]
     #[cold]
@@ -765,6 +768,7 @@ where
                         needed: self.config.start_block,
                         horizon,
                     });
+                self.caught_up = false;
                 #[cfg(verus_keep_ghost)]
                 proof! {
                     assert forall|k: int| #[trigger] self.engine@.live_at(k) implies old(self).engine@.live_at(k) by {}
@@ -948,6 +952,7 @@ where
     fn poll_apply(&mut self) -> Tick {
         self.generation = self.generation.wrapping_add(1);
         if !self.engine.status().is_active() {
+            self.caught_up = false;
             let tick = Tick::Terminal(self.engine.status());
             #[cfg(verus_keep_ghost)]
             proof! {
@@ -1167,6 +1172,7 @@ where
             }
             Err(ApplyError::Halted { .. } | ApplyError::Poisoned { .. }) => {
                 self.tip = None;
+                self.caught_up = false;
                 let tick = Tick::Terminal(self.engine.status());
                 #[cfg(verus_keep_ghost)]
                 proof! {
@@ -3786,6 +3792,49 @@ mod tests {
     }
 
     #[test]
+    fn a_terminal_tick_is_not_caught_up() {
+        for kind in [FailKind::Halt, FailKind::Poison] {
+            // given a driver caught up on blocks 0..=1, and a fold that fails at the event of
+            // the next block
+            let mut chain = ScriptedChain::new(0);
+            chain.push_block(&[1]);
+            chain.push_block(&[]);
+            let mut driver =
+                new_driver(chain, engine_config(2), DriverConfig::from_block(0));
+            run_to_idle(&mut driver);
+            assert!(driver.is_caught_up());
+            driver.source.push_block(&[2]);
+            driver.engine_mut().fold_mut().fail_at = Some((Position::new(2, 0), kind));
+            // when the poll that reads it ends the engine
+            let tick = driver.tick();
+            // then the driver does not report caught up
+            assert!(matches!(tick, Tick::Terminal(_)));
+            assert!(!driver.is_caught_up());
+            assert!(!driver.status().caught_up);
+        }
+
+        // given a driver caught up on blocks 1..=5, on a source whose horizon then rises
+        // above the start block
+        let mut chain = ScriptedChain::new(1);
+        for value in 1..=5u64 {
+            chain.push_block(&[value]);
+        }
+        let mut driver = new_driver(chain, engine_config(0), DriverConfig::default());
+        run_to_idle(&mut driver);
+        assert!(driver.is_caught_up());
+        driver.source_mut().reorg(3, &[&[10], &[20], &[30]]);
+        driver.source_mut().set_horizon(ReplayHorizon::FromBlock(1));
+        // when a fork surfaces that only a resync could recover from
+        let tick = driver.tick();
+        // then the engine is unrecoverable, and the driver does not report caught up
+        assert!(matches!(
+            tick,
+            Tick::Terminal(EngineStatus::Unrecoverable { .. })
+        ));
+        assert!(!driver.is_caught_up());
+    }
+
+    #[test]
     fn generation_increments_every_tick() {
         // given a driver over an empty chain
         let chain = ScriptedChain::new(1);
@@ -5440,7 +5489,7 @@ spec fn recovered<F: Fold, S: Source<Event = F::Event>, K: SnapshotSink<F>>(
         0 < lo <= ring.len() && from <= k < hist.len() && #[trigger] probe_held(ring, lo, hist[k])
             && rolled_back(mid, post, ring[lo - 1].number, to)
     &&& r is Resynced ==> resynced(mid, post)
-    &&& r is Terminal ==> post == (Driver { engine: post.engine, ..mid })
+    &&& r is Terminal ==> post == (Driver { engine: post.engine, caught_up: false, ..mid })
         && post.engine@ == (EngineView { status: post.engine@.status, ..pre.engine@ })
     &&& r is SourceError ==> post == (Driver {
         consecutive_errors: if pre.consecutive_errors < u32::MAX {

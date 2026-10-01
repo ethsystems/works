@@ -501,8 +501,8 @@ spec 27737d649a25 src/driver.rs::Driver::run_checkpoint
 spec 8527b0f10708 src/driver.rs::Driver::offer_snapshot
 spec eecadb290432 src/driver.rs::Driver::lose_durability
 spec 7c5b66f69c7b src/driver.rs::Driver::clamp_marks
-spec 2bf545ca997b src/driver.rs::Driver::roll_back_to
-spec 28bcd4d3c406 src/driver.rs::Driver::resync_or_terminal
+spec fb44634ef304 src/driver.rs::Driver::roll_back_to
+spec e23da2b8c91a src/driver.rs::Driver::resync_or_terminal
 spec b933d47806de src/driver.rs::Driver::resync
 spec 460f2c103d7b src/driver.rs::Driver::reconcile_reset
 spec 9ba9a901eb78 src/driver.rs::Driver::reconcile_reset_slow
@@ -529,7 +529,7 @@ spec ed2cd9830c07 src/driver.rs::group_into
 spec 70d5b0f602c9 src/driver.rs::clamp_spec
 spec c5c8e113698e src/driver.rs::floor_ok
 spec eac4e894af9e src/driver.rs::resynced
-spec 5184378066c3 src/driver.rs::recovered
+spec fa73b02c50d9 src/driver.rs::recovered
 spec e365ca34ec86 src/driver.rs::rolled_back
 spec d10a1aafbd53 src/driver.rs::due_spec
 spec c4ec99a8e050 src/driver.rs::checkpointed
