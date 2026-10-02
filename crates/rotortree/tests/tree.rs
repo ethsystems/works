@@ -137,6 +137,95 @@ fn snapshot_get_node_and_level_len() {
     }
 }
 
+fn snapshots_at_max_depth<const N: usize, const DEPTH: usize>(
+    mut check: impl FnMut(&rotortree::TreeSnapshot<N, DEPTH>),
+) {
+    let capacity = N.pow(DEPTH as u32);
+    for batched in [false, true] {
+        for count in (capacity / N + 1)..=capacity {
+            let mut tree = LeanIMT::<XorHasher, N, DEPTH>::new(XorHasher);
+            let leaves: Vec<Hash> = (0..count as u32).map(leaf).collect();
+            if batched {
+                tree.insert_many(&leaves).unwrap();
+            } else {
+                for hash in leaves {
+                    tree.insert(hash).unwrap();
+                }
+            }
+            let snapshot = tree.snapshot();
+            assert_eq!(snapshot.depth(), DEPTH);
+            check(&snapshot);
+            // The root access must not change inclusion proof generation.
+            for index in 0..count as u64 {
+                assert!(
+                    snapshot
+                        .generate_proof(index)
+                        .unwrap()
+                        .verify(&XorHasher)
+                        .unwrap()
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn snapshot_level_len_returns_one_at_max_depth() {
+    snapshots_at_max_depth::<2, 1>(|snapshot| {
+        assert_eq!(snapshot.level_len(snapshot.depth()), 1);
+    });
+    snapshots_at_max_depth::<2, 3>(|snapshot| {
+        assert_eq!(snapshot.level_len(snapshot.depth()), 1);
+    });
+    snapshots_at_max_depth::<3, 2>(|snapshot| {
+        assert_eq!(snapshot.level_len(snapshot.depth()), 1);
+    });
+}
+
+#[test]
+fn snapshot_get_node_returns_root_at_max_depth() {
+    fn check<const N: usize, const DEPTH: usize>(
+        snapshot: &rotortree::TreeSnapshot<N, DEPTH>,
+    ) {
+        assert_eq!(
+            snapshot.get_node(snapshot.depth(), 0),
+            Ok(snapshot.root().unwrap())
+        );
+        assert_eq!(
+            snapshot.get_node(snapshot.depth(), 1),
+            Err(TreeError::IndexOutOfRange { index: 1, size: 1 })
+        );
+        assert_eq!(snapshot.level_len(snapshot.depth() + 1), 0);
+        assert_eq!(
+            snapshot.get_node(snapshot.depth() + 1, 0),
+            Err(TreeError::IndexOutOfRange { index: 0, size: 0 })
+        );
+    }
+    snapshots_at_max_depth::<2, 1>(check);
+    snapshots_at_max_depth::<2, 3>(check);
+    snapshots_at_max_depth::<3, 2>(check);
+}
+
+#[test]
+fn snapshot_root_access_preserves_empty_and_single_leaf_behavior() {
+    let mut tree = LeanIMT::<XorHasher, 2, 1>::new(XorHasher);
+    let empty = tree.snapshot();
+    assert_eq!(empty.level_len(0), 0);
+    assert_eq!(
+        empty.get_node(0, 0),
+        Err(TreeError::IndexOutOfRange { index: 0, size: 0 })
+    );
+    tree.insert(leaf(7)).unwrap();
+    let single = tree.snapshot();
+    assert_eq!(single.depth(), 0);
+    assert_eq!(single.level_len(0), 1);
+    assert_eq!(single.get_node(0, 0), Ok(leaf(7)));
+    assert_eq!(
+        single.get_node(0, 1),
+        Err(TreeError::IndexOutOfRange { index: 1, size: 1 })
+    );
+}
+
 #[test]
 fn proof_for_last_leaf() {
     // given

@@ -82,6 +82,9 @@ impl<const N: usize, const MAX_DEPTH: usize> TreeSnapshot<N, MAX_DEPTH> {
         if level > self.depth {
             return 0;
         }
+        if level == self.depth {
+            return usize::from(self.root.is_some());
+        }
         self.levels[level].len()
     }
 
@@ -92,6 +95,16 @@ impl<const N: usize, const MAX_DEPTH: usize> TreeSnapshot<N, MAX_DEPTH> {
                 index: index as u64,
                 size: 0,
             });
+        }
+        // At MAX_DEPTH the root has no slot in `levels`; it is stored separately.
+        if level == self.depth {
+            return self
+                .root
+                .filter(|_| index == 0)
+                .ok_or(TreeError::IndexOutOfRange {
+                    index: index as u64,
+                    size: u64::from(self.root.is_some()),
+                });
         }
         self.levels[level].get(index)
     }
