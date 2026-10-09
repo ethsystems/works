@@ -143,7 +143,7 @@ impl Shared {
     }
 }
 
-/// Shared cell one durability token waits on.
+/// Cell the flusher thread settles with one submitted snapshot's outcome.
 #[derive(Default)]
 struct TokenState {
     result: Mutex<Option<Result<(), FlushError>>>,
@@ -159,29 +159,16 @@ impl TokenState {
             self.ready.notify_all();
         }
     }
-}
 
-/// One submitted snapshot's durability outcome.
-#[derive(Clone)]
-pub struct DurabilityToken {
-    state: Arc<TokenState>,
-}
-
-impl DurabilityToken {
     /// Blocks until the flush completes or fails.
-    pub fn wait(&self) -> Result<(), FlushError> {
-        let guard = lock_recovering(&self.state.result);
+    #[cfg(test)]
+    fn wait(&self) -> Result<(), FlushError> {
+        let guard = lock_recovering(&self.result);
         let guard = self
-            .state
             .ready
             .wait_while(guard, |result| result.is_none())
             .unwrap_or_else(|error| error.into_inner());
         (*guard).expect("condvar wakes only after the result is set")
-    }
-
-    /// Non-blocking read of the flush outcome, if it has completed.
-    pub fn try_result(&self) -> Option<Result<(), FlushError>> {
-        *lock_recovering(&self.state.result)
     }
 }
 
@@ -236,7 +223,10 @@ pub struct Flusher<V: Vfs + Send + 'static> {
 
 impl<V: Vfs + Send + 'static> Flusher<V> {
     /// Spawns the background fsync thread over an opened store.
+    ///
+    /// A `queue_depth` of 0 counts as 1.
     pub fn spawn(store: SnapshotStore<V>, queue_depth: usize) -> Self {
+        let queue_depth = queue_depth.max(1);
         let (sender, receiver) = mpsc::sync_channel::<Job>(queue_depth);
         let shared = Arc::new(Shared::new(queue_depth, store.durable_cursor()));
         let thread_shared = Arc::clone(&shared);
@@ -249,11 +239,30 @@ impl<V: Vfs + Send + 'static> Flusher<V> {
     }
 
     /// Fails fast once a prior flush failed; the watermark never moves after that.
-    pub fn submit(
+    ///
+    /// Private, so only an engine's own offer can move the watermark:
+    ///
+    /// ```compile_fail,E0624
+    /// use chainfold::{
+    ///     Position,
+    ///     storage::{
+    ///         Flusher,
+    ///         RealVfs,
+    ///     },
+    /// };
+    ///
+    /// // given the flusher a driver hands out through `Driver::sink`
+    /// fn given(flusher: &Flusher<RealVfs>) {
+    ///     // when a caller submits a snapshot at a cursor the engine never reached
+    ///     flusher.submit(Vec::new(), Some(Position::new(1_000_000, 0)));
+    /// }
+    /// // then it does not compile
+    /// ```
+    fn submit(
         &self,
         snapshot: Vec<u8>,
         cursor: Option<Position>,
-    ) -> Result<DurabilityToken, FlushError> {
+    ) -> Result<Arc<TokenState>, FlushError> {
         if self.shared.is_poisoned() {
             return Err(FlushError::Closed);
         }
@@ -268,7 +277,7 @@ impl<V: Vfs + Send + 'static> Flusher<V> {
         if self.sender.send(job).is_err() {
             return Err(FlushError::Closed);
         }
-        Ok(DurabilityToken { state: token })
+        Ok(token)
     }
 
     /// Cursor a reopen of the store would recover; falls when a resync commits
@@ -641,5 +650,21 @@ mod tests {
         assert_eq!(first.wait(), Ok(()));
         let second = handle.join().unwrap().unwrap();
         assert_eq!(second.wait(), Ok(()));
+    }
+
+    #[test]
+    fn zero_queue_depth_counts_as_one() {
+        // given a flusher spawned with queue_depth 0
+        let dir = PathBuf::from("/flusher");
+        let (store, _) = SnapshotStore::open(config(dir, 1), CrashVfs::new()).unwrap();
+        let flusher = Flusher::spawn(store, 0);
+        // when a snapshot is submitted from another thread, so a stall cannot hang the test
+        let (done_tx, done_rx) = mpsc::channel();
+        thread::spawn(move || {
+            let token = flusher.submit(b"snapshot".to_vec(), Some(Position::new(1, 0)));
+            let _ = done_tx.send(token.map(|token| token.wait()));
+        });
+        // then the flush completes instead of blocking the first submit forever
+        assert_eq!(done_rx.recv_timeout(Duration::from_secs(5)), Ok(Ok(Ok(()))));
     }
 }

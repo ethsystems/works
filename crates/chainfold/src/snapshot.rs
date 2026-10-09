@@ -344,7 +344,6 @@ impl<F: Persist> Engine<F> {
         }
         let cursor = (envelope.cursor_set != 0)
             .then(|| Position::new(envelope.cursor_block, envelope.cursor_log_index));
-        // A cursorless engine has an empty ring, so None must pair with no entries.
         if envelope.ring_numbers.last().copied() != cursor.map(|pos| pos.block) {
             return Err(SnapshotError::RingCursorMismatch);
         }
@@ -757,19 +756,19 @@ mod tests {
     }
 
     #[test]
-    fn cursorless_envelope_with_a_ring_is_refused() {
-        // given a hand-built envelope with no cursor but one observed block
+    fn cursorless_snapshot_with_a_ring_is_refused() {
+        // given a hand-built envelope with no cursor and a one-block ring
         let mut state = Vec::new();
         RecordingFold::default().encode_state(&mut state);
         let bytes = encode_custom(
             RecordingFold::STATE_TAG.as_bytes(),
             None,
-            &[block(5, 0)],
+            &[block(3, 0)],
             state,
         );
         // when decoded
         let result = Engine::<RecordingFold>::decode_snapshot(&bytes, test_config());
-        // then RingCursorMismatch; no engine reaches a cursorless state with a ring
+        // then RingCursorMismatch, since an engine without a cursor has observed nothing
         assert_eq!(result.unwrap_err(), SnapshotError::RingCursorMismatch);
     }
 }

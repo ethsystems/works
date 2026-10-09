@@ -30,13 +30,15 @@ use crate::{
 const MIN_RING_CAPACITY: usize = 2;
 /// Largest allowed observed-block ring capacity.
 const MAX_RING_CAPACITY: usize = 1 << 20;
+/// Largest allowed checkpoint slot count.
+const MAX_CHECKPOINT_SLOTS: usize = 1 << 16;
 
 /// Fixed engine construction parameters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EngineConfig {
     /// Observed-block window W; power of two between 2 and 1 << 20.
     pub ring_capacity: usize,
-    /// Retained checkpoint slots K; zero disables rollback.
+    /// Retained checkpoint slots K, at most 1 << 16; zero disables rollback.
     pub checkpoint_slots: usize,
 }
 
@@ -50,7 +52,7 @@ impl Default for EngineConfig {
 }
 
 impl EngineConfig {
-    /// Accepts a power-of-two ring capacity within the allowed range.
+    /// Accepts a power-of-two ring capacity and a slot count within the allowed ranges.
     pub(crate) fn validate(&self) -> Result<(), ConfigError> {
         if !self.ring_capacity.is_power_of_two() {
             return Err(ConfigError::RingCapacityNotPowerOfTwo {
@@ -60,6 +62,11 @@ impl EngineConfig {
         if !(MIN_RING_CAPACITY..=MAX_RING_CAPACITY).contains(&self.ring_capacity) {
             return Err(ConfigError::RingCapacityOutOfRange {
                 got: self.ring_capacity,
+            });
+        }
+        if self.checkpoint_slots > MAX_CHECKPOINT_SLOTS {
+            return Err(ConfigError::CheckpointSlotsOutOfRange {
+                got: self.checkpoint_slots,
             });
         }
         Ok(())
@@ -880,6 +887,32 @@ mod tests {
         assert_eq!(
             result.err(),
             Some(ConfigError::RingCapacityNotPowerOfTwo { got: 12 })
+        );
+    }
+
+    #[test]
+    fn config_rejects_checkpoint_slots_past_the_cap() {
+        // given slot counts at the cap, one past it, and far past it
+        let config = |checkpoint_slots| EngineConfig {
+            ring_capacity: 8,
+            checkpoint_slots,
+        };
+        // when constructing
+        let at_cap = Engine::new(RecordingFold::default(), config(MAX_CHECKPOINT_SLOTS));
+        let past_cap =
+            Engine::new(RecordingFold::default(), config(MAX_CHECKPOINT_SLOTS + 1));
+        let far_past = Engine::new(RecordingFold::default(), config(usize::MAX));
+        // then only the cap is accepted, and the rest are typed errors, never a panic
+        assert!(at_cap.is_ok());
+        assert_eq!(
+            past_cap.err(),
+            Some(ConfigError::CheckpointSlotsOutOfRange {
+                got: MAX_CHECKPOINT_SLOTS + 1,
+            })
+        );
+        assert_eq!(
+            far_past.err(),
+            Some(ConfigError::CheckpointSlotsOutOfRange { got: usize::MAX })
         );
     }
 

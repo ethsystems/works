@@ -139,6 +139,11 @@ pub enum ConfigError {
         /// Capacity the caller asked for.
         got: usize,
     },
+    /// Checkpoint slot count is above the allowed maximum.
+    CheckpointSlotsOutOfRange {
+        /// Slot count the caller asked for.
+        got: usize,
+    },
     /// Source cannot replay from the configured start block.
     HorizonExceedsStart {
         /// Block the driver folds from.
@@ -156,6 +161,9 @@ impl fmt::Display for ConfigError {
             }
             Self::RingCapacityOutOfRange { got } => {
                 write!(f, "ring capacity {got} is out of the allowed range")
+            }
+            Self::CheckpointSlotsOutOfRange { got } => {
+                write!(f, "checkpoint slot count {got} is out of the allowed range")
             }
             Self::HorizonExceedsStart { start, horizon } => {
                 write!(f, "replay horizon {horizon} exceeds start block {start}")
