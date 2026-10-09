@@ -17,9 +17,10 @@ durable, a reorg noticed only when a proof stops verifying.
 - **apply**: a poll fills one `Batch`; the `Engine` enforces the total order, drops
   everything at or below the cursor as already applied, and counts the events the fold
   declares are not its own.
-- **detect**: each batch carries the current header of the cursor block. A block hash
-  commits to its whole ancestry, so a reorg touching anything at or below the cursor
-  changes that one hash. One header per poll, one 40-byte compare.
+- **detect**: each batch carries the current header of the cursor block, or reuses the one
+  last checked while the head has not moved. A block hash commits to its whole ancestry,
+  so a reorg touching anything at or below the cursor changes that one hash. One 40-byte
+  compare per poll.
 - **recover**: on a mismatch, the driver bisects the ring of observed blocks with
   `header_at` for the deepest still-canonical block, rolls back to the newest checkpoint
   at or below it, and refolds forward. `O(log W)` probes, then deterministic replay.

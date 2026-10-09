@@ -43,6 +43,8 @@ const DEFAULT_BACKOFF_BASE: Duration = Duration::from_millis(200);
 const DEFAULT_BACKOFF_MAX: Duration = Duration::from_secs(30);
 /// Default blocks between checkpoints.
 const DEFAULT_CHECKPOINT_INTERVAL: u64 = 64;
+/// Most windows one tick reads; a longer walk goes on in the next tick.
+const MAX_SPAN: u64 = 64;
 
 /// True when `block` has reached the next interval step past the last marked block.
 fn due(last: Option<u64>, block: u64, interval: u64) -> bool {
@@ -52,7 +54,9 @@ fn due(last: Option<u64>, block: u64, interval: u64) -> bool {
 /// Outcome of one driver tick.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tick {
-    /// Batch applied; the summary counts what the fold saw.
+    /// Batch applied; the summary counts what the fold saw. A zero summary means the walk
+    /// stopped at its per-tick cap with nothing to fold yet; the next tick goes on from
+    /// there.
     Progressed(ApplySummary),
     /// Poll returned nothing new.
     Idle,
@@ -73,9 +77,13 @@ pub enum Tick {
 
 /// What a scan leaves for the tick to act on.
 enum Scan {
-    /// `batch` is ready to apply.
-    Ready,
-    /// The source's head trails the cursor on the chain the ring observed; nothing to do.
+    /// `batch` is ready to apply; the walk ran under this head.
+    Ready(BlockRef),
+    /// The walk stopped at its cap with nothing to fold; `batch` holds only the boundary,
+    /// `anchor` is the block the walk ended on, and the walk ran under `head`.
+    Capped { anchor: BlockRef, head: BlockRef },
+    /// The source's head trails the cursor, or the walked mark, on the chain the ring
+    /// observed; nothing to do.
     Lagging,
     /// The source contradicted itself; its answer is dropped.
     Refused,
@@ -90,7 +98,7 @@ pub struct DriverStatus {
     pub last_verified: Option<BlockRef>,
     /// Engine status behind this driver.
     pub engine: EngineStatus,
-    /// True once the most recent poll returned no new blocks.
+    /// True once the most recent poll reached the head and found no new blocks.
     pub caught_up: bool,
     /// Events the fold declared not its own.
     pub skips: u64,
@@ -175,6 +183,20 @@ where
     seen_resets: u64,
     durability_lost: bool,
     advanced: bool,
+    /// Windows the next tick may read, up to `MAX_SPAN`: halves after a source error,
+    /// doubles after any other tick.
+    span: u64,
+    /// The block the last walk ended on when it stopped at its cap: the chain through it
+    /// has nothing to fold above the cursor, up to that block.
+    walked: Option<BlockRef>,
+    /// The head a tick read before and after a walk that folded or stopped at its cap,
+    /// once its boundary check passed. The chain it names holds the whole cursor block,
+    /// so a tick that finds the same head need not read that block again.
+    vouched: Option<BlockRef>,
+    /// Cursor and reset count the last tick left the engine at; None when that tick left
+    /// it halted or poisoned, or never ended. A different pair now means the caller moved
+    /// the engine.
+    left_at: Option<(Option<Position>, u64)>,
 }
 
 impl<F, S> Driver<F, S>
@@ -290,6 +312,10 @@ where
             seen_resets,
             durability_lost: false,
             advanced: false,
+            span: MAX_SPAN,
+            walked: None,
+            vouched: None,
+            left_at: None,
         };
         // A recovered engine holds no checkpoint. Its first poll would take one at the tip,
         // so a depth-1 reorg there would resync; keep one at the recovery point.
@@ -320,13 +346,25 @@ where
     }
 
     /// Mutable access to the underlying event source.
+    ///
+    /// A call drops the scan's progress, since the caller may change what it returns.
     pub fn source_mut(&mut self) -> &mut S {
+        self.walked = None;
+        self.vouched = None;
         &mut self.source
     }
 
-    /// True once the most recent poll returned no new blocks.
+    /// True once the most recent poll reached the head and found no new blocks.
     pub fn is_caught_up(&self) -> bool {
-        self.caught_up && self.engine.status().is_active()
+        self.caught_up
+            && self.engine.status().is_active()
+            && self.left_at == Some(self.engine_point())
+    }
+
+    /// The cursor and reset count, which change only when a tick or the caller moves the
+    /// engine.
+    fn engine_point(&self) -> (Option<Position>, u64) {
+        (self.engine.cursor(), self.engine.resets())
     }
 
     /// Runs the interval-based checkpoint rule.
@@ -435,13 +473,25 @@ where
             self.sink.reset();
             self.seen_resets = self.engine.resets();
         }
+        // An engine away from where the last tick left it was moved by the caller, so
+        // what was walked above its old cursor says nothing about the new one.
+        if self.left_at.take() != Some(self.engine_point()) {
+            self.walked = None;
+            self.vouched = None;
+        }
         let tick = self.poll_apply();
-        // Only forward cursor movement earns an immediate re-poll; a batch the
-        // engine fully deduped leaves the loop on its poll interval.
-        self.advanced = matches!(
-            tick,
-            Tick::Progressed(summary) if summary.applied > 0 || summary.skipped > 0
-        );
+        // A tick that folded, or walked to its cap, earns an immediate re-poll.
+        self.advanced = matches!(tick, Tick::Progressed(_));
+        self.span = if tick == Tick::SourceError {
+            (self.span / 2).max(1)
+        } else {
+            self.span.saturating_mul(2).min(MAX_SPAN)
+        };
+        self.left_at = self
+            .engine
+            .status()
+            .is_active()
+            .then(|| self.engine_point());
         tick
     }
 
@@ -451,8 +501,13 @@ where
         if !self.engine.status().is_active() {
             return Tick::Terminal(self.engine.status());
         }
-        match self.scan() {
-            Ok(Scan::Ready) => {}
+        let mut capped_at = None;
+        let head = match self.scan() {
+            Ok(Scan::Ready(head)) => head,
+            Ok(Scan::Capped { anchor, head }) => {
+                capped_at = Some(anchor);
+                head
+            }
             Ok(Scan::Lagging) => {
                 self.consecutive_errors = 0;
                 self.caught_up = true;
@@ -463,17 +518,27 @@ where
                 self.consecutive_errors = self.consecutive_errors.saturating_add(1);
                 return Tick::SourceError;
             }
-        }
+        };
         self.consecutive_errors = 0;
+        // The mark survives only a tick that folds nothing and passes its boundary check.
+        let walked = self.walked.take();
         match self.engine.apply_batch(&self.batch) {
             Ok(summary) => {
-                self.caught_up = self.batch.is_empty();
+                let idle = self.batch.is_empty() && capped_at.is_none();
+                if self.batch.is_empty() {
+                    self.walked = capped_at.or(walked);
+                }
+                // An idle walk read the head only once, so it vouches for no new head.
+                if !idle {
+                    self.vouched = Some(head);
+                }
+                self.caught_up = idle;
                 // A snapshot refusal overrides progress; a checkpoint is silent.
                 self.auto_checkpoint();
                 if let Some(tick) = self.offer_snapshot() {
                     return tick;
                 }
-                if self.batch.is_empty() {
+                if idle {
                     Tick::Idle
                 } else {
                     Tick::Progressed(summary)
@@ -500,14 +565,21 @@ where
     }
 
     /// Fills `batch` with the events after the cursor, plus the cursor block's header, all
-    /// as the chain `head` names reports them.
+    /// as the chain `head` names reports them. A walk stops at `span` windows; when it
+    /// has found nothing by then, the block it ended on is the mark the next walk starts
+    /// above. A head the last folding or capped tick vouched for is the same chain, so
+    /// the walk starts above the cursor block, and above the mark without checking it.
     fn scan(&mut self) -> Result<Scan, S::Error> {
         self.batch.clear();
         let head = self.source.head()?;
         let cursor = self.engine.cursor();
-        // a node behind the cursor on the chain the ring observed is lagging, not forked
-        if let Some(cursor) = cursor
-            && head.number < cursor.block
+        // a node behind the mark, or behind the cursor without one, on the chain the ring
+        // observed is lagging, not forked
+        if let Some(floor) = self
+            .walked
+            .map(|walked| walked.number)
+            .or(cursor.map(|cursor| cursor.block))
+            && head.number < floor
             && self
                 .engine
                 .observed()
@@ -518,8 +590,31 @@ where
 
         let window = self.source.window().max(1);
         let mut from = cursor.map_or(self.config.start_block, |cursor| cursor.block);
-        while from <= head.number {
-            let to = head.number.min(from.saturating_add(window - 1));
+        // The same head names the same chain, which still holds the cursor block that
+        // tick checked, so a walk can start above it.
+        let vouched = self.vouched == Some(head);
+        // A mark on the head's chain holds nothing to fold below it, and that chain holds
+        // the cursor block the mark was set over. Any other mark is stale.
+        let mut resumed = false;
+        if let Some(walked) = self.walked {
+            if vouched
+                || head == walked
+                || self.source.header_at(walked.number)? == Some(walked)
+            {
+                from = walked.number.saturating_add(1);
+                resumed = true;
+            } else {
+                self.walked = None;
+            }
+        } else if vouched && let Some(cursor) = cursor {
+            from = cursor.block.saturating_add(1);
+            resumed = true;
+        }
+        let end = head
+            .number
+            .min(from.saturating_add(self.span.saturating_mul(window) - 1));
+        while from <= end {
+            let to = end.min(from.saturating_add(window - 1));
             self.scratch.clear();
             self.source.events_in(from, to, &mut self.scratch)?;
             if self
@@ -559,11 +654,25 @@ where
         if let Some(cursor) = cursor
             && self.batch.boundary.is_none()
         {
-            self.batch.boundary = if head.number == cursor.block {
+            self.batch.boundary = if resumed {
+                self.engine.observed().last()
+            } else if head.number == cursor.block {
                 Some(head)
             } else {
                 self.source.header_at(cursor.block)?
             };
+        }
+        if end < head.number && self.batch.is_empty() {
+            // The head reads before and after the anchor read bracket it, so the anchor
+            // lies on the chain `head` names.
+            let anchor = self.source.header_at(end)?;
+            let unmoved = self.source.header_at(head.number)? == Some(head);
+            return Ok(match anchor {
+                Some(anchor) if unmoved && anchor.number == end => {
+                    Scan::Capped { anchor, head }
+                }
+                _ => Scan::Refused,
+            });
         }
         // What was read since `head` came from its chain only while the source still has
         // `head`. An answer that ends on `head` is no exception: it may still carry blocks
@@ -571,12 +680,14 @@ where
         if !self.batch.is_empty() && self.source.header_at(head.number)? != Some(head) {
             return Ok(Scan::Refused);
         }
-        Ok(Scan::Ready)
+        Ok(Scan::Ready(head))
     }
 
     /// Bisects the observed ring for the deepest still-canonical block, then rolls back.
     #[cold]
     fn recover_via_bisection(&mut self) -> Tick {
+        // The engine is about to leave the cursor block the head vouched for.
+        self.vouched = None;
         let observed: Vec<BlockRef> = self.engine.observed().collect();
         let mut lo = 0usize;
         let mut hi = observed.len();
@@ -674,6 +785,10 @@ mod tests {
     use alloc::{
         vec,
         vec::Vec,
+    };
+    use core::cell::{
+        Cell,
+        RefCell,
     };
     #[cfg(feature = "std")]
     use std::{
@@ -854,6 +969,127 @@ mod tests {
         }
     }
 
+    /// Scripted chain read through shared handles, so a test can move the chain between
+    /// ticks without `source_mut`, which drops the walk's mark. `gate` is asked once per
+    /// call and fails it by returning true; `hide` drops the events of one block; `lie_at`
+    /// answers the header request for that block with the next block's header.
+    struct Remote<'a, G> {
+        chain: &'a RefCell<ScriptedChain>,
+        calls: &'a Cell<u32>,
+        gate: G,
+        hide: Option<u64>,
+        lie_at: Option<u64>,
+    }
+
+    impl<G: FnMut() -> bool> Remote<'_, G> {
+        fn enter(&mut self) -> Result<(), PollFailure> {
+            self.calls.set(self.calls.get() + 1);
+            if (self.gate)() {
+                Err(PollFailure)
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    impl<G: FnMut() -> bool> Source for Remote<'_, G> {
+        type Event = u64;
+        type Error = PollFailure;
+
+        fn head(&mut self) -> Result<BlockRef, PollFailure> {
+            self.enter()?;
+            self.chain.borrow_mut().head()
+        }
+
+        fn header_at(&mut self, number: u64) -> Result<Option<BlockRef>, PollFailure> {
+            self.enter()?;
+            let asked = if self.lie_at == Some(number) {
+                number + 1
+            } else {
+                number
+            };
+            self.chain.borrow_mut().header_at(asked)
+        }
+
+        fn events_in(
+            &mut self,
+            from: u64,
+            to: u64,
+            out: &mut Vec<(BlockRef, u32, u64)>,
+        ) -> Result<(), PollFailure> {
+            self.enter()?;
+            self.chain.borrow_mut().events_in(from, to, out)?;
+            if let Some(hidden) = self.hide {
+                out.retain(|(block, ..)| block.number != hidden);
+            }
+            Ok(())
+        }
+
+        fn window(&self) -> u64 {
+            self.chain.borrow().window()
+        }
+    }
+
+    fn remote_driver<'a, G: FnMut() -> bool>(
+        chain: &'a RefCell<ScriptedChain>,
+        calls: &'a Cell<u32>,
+        gate: G,
+        engine: EngineConfig,
+        config: DriverConfig,
+    ) -> Driver<RecordingFold, Remote<'a, G>> {
+        let source = Remote {
+            chain,
+            calls,
+            gate,
+            hide: None,
+            lie_at: None,
+        };
+        Driver::new(RecordingFold::default(), source, engine, config).unwrap()
+    }
+
+    /// Runs one tick and returns it with the source calls it made.
+    fn tick_counted<G: FnMut() -> bool>(
+        driver: &mut Driver<RecordingFold, Remote<'_, G>>,
+        calls: &Cell<u32>,
+    ) -> (Tick, u32) {
+        let before = calls.get();
+        let tick = driver.tick();
+        (tick, calls.get() - before)
+    }
+
+    /// Chain of `blocks` blocks read `window` at a time; the block numbered `n` carries
+    /// the event `n` when `n` is listed and none otherwise.
+    fn sparse_chain(blocks: u64, window: u64, events: &[u64]) -> ScriptedChain {
+        let mut chain = ScriptedChain::new(1);
+        for number in 1..=blocks {
+            let carried: &[u64] = if events.contains(&number) {
+                &[number]
+            } else {
+                &[]
+            };
+            chain.push_block(carried);
+        }
+        chain.set_window(window);
+        chain
+    }
+
+    /// Replaces the blocks `first..` of `chain` with blocks up to `last`, carrying the
+    /// listed events as `sparse_chain` does.
+    fn replace_from(chain: &mut ScriptedChain, first: u64, last: u64, events: &[u64]) {
+        let depth = chain.tip().map_or(0, |tip| tip.number) + 1 - first;
+        let blocks: Vec<Vec<u64>> = (first..=last)
+            .map(|number| {
+                if events.contains(&number) {
+                    vec![number]
+                } else {
+                    vec![]
+                }
+            })
+            .collect();
+        let blocks: Vec<&[u64]> = blocks.iter().map(Vec::as_slice).collect();
+        chain.reorg(usize::try_from(depth).unwrap(), &blocks);
+    }
+
     fn engine_config(checkpoint_slots: usize) -> EngineConfig {
         EngineConfig {
             ring_capacity: 8,
@@ -900,6 +1136,21 @@ mod tests {
             outcome = driver.tick();
         }
         outcome
+    }
+
+    /// Ticks until the first `Idle`; a thousand ticks without one fail the test.
+    fn settle<F, S, K>(driver: &mut Driver<F, S, K>)
+    where
+        F: Fold + Clone,
+        S: Source<Event = F::Event>,
+        K: SnapshotSink<F>,
+    {
+        for _ in 0..1_000 {
+            if driver.tick() == Tick::Idle {
+                return;
+            }
+        }
+        panic!("the driver never went idle");
     }
 
     fn collect_to_idle<F, S, K>(driver: &mut Driver<F, S, K>) -> Vec<Tick>
@@ -1536,6 +1787,9 @@ mod tests {
         );
         assert!(!driver.is_caught_up());
         assert!(!driver.status().caught_up);
+        // and a manual recovery through engine_mut is not caught up before the next poll
+        driver.engine_mut().reset(RecordingFold::default());
+        assert!(!driver.is_caught_up());
     }
 
     #[cfg(feature = "std")]
@@ -1564,6 +1818,81 @@ mod tests {
                 at: Position::new(1, 0),
             }
         );
+        assert!(!driver.is_caught_up());
+        assert!(!driver.status().caught_up);
+    }
+
+    #[test]
+    fn fold_maintenance_between_ticks_keeps_caught_up() {
+        // given a driver over five one-event blocks
+        let mut chain = ScriptedChain::new(1);
+        for value in 1..=5u64 {
+            chain.push_block(&[value]);
+        }
+        let mut driver = new_driver(chain, engine_config(0), DriverConfig::default());
+        // when it ticks and then touches the fold, as a loop that prunes it does, until
+        // it reports caught up
+        let mut ticks = 0;
+        while !driver.is_caught_up() {
+            driver.tick();
+            driver.engine_mut().fold_mut();
+            ticks += 1;
+            assert!(ticks < 50, "the driver never reported caught up");
+        }
+        // then it gets there after one tick that folds and one that finds the head
+        assert_eq!(ticks, 2);
+        assert_eq!(folded(&driver), vec![1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn a_halted_engine_rolled_back_to_its_own_cursor_is_not_caught_up() {
+        // given a caught-up driver with a checkpoint at its cursor, whose fold halts on
+        // the next block's event
+        let mut chain = ScriptedChain::new(1);
+        chain.push_block(&[1]);
+        let fold = RecordingFold {
+            applied: Vec::new(),
+            fail_at: Some((Position::new(2, 0), FailKind::Halt)),
+        };
+        let mut driver =
+            Driver::new(fold, chain, engine_config(1), DriverConfig::default()).unwrap();
+        run_to_idle(&mut driver);
+        assert!(driver.is_caught_up());
+        // when that block arrives, the tick hits the halt, which leaves the cursor where
+        // it was, and the caller rolls back to the checkpoint there
+        driver.source_mut().push_block(&[2]);
+        driver.tick();
+        let restored = driver.engine_mut().rollback_at_or_below(1).unwrap();
+        // then the cursor is as it was, and the driver does not call that caught up
+        assert_eq!(restored, Some(Position::new(1, 0)));
+        assert!(!driver.is_caught_up());
+        assert!(!driver.status().caught_up);
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn a_poisoned_engine_rolled_back_to_its_own_cursor_is_not_caught_up() {
+        // given a caught-up driver with a checkpoint at its cursor, whose fold panics on
+        // the next block's event
+        let mut chain = ScriptedChain::new(1);
+        chain.push_block(&[1]);
+        let fold = RecordingFold {
+            applied: Vec::new(),
+            fail_at: Some((Position::new(2, 0), FailKind::Panic)),
+        };
+        let mut driver =
+            Driver::new(fold, chain, engine_config(1), DriverConfig::default()).unwrap();
+        run_to_idle(&mut driver);
+        assert!(driver.is_caught_up());
+        // when that block arrives, the panic out of the next tick is caught, and the
+        // caller rolls back to the checkpoint at the cursor, which the panic left alone
+        driver.source_mut().push_block(&[2]);
+        let caught =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| driver.tick()));
+        let restored = driver.engine_mut().rollback_at_or_below(1).unwrap();
+        // then the cursor is as it was, and the driver does not call that caught up
+        assert!(caught.is_err());
+        assert_eq!(restored, Some(Position::new(1, 0)));
         assert!(!driver.is_caught_up());
         assert!(!driver.status().caught_up);
     }
@@ -2279,5 +2608,789 @@ mod tests {
             }
         );
         assert_eq!(driver.source_mut().reads - before, 4);
+    }
+
+    #[test]
+    fn a_long_empty_walk_that_keeps_failing_still_finishes() {
+        // given an event, 1,000 empty blocks read four at a time, and another event, from
+        // a source that fails every 25th call, which is fewer calls than the walk needs
+        let chain = RefCell::new(sparse_chain(1_002, 4, &[1, 1_002]));
+        let calls = Cell::new(0);
+        let mut seen = 0;
+        let flaky = move || {
+            seen += 1;
+            seen % 25 == 0
+        };
+        let mut driver = remote_driver(
+            &chain,
+            &calls,
+            flaky,
+            engine_config(0),
+            DriverConfig::from_block(1),
+        );
+        // when ticked until the second event folds
+        for _ in 0..1_000 {
+            driver.tick();
+            if folded(&driver).len() == 2 {
+                break;
+            }
+        }
+        // then the walk got through the gap
+        assert_eq!(folded(&driver), vec![1, 1_002]);
+    }
+
+    #[test]
+    fn a_token_bucket_rate_limit_still_finishes() {
+        // given 2,000 empty blocks read four at a time, then an event, from a source
+        // that allows 10 calls a second with a burst of 20, takes 20 ms a call, and fails
+        // the rest
+        let chain = RefCell::new(sparse_chain(2_001, 4, &[2_001]));
+        let calls = Cell::new(0);
+        let clock = Cell::new(0u64);
+        let (mut tokens, mut last) = (20_000u64, 0u64);
+        let limiter = {
+            let clock = &clock;
+            move || {
+                clock.set(clock.get() + 20);
+                // a millisecond at 10 calls a second earns ten thousandths of a call
+                tokens = (tokens + (clock.get() - last) * 10).min(20_000);
+                last = clock.get();
+                let refused = tokens < 1_000;
+                if !refused {
+                    tokens -= 1_000;
+                }
+                refused
+            }
+        };
+        let mut driver = remote_driver(
+            &chain,
+            &calls,
+            limiter,
+            engine_config(0),
+            DriverConfig::from_block(1),
+        );
+        // when ticked, sleeping each tick's delay, until the event folds
+        for _ in 0..10_000 {
+            driver.tick();
+            if !folded(&driver).is_empty() {
+                break;
+            }
+            let delay = driver.next_delay();
+            clock.set(
+                clock.get() + delay.as_secs() * 1_000 + u64::from(delay.subsec_millis()),
+            );
+        }
+        // then the walk finished inside the limit
+        assert_eq!(folded(&driver), vec![2_001]);
+    }
+
+    #[test]
+    fn a_reorg_that_adds_events_below_the_mark_drops_it() {
+        // given a driver folded to the event at block 1, whose next walk stopped at its
+        // cap over 256 empty blocks of a 600-block chain read four at a time
+        let chain = RefCell::new(sparse_chain(600, 4, &[1, 600]));
+        let calls = Cell::new(0);
+        let mut driver = remote_driver(
+            &chain,
+            &calls,
+            || false,
+            engine_config(0),
+            DriverConfig::from_block(1),
+        );
+        driver.tick();
+        let capped = driver.tick();
+        assert_eq!(capped, Tick::Progressed(ApplySummary::default()));
+        // when blocks 60 to 600 are replaced, with an event at 60 below the walk's end
+        replace_from(&mut chain.borrow_mut(), 60, 600, &[60, 600]);
+        settle(&mut driver);
+        // then the new event folds with the rest
+        assert_eq!(folded(&driver), vec![1, 60, 600]);
+    }
+
+    #[test]
+    fn source_mut_drops_the_mark() {
+        // given a driver folded to the event at block 1, whose next walk stopped at its
+        // cap over a source that hides the event at block 60
+        let chain = RefCell::new(sparse_chain(600, 4, &[1, 60, 600]));
+        let calls = Cell::new(0);
+        let mut driver = remote_driver(
+            &chain,
+            &calls,
+            || false,
+            engine_config(0),
+            DriverConfig::from_block(1),
+        );
+        driver.source_mut().hide = Some(60);
+        driver.tick();
+        let capped = driver.tick();
+        assert_eq!(capped, Tick::Progressed(ApplySummary::default()));
+        // when the source starts to answer for block 60
+        driver.source_mut().hide = None;
+        settle(&mut driver);
+        // then the walk starts again at the cursor and folds it
+        assert_eq!(folded(&driver), vec![1, 60, 600]);
+    }
+
+    #[test]
+    fn engine_mut_drops_the_mark() {
+        // given a driver folded to block 3 one block per query, with a checkpoint at each
+        // event, whose next walk stopped at its cap over empty blocks
+        let chain = RefCell::new(sparse_chain(250, 1, &[1, 2, 3, 250]));
+        let calls = Cell::new(0);
+        let config = DriverConfig {
+            checkpoint_interval: Some(1),
+            ..DriverConfig::from_block(1)
+        };
+        let mut driver =
+            remote_driver(&chain, &calls, || false, engine_config(4), config);
+        for _ in 0..3 {
+            driver.tick();
+        }
+        let capped = driver.tick();
+        assert_eq!(capped, Tick::Progressed(ApplySummary::default()));
+        // when the engine is rolled back to block 2 by hand
+        driver.engine_mut().rollback_at_or_below(2).unwrap();
+        settle(&mut driver);
+        // then the walk starts again at the restored cursor and folds block 3 once more
+        assert_eq!(folded(&driver), vec![1, 2, 3, 250]);
+    }
+
+    #[test]
+    fn a_long_empty_walk_finishes_through_fold_maintenance_between_its_ticks() {
+        // given an event, 600 empty blocks read four at a time, and another event
+        let chain = RefCell::new(sparse_chain(602, 4, &[1, 602]));
+        let calls = Cell::new(0);
+        let mut driver = remote_driver(
+            &chain,
+            &calls,
+            || false,
+            engine_config(0),
+            DriverConfig::from_block(1),
+        );
+        // when it ticks, touching the fold after each tick, until the second event folds
+        for _ in 0..100 {
+            driver.tick();
+            driver.engine_mut().fold_mut();
+            if folded(&driver).len() == 2 {
+                break;
+            }
+        }
+        // then the walk got through the gap, which takes more than one capped tick
+        assert_eq!(folded(&driver), vec![1, 602]);
+    }
+
+    #[test]
+    fn a_manual_rollback_clears_caught_up_and_the_mark() {
+        // given a driver folded to block 3 one block per query, with a checkpoint at each
+        // event, that went idle after walks over empty blocks left a mark
+        let chain = RefCell::new(sparse_chain(250, 1, &[1, 2, 3]));
+        let calls = Cell::new(0);
+        let config = DriverConfig {
+            checkpoint_interval: Some(1),
+            ..DriverConfig::from_block(1)
+        };
+        let mut driver =
+            remote_driver(&chain, &calls, || false, engine_config(4), config);
+        settle(&mut driver);
+        assert!(driver.is_caught_up());
+        assert!(driver.walked.is_some());
+        // when the engine is rolled back to block 2 by hand
+        driver.engine_mut().rollback_at_or_below(2).unwrap();
+        // then it is not caught up
+        assert!(!driver.is_caught_up());
+        assert!(!driver.status().caught_up);
+        // and the walk starts again at the restored cursor and folds block 3 once more
+        settle(&mut driver);
+        assert_eq!(folded(&driver), vec![1, 2, 3]);
+        assert!(driver.is_caught_up());
+    }
+
+    #[test]
+    fn a_manual_reset_of_an_engine_with_no_cursor_is_not_caught_up() {
+        // given a caught-up driver over an empty chain, so its engine has no cursor
+        let mut driver = new_driver(
+            ScriptedChain::new(1),
+            engine_config(0),
+            DriverConfig::default(),
+        );
+        driver.tick();
+        assert!(driver.is_caught_up());
+        // when the engine is reset by hand
+        driver.engine_mut().reset(RecordingFold::default());
+        // then the driver is not caught up before its next poll
+        assert!(!driver.is_caught_up());
+        driver.tick();
+        assert!(driver.is_caught_up());
+    }
+
+    #[test]
+    fn a_manual_reset_clears_caught_up_and_the_mark() {
+        // given a driver folded to the event at block 1 of 250 blocks read one at a time,
+        // that went idle after walks over empty blocks left a mark
+        let chain = RefCell::new(sparse_chain(250, 1, &[1]));
+        let calls = Cell::new(0);
+        let mut driver = remote_driver(
+            &chain,
+            &calls,
+            || false,
+            engine_config(0),
+            DriverConfig::from_block(1),
+        );
+        settle(&mut driver);
+        assert!(driver.is_caught_up());
+        assert!(driver.walked.is_some());
+        // when the engine is reset by hand
+        driver.engine_mut().reset(RecordingFold::default());
+        // then it is not caught up
+        assert!(!driver.is_caught_up());
+        assert!(!driver.status().caught_up);
+        // and it folds the chain again from the start instead of going on from the mark
+        settle(&mut driver);
+        assert_eq!(folded(&driver), vec![1]);
+        assert!(driver.is_caught_up());
+    }
+
+    #[test]
+    fn a_mark_off_the_head_chain_is_dropped_for_good() {
+        // given a fresh driver whose first walk stopped at its cap at block 256 of a
+        // 600-block chain with no events
+        let chain = RefCell::new(sparse_chain(600, 4, &[]));
+        let calls = Cell::new(0);
+        let mut driver = remote_driver(
+            &chain,
+            &calls,
+            || false,
+            engine_config(0),
+            DriverConfig::from_block(1),
+        );
+        driver.tick();
+        // when blocks 2 and up are replaced by empty blocks up to 256, and the driver polls
+        // twice
+        replace_from(&mut chain.borrow_mut(), 2, 256, &[]);
+        let first = tick_counted(&mut driver, &calls);
+        let second = tick_counted(&mut driver, &calls);
+        // then the first poll finds the mark off the head's chain and walks from the
+        // start instead, 64 windows, and the second has no mark to check
+        assert_eq!([first, second], [(Tick::Idle, 66), (Tick::Idle, 65)]);
+    }
+
+    #[test]
+    fn a_head_below_the_mark_is_idle_and_changes_nothing() {
+        // given a driver folded to the event at block 1, whose next walk stopped at its
+        // cap at block 257 of a 600-block chain
+        let chain = RefCell::new(sparse_chain(600, 4, &[1]));
+        let calls = Cell::new(0);
+        let mut driver = remote_driver(
+            &chain,
+            &calls,
+            || false,
+            engine_config(0),
+            DriverConfig::from_block(1),
+        );
+        driver.tick();
+        driver.tick();
+        let mark = driver.walked;
+        assert_eq!(mark, chain.borrow().header(257));
+        // when the source answers from a node that is only at block 100
+        let full = chain.borrow().clone();
+        chain.borrow_mut().reorg(500, &[]);
+        let (tick, read) = tick_counted(&mut driver, &calls);
+        // then the tick reads the head and stops, and nothing it holds moves
+        assert_eq!((tick, read), (Tick::Idle, 1));
+        assert!(driver.is_caught_up());
+        assert_eq!(driver.next_delay(), Duration::from_secs(1));
+        assert_eq!(driver.engine().cursor(), Some(Position::new(1, 0)));
+        assert_eq!(folded(&driver), vec![1]);
+        assert_eq!(driver.walked, mark);
+        // and the walk goes on from the mark once the node catches up, without a check of
+        // the mark, since the head is the one the capped walk read twice
+        *chain.borrow_mut() = full;
+        let (tick, read) = tick_counted(&mut driver, &calls);
+        assert_eq!(
+            (tick, read),
+            (Tick::Progressed(ApplySummary::default()), 67)
+        );
+    }
+
+    #[test]
+    fn a_first_sync_behind_the_mark_waits_for_the_node() {
+        // given a fresh driver whose first walk stopped at its cap at block 256 of a
+        // 600-block chain with no events
+        let chain = RefCell::new(sparse_chain(600, 4, &[]));
+        let calls = Cell::new(0);
+        let mut driver = remote_driver(
+            &chain,
+            &calls,
+            || false,
+            engine_config(0),
+            DriverConfig::from_block(1),
+        );
+        driver.tick();
+        let mark = driver.walked;
+        assert_eq!(mark, chain.borrow().header(256));
+        // when the source answers from a node that is only at block 100
+        chain.borrow_mut().reorg(500, &[]);
+        let (tick, read) = tick_counted(&mut driver, &calls);
+        // then the tick reads the head and stops, and the mark stays
+        assert_eq!((tick, read), (Tick::Idle, 1));
+        assert_eq!(driver.walked, mark);
+    }
+
+    #[test]
+    fn a_head_that_contradicts_the_ring_is_a_fork_even_below_the_mark() {
+        // given a driver folded to the event at block 1, whose next walk stopped at its
+        // cap at block 257 of a 600-block chain
+        let chain = RefCell::new(sparse_chain(600, 4, &[1]));
+        let calls = Cell::new(0);
+        let mut driver = remote_driver(
+            &chain,
+            &calls,
+            || false,
+            engine_config(0),
+            DriverConfig::from_block(1),
+        );
+        driver.tick();
+        driver.tick();
+        // when the source answers from a one-block chain whose block 1 is another block
+        let mut other = sparse_chain(1, 4, &[]);
+        other.reorg(1, &[&[1]]);
+        *chain.borrow_mut() = other;
+        let tick = driver.tick();
+        // then the tick is no wait for a node to catch up: the engine resyncs
+        assert_eq!(tick, Tick::Resynced);
+    }
+
+    #[test]
+    fn a_failed_tick_keeps_the_mark() {
+        // given a driver whose first walk stopped at its cap at block 256 of a 600-block
+        // chain with no events, and whose source fails its 70th call, the third of the
+        // next tick
+        let chain = RefCell::new(sparse_chain(600, 4, &[]));
+        let calls = Cell::new(0);
+        let mut seen = 0;
+        let gate = move || {
+            seen += 1;
+            seen == 70
+        };
+        let mut driver = remote_driver(
+            &chain,
+            &calls,
+            gate,
+            engine_config(0),
+            DriverConfig::from_block(1),
+        );
+        driver.tick();
+        // when that tick fails, and the next one runs
+        let failed = driver.tick();
+        let mark = driver.walked;
+        let next = tick_counted(&mut driver, &calls);
+        // then the failure left the mark, and the next walk, half as long, goes on from it
+        assert_eq!(failed, Tick::SourceError);
+        assert_eq!(mark, chain.borrow().header(256));
+        assert_eq!(next, (Tick::Progressed(ApplySummary::default()), 35));
+        assert_eq!(driver.walked, chain.borrow().header(384));
+    }
+
+    #[test]
+    fn a_fold_inside_the_cap_costs_what_it_did() {
+        // given a fresh driver over a 600-block chain read four at a time, with an event
+        // in block 10
+        let chain = RefCell::new(sparse_chain(600, 4, &[10]));
+        let calls = Cell::new(0);
+        let mut driver = remote_driver(
+            &chain,
+            &calls,
+            || false,
+            engine_config(0),
+            DriverConfig::from_block(1),
+        );
+        // when ticked once
+        let (tick, read) = tick_counted(&mut driver, &calls);
+        // then the walk stops at the window with the event, and the tick reads the head,
+        // three windows, and the head block again
+        let applied = ApplySummary {
+            applied: 1,
+            deduped: 0,
+            skipped: 0,
+        };
+        assert_eq!((tick, read), (Tick::Progressed(applied), 5));
+    }
+
+    #[test]
+    fn a_head_on_the_mark_costs_one_call() {
+        // given a driver folded to the event at block 1, whose next walk stopped at its
+        // cap at block 257 of a 600-block chain
+        let chain = RefCell::new(sparse_chain(600, 4, &[1]));
+        let calls = Cell::new(0);
+        let mut driver = remote_driver(
+            &chain,
+            &calls,
+            || false,
+            engine_config(0),
+            DriverConfig::from_block(1),
+        );
+        driver.tick();
+        driver.tick();
+        // when the source answers from a node whose head is that block
+        chain.borrow_mut().reorg(343, &[]);
+        let (tick, read) = tick_counted(&mut driver, &calls);
+        // then the tick reads the head and nothing else
+        assert_eq!((tick, read), (Tick::Idle, 1));
+    }
+
+    #[test]
+    fn a_long_walk_goes_on_from_the_block_its_last_tick_ended_on() {
+        // given a fresh driver over 600 blocks read four at a time, whose only event is
+        // in the last block
+        let chain = RefCell::new(sparse_chain(600, 4, &[600]));
+        let calls = Cell::new(0);
+        let mut driver = remote_driver(
+            &chain,
+            &calls,
+            || false,
+            engine_config(0),
+            DriverConfig::from_block(1),
+        );
+        // when ticked four times, counting each tick's calls
+        let mut ticks = vec![tick_counted(&mut driver, &calls)];
+        let first_delay = driver.next_delay();
+        let first_caught_up = driver.is_caught_up();
+        ticks.extend((0..3).map(|_| tick_counted(&mut driver, &calls)));
+        // then two ticks stop at 64 windows with nothing to fold, and ask for no delay
+        // and no caught-up; each costs the head, its windows, the block it ended on and
+        // the head block again, and the second starts above the mark without checking it,
+        // since the head is the one the first read twice
+        let empty = Tick::Progressed(ApplySummary::default());
+        let applied = Tick::Progressed(ApplySummary {
+            applied: 1,
+            deduped: 0,
+            skipped: 0,
+        });
+        assert_eq!(
+            ticks,
+            vec![(empty, 67), (empty, 67), (applied, 24), (Tick::Idle, 1)]
+        );
+        assert_eq!(first_delay, Duration::ZERO);
+        assert!(!first_caught_up);
+        assert_eq!(folded(&driver), vec![600]);
+    }
+
+    #[test]
+    fn a_failed_walk_is_halved_and_a_good_one_doubles_the_next() {
+        // given 400 empty blocks read one at a time, from a source that fails its first
+        // eight calls
+        let chain = RefCell::new(sparse_chain(400, 1, &[]));
+        let calls = Cell::new(0);
+        let mut seen = 0;
+        let gate = move || {
+            seen += 1;
+            seen <= 8
+        };
+        let mut driver = remote_driver(
+            &chain,
+            &calls,
+            gate,
+            engine_config(0),
+            DriverConfig::from_block(1),
+        );
+        // when ticked sixteen times
+        let read: Vec<u32> = (0..16)
+            .map(|_| tick_counted(&mut driver, &calls).1)
+            .collect();
+        // then the span runs 64 down to 1 and stays there, then 1 up to 64 and stays
+        // there: a tick costs its windows, the head, the block it ended on and the head
+        // block again, with no check of the mark, since the head is the one the tick
+        // before read twice
+        assert_eq!(
+            read,
+            vec![1, 1, 1, 1, 1, 1, 1, 1, 4, 5, 7, 11, 19, 35, 67, 67]
+        );
+    }
+
+    #[test]
+    fn a_head_reorg_does_not_cost_a_walk_its_progress() {
+        // given a driver whose two capped walks over 600 empty blocks read four at a time
+        // ended at blocks 256 and 512
+        let chain = RefCell::new(sparse_chain(600, 4, &[]));
+        let calls = Cell::new(0);
+        let mut driver = remote_driver(
+            &chain,
+            &calls,
+            || false,
+            engine_config(0),
+            DriverConfig::from_block(1),
+        );
+        driver.tick();
+        driver.tick();
+        // when the head block is replaced by two blocks, and later one more block follows
+        replace_from(&mut chain.borrow_mut(), 600, 601, &[]);
+        let replaced = tick_counted(&mut driver, &calls);
+        chain.borrow_mut().push_block(&[]);
+        let followed = tick_counted(&mut driver, &calls);
+        // then each walk starts above block 512 and reaches the head: the head, the check
+        // of the mark, and 89 or 90 blocks in 23 windows
+        assert_eq!([replaced, followed], [(Tick::Idle, 25); 2]);
+    }
+
+    #[test]
+    fn a_walk_that_fails_its_boundary_check_leaves_no_mark() {
+        // given a driver folded to the event at block 1 of a 600-block chain read four at
+        // a time
+        let chain = RefCell::new(sparse_chain(600, 4, &[1, 600]));
+        let calls = Cell::new(0);
+        let mut driver = remote_driver(
+            &chain,
+            &calls,
+            || false,
+            engine_config(0),
+            DriverConfig::from_block(1),
+        );
+        driver.tick();
+        // when the whole chain is replaced, so the next walk stops at its cap over empty
+        // blocks and finds block 1 changed
+        {
+            let mut chain = chain.borrow_mut();
+            let mut blocks = vec![vec![11]];
+            blocks.resize(599, vec![]);
+            blocks.push(vec![600]);
+            let blocks: Vec<&[u64]> = blocks.iter().map(Vec::as_slice).collect();
+            chain.reorg(600, &blocks);
+        }
+        let recovery = driver.tick();
+        settle(&mut driver);
+        // then the engine resyncs and folds the new chain from the start
+        assert_eq!(recovery, Tick::Resynced);
+        assert_eq!(folded(&driver), vec![11, 600]);
+    }
+
+    #[test]
+    fn an_anchor_that_is_not_the_block_asked_for_is_a_source_error() {
+        // given a source that answers the request for block 256 with block 257's header
+        let chain = RefCell::new(sparse_chain(600, 4, &[]));
+        let calls = Cell::new(0);
+        let mut driver = remote_driver(
+            &chain,
+            &calls,
+            || false,
+            engine_config(0),
+            DriverConfig::from_block(1),
+        );
+        driver.source_mut().lie_at = Some(256);
+        // when a walk stops at its cap and asks for the block it ended on
+        let tick = driver.tick();
+        // then the answer is refused
+        assert_eq!(tick, Tick::SourceError);
+    }
+
+    /// A driver over `chain`, which is read one block at a time, folded to the head, with
+    /// a checkpoint at each block.
+    fn head_cache_driver<'a>(
+        chain: &'a RefCell<ScriptedChain>,
+        calls: &'a Cell<u32>,
+    ) -> Driver<RecordingFold, Remote<'a, impl FnMut() -> bool>> {
+        let config = DriverConfig {
+            checkpoint_interval: Some(1),
+            ..DriverConfig::from_block(1)
+        };
+        let mut driver = remote_driver(chain, calls, || false, engine_config(8), config);
+        settle(&mut driver);
+        driver
+    }
+
+    #[test]
+    fn an_unchanged_head_skips_the_read_of_the_cursor_block() {
+        // given a driver over five one-event blocks read one at a time
+        let chain = RefCell::new(sparse_chain(5, 1, &[1, 2, 3, 4, 5]));
+        let calls = Cell::new(0);
+        let mut driver = remote_driver(
+            &chain,
+            &calls,
+            || false,
+            engine_config(0),
+            DriverConfig::from_block(1),
+        );
+        // when it ticks to the head and once more, counting each tick's calls
+        let reads: Vec<u32> = (0..6)
+            .map(|_| tick_counted(&mut driver, &calls).1)
+            .collect();
+        // then a tick that folds reads the head, the next block and the head block again,
+        // and the poll after the last reads the head and nothing else
+        assert_eq!(reads, vec![3, 3, 3, 3, 3, 1]);
+    }
+
+    #[test]
+    fn a_reorg_below_the_cursor_block_is_caught_when_the_head_changes() {
+        // given a driver folded to block 5 of five one-event blocks
+        let chain = RefCell::new(sparse_chain(5, 1, &[1, 2, 3, 4, 5]));
+        let calls = Cell::new(0);
+        let mut driver = head_cache_driver(&chain, &calls);
+        // when blocks 3 to 5 are replaced by blocks with other events, so the head is
+        // another block at the same height
+        chain.borrow_mut().reorg(3, &[&[30], &[40], &[50]]);
+        let found = driver.tick();
+        settle(&mut driver);
+        // then the next poll finds the fork and rolls back, and the new events fold
+        assert_eq!(
+            found,
+            Tick::RolledBack {
+                to: Some(Position::new(2, 0)),
+            }
+        );
+        assert_eq!(folded(&driver), vec![1, 2, 30, 40, 50]);
+    }
+
+    #[test]
+    fn source_mut_drops_the_head_cache() {
+        // given a driver folded to the head, whose poll with the head unchanged reads the
+        // head and nothing else
+        let chain = RefCell::new(sparse_chain(5, 1, &[1, 2, 3, 4, 5]));
+        let calls = Cell::new(0);
+        let mut driver = head_cache_driver(&chain, &calls);
+        assert_eq!(tick_counted(&mut driver, &calls), (Tick::Idle, 1));
+        // when the source is borrowed, which may change what it returns
+        driver.source_mut();
+        // then the next poll reads the cursor block again
+        assert_eq!(tick_counted(&mut driver, &calls), (Tick::Idle, 2));
+    }
+
+    #[test]
+    fn a_manual_rollback_drops_the_head_cache() {
+        // given a driver folded to the head, whose poll with the head unchanged reads the
+        // head and nothing else
+        let chain = RefCell::new(sparse_chain(5, 1, &[1, 2, 3, 4, 5]));
+        let calls = Cell::new(0);
+        let mut driver = head_cache_driver(&chain, &calls);
+        assert_eq!(tick_counted(&mut driver, &calls), (Tick::Idle, 1));
+        // when the engine is rolled back to block 3 by hand
+        driver.engine_mut().rollback_at_or_below(3).unwrap();
+        let refold = tick_counted(&mut driver, &calls);
+        // then the next tick reads the cursor block again, the next block, and the head
+        // block, and folds block 4
+        let applied = ApplySummary {
+            applied: 1,
+            deduped: 0,
+            skipped: 0,
+        };
+        assert_eq!(refold, (Tick::Progressed(applied), 4));
+    }
+
+    #[test]
+    fn a_rollback_drops_the_head_cache() {
+        // given a driver folded to block 5 of five one-event blocks read one at a time,
+        // with a checkpoint at each
+        let chain = RefCell::new(sparse_chain(5, 1, &[1, 2, 3, 4, 5]));
+        let calls = Cell::new(0);
+        let mut driver = head_cache_driver(&chain, &calls);
+        let original = chain.borrow().clone();
+        // when block 5 is replaced, the next poll rolls back to block 4, and the chain
+        // goes back to the original block 5
+        chain.borrow_mut().reorg(1, &[&[50]]);
+        let found = driver.tick();
+        *chain.borrow_mut() = original;
+        let refold = tick_counted(&mut driver, &calls);
+        // then the poll after the rollback reads the cursor block again, the next block,
+        // and the head block, though the head is the one the driver vouched for before it
+        let applied = ApplySummary {
+            applied: 1,
+            deduped: 0,
+            skipped: 0,
+        };
+        assert_eq!(
+            found,
+            Tick::RolledBack {
+                to: Some(Position::new(4, 0)),
+            }
+        );
+        assert_eq!(refold, (Tick::Progressed(applied), 4));
+    }
+
+    #[test]
+    fn an_answer_that_fails_the_shape_check_vouches_for_no_head() {
+        // given a driver folded to block 5 of five one-event blocks read two at a time,
+        // with a checkpoint at each
+        let mut chain = one_event_chain(5);
+        chain.set_window(2);
+        let config = DriverConfig {
+            checkpoint_interval: Some(1),
+            ..DriverConfig::from_block(1)
+        };
+        let mut driver = hostile_driver(chain, 8, config);
+        run_to_idle(&mut driver);
+        // when block 5 is replaced and a block 6 follows it, and the first answer from
+        // that chain also lists a rival block 6
+        let rival = BlockRef {
+            number: 6,
+            hash: [7; 32],
+        };
+        let source = driver.source_mut();
+        source.inner.reorg(1, &[&[50], &[60]]);
+        source.extra = vec![(rival, 0, 666)];
+        let refused = driver.tick();
+        // and the next answer is clean
+        let found = driver.tick();
+        // then the refused tick folded nothing, and the next one still checks the cursor
+        // block against the new chain
+        assert_eq!(refused, Tick::SourceError);
+        assert_eq!(
+            found,
+            Tick::RolledBack {
+                to: Some(Position::new(4, 0)),
+            }
+        );
+    }
+
+    #[test]
+    fn an_idle_poll_on_a_new_head_does_not_vouch_for_it() {
+        // given a driver folded to the head of five one-event blocks read one at a time
+        let chain = RefCell::new(sparse_chain(5, 1, &[1, 2, 3, 4, 5]));
+        let calls = Cell::new(0);
+        let mut driver = head_cache_driver(&chain, &calls);
+        // when a block with no events arrives and the driver polls twice
+        chain.borrow_mut().push_block(&[]);
+        let first = tick_counted(&mut driver, &calls);
+        let second = tick_counted(&mut driver, &calls);
+        // then each poll reads the head, the cursor block and the new block, since the
+        // walk that found nothing read the head only once
+        assert_eq!([first, second], [(Tick::Idle, 3); 2]);
+    }
+
+    #[test]
+    fn a_resumed_driver_reads_the_rest_of_its_cursor_block() {
+        // given an engine that took the first event of block 2 and no more, over a chain
+        // read one block at a time
+        let mut scripted = ScriptedChain::new(1);
+        scripted.push_block(&[1]);
+        scripted.push_block(&[20, 21, 22]);
+        scripted.push_block(&[30]);
+        scripted.set_window(1);
+        let chain = RefCell::new(scripted);
+        let mut engine = Engine::new(RecordingFold::default(), engine_config(0)).unwrap();
+        let mut partial = Batch::new();
+        partial.push_block(chain.borrow().header(1).unwrap(), [(0, 1)]);
+        partial.push_block(chain.borrow().header(2).unwrap(), [(0, 20)]);
+        engine.apply_batch(&partial).unwrap();
+        let calls = Cell::new(0);
+        let source = Remote {
+            chain: &chain,
+            calls: &calls,
+            gate: || false,
+            hide: None,
+            lie_at: None,
+        };
+        let mut driver = Driver::resume(
+            engine,
+            source,
+            RecordingFold::default(),
+            DriverConfig::from_block(1),
+        )
+        .unwrap();
+        // when it is ticked to the head and once more, counting each tick's calls
+        let reads: Vec<u32> = (0..3)
+            .map(|_| tick_counted(&mut driver, &calls).1)
+            .collect();
+        // then the first tick reads the cursor block and folds the rest of it, and only
+        // the ticks after it find a head they have vouched for
+        assert_eq!(folded(&driver), vec![1, 20, 21, 22, 30]);
+        assert_eq!(reads, vec![3, 3, 1]);
     }
 }

@@ -201,8 +201,8 @@ fn flusher_sink_persists_and_resumes() {
     }
 
     // then the durable cursor trails the tip, the resume starts there, and the view converges
-    assert_eq!(durable_cursor, Some(Position::new(7, 0)));
-    assert_eq!(resume_cursor, Some(Position::new(7, 0)));
+    assert_eq!(durable_cursor, Some(Position::new(8, 0)));
+    assert_eq!(resume_cursor, Some(Position::new(8, 0)));
     assert_eq!(resumed.engine().cursor(), Some(Position::new(10, 0)));
     let expected: Vec<(Position, u64)> = (1..=10u64)
         .map(|value| (Position::new(value, 0), value))
