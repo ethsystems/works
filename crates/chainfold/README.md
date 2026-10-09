@@ -66,8 +66,7 @@ and recovery), and the adapters (`std`: tokio harness, snapshot store, flusher).
 - rollback is bounded to K retained checkpoints. Over-rollback past still-canonical but
   unobserved blocks is intended; the discarded events replay deterministically.
 - the recovery ladder is rollback, then resync from genesis, then a typed terminal state.
-  `DivergenceCause` names which rung ran out: fork deeper than the window, no checkpoint
-  below the ancestor, source horizon short of the start block.
+  `DivergenceCause` names which rung ran out: source horizon short of the start block.
 - `EngineStatus::Unrecoverable` is only left by a `reset`. Automated progress stops
   rather than folding on untrusted state.
 - the snapshot envelope is engine-owned: magic, format version, fold identity tag,
@@ -183,11 +182,10 @@ dependency stack that a guest or wasm build has no use for.
 ### Tuning
 
 - `EngineConfig::ring_capacity` (W): observed-block window, a power of two in `[2, 1 << 20]`.
-  It bounds fork detection; a fork deeper than the oldest ring entry is
-  `ForkBeyondWindow`.
+  It bounds fork detection; a fork deeper than the oldest ring entry escalates to a resync.
 - `EngineConfig::checkpoint_slots` (K): retained rollback points. Zero disables rollback,
-  so `Halt` and `Poison` escalate straight to resync and anchor checks never fire. That is
-  the default shape of most consumers today, not an edge case.
+  so every fork escalates to a resync. That is the default shape of most consumers today,
+  not an edge case.
 - `DriverConfig::checkpoint_interval`: blocks of cursor progress between automatic
   checkpoints. The reorg an offered snapshot survives without a resync is
   `checkpoint_slots * checkpoint_interval` blocks; size both against the deepest reorg

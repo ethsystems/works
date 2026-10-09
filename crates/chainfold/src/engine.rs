@@ -1240,7 +1240,11 @@ mod tests {
     fn unrecoverable_refuses_apply_and_rollback() {
         // given mark_unrecoverable
         let mut engine = new_engine();
-        engine.mark_unrecoverable(DivergenceCause::ForkBeyondWindow);
+        let cause = DivergenceCause::HorizonExceeded {
+            needed: 0,
+            horizon: 1,
+        };
+        engine.mark_unrecoverable(cause);
         // when applying or rolling back
         let apply_result =
             engine.apply_batch(&batch_of(None, vec![(block(1, 0), vec![0])]));
@@ -1249,17 +1253,10 @@ mod tests {
         assert_eq!(
             apply_result,
             Err(ApplyError::NotActive {
-                status: EngineStatus::Unrecoverable {
-                    cause: DivergenceCause::ForkBeyondWindow
-                },
+                status: EngineStatus::Unrecoverable { cause },
             })
         );
-        assert_eq!(
-            rollback_result,
-            Err(RollbackError::Unrecoverable {
-                cause: DivergenceCause::ForkBeyondWindow,
-            })
-        );
+        assert_eq!(rollback_result, Err(RollbackError::Unrecoverable { cause }));
     }
 
     #[test]

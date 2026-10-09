@@ -331,7 +331,13 @@ impl Source for ScriptedChain {
             usize::try_from(number.saturating_sub(self.first_block))
                 .map_or(self.blocks.len(), |i| i.min(self.blocks.len()))
         };
-        let (start, end) = (index(from), index(to.saturating_add(1)));
+        // One past `to`, without the `to + 1` that saturates at u64::MAX.
+        let end = if to < self.first_block {
+            0
+        } else {
+            index(to).saturating_add(1).min(self.blocks.len())
+        };
+        let start = index(from);
         for block in &self.blocks[start.min(end)..end] {
             let header = BlockRef {
                 number: block.number,
@@ -742,6 +748,20 @@ mod tests {
         // then only those two blocks' events
         let numbers: Vec<u64> = out.iter().map(|(block, ..)| block.number).collect();
         assert_eq!(numbers, vec![2, 3]);
+    }
+
+    #[test]
+    fn events_in_includes_the_block_numbered_u64_max() {
+        // given blocks numbered u64::MAX - 1 and u64::MAX
+        let mut chain = ScriptedChain::new(u64::MAX - 1);
+        chain.push_block(&[1]);
+        chain.push_block(&[2]);
+        let mut out = Vec::new();
+        // when reading a range that ends at u64::MAX
+        chain.events_in(u64::MAX - 1, u64::MAX, &mut out).unwrap();
+        // then both blocks' events
+        let numbers: Vec<u64> = out.iter().map(|(block, ..)| block.number).collect();
+        assert_eq!(numbers, vec![u64::MAX - 1, u64::MAX]);
     }
 
     #[test]
