@@ -17,15 +17,17 @@ durable, a reorg noticed only when a proof stops verifying.
 - **apply**: a poll fills one `Batch`; the `Engine` enforces the total order, drops
   everything at or below the cursor as already applied, and counts the events the fold
   declares are not its own.
-- **detect**: each batch carries the current header of the cursor block. A block hash
-  commits to its whole ancestry, so a reorg touching anything at or below the cursor
-  changes that one hash. One header per poll, one 40-byte compare.
+- **detect**: each batch carries the current header of the cursor block, or reuses the one
+  last checked while the head has not moved. A block hash commits to its whole ancestry,
+  so a reorg touching anything at or below the cursor changes that one hash. One 40-byte
+  compare per poll.
 - **recover**: on a mismatch, the driver bisects the ring of observed blocks with
   `header_at` for the deepest still-canonical block, rolls back to the newest checkpoint
   at or below it, and refolds forward. `O(log W)` probes, then deterministic replay.
 - **persist**: the driver offers the oldest retained checkpoint to a sink; a flusher
   thread fsyncs it. The durable cursor trails the applied cursor and names what a
-  restart recovers, so the apply path never fsyncs and replay closes the gap.
+  restart recovers, so the apply path never fsyncs and replay closes the gap. After a
+  reset it is None until a later offer commits.
 
 ```mermaid
 flowchart LR
@@ -59,14 +61,13 @@ and recovery), and the adapters (`std`: tokio harness, snapshot store, flusher).
   counted and stepped over), `Halt` (clean below this position, rollback or resync),
   `Poison` (partially mutated, untrusted until a restore).
 - `Source` is three reads: `head`, `header_at`, `events_in`. The driver owns the window
-  walk, the scan mark, the boundary refetch, and the grouping into spans, so a source
-  cannot get the batch shape wrong and every source gets fork detection. `Ok(None)` from
-  a probe means suspected fork.
+  walk, the boundary refetch, and the grouping into spans, so a source cannot get the
+  batch shape wrong and every source gets fork detection. `Ok(None)` from a probe means
+  suspected fork.
 - rollback is bounded to K retained checkpoints. Over-rollback past still-canonical but
   unobserved blocks is intended; the discarded events replay deterministically.
 - the recovery ladder is rollback, then resync from genesis, then a typed terminal state.
-  `DivergenceCause` names which rung ran out: fork deeper than the window, no checkpoint
-  below the ancestor, source horizon short of the start block.
+  `DivergenceCause` names which rung ran out: source horizon short of the start block.
 - `EngineStatus::Unrecoverable` is only left by a `reset`. Automated progress stops
   rather than folding on untrusted state.
 - the snapshot envelope is engine-owned: magic, format version, fold identity tag,
@@ -182,11 +183,10 @@ dependency stack that a guest or wasm build has no use for.
 ### Tuning
 
 - `EngineConfig::ring_capacity` (W): observed-block window, a power of two in `[2, 1 << 20]`.
-  It bounds fork detection; a fork deeper than the oldest ring entry is
-  `ForkBeyondWindow`.
+  It bounds fork detection; a fork deeper than the oldest ring entry escalates to a resync.
 - `EngineConfig::checkpoint_slots` (K): retained rollback points. Zero disables rollback,
-  so `Halt` and `Poison` escalate straight to resync and anchor checks never fire. That is
-  the default shape of most consumers today, not an edge case.
+  so every fork escalates to a resync. That is the default shape of most consumers today,
+  not an edge case.
 - `DriverConfig::checkpoint_interval`: blocks of cursor progress between automatic
   checkpoints. The reorg an offered snapshot survives without a resync is
   `checkpoint_slots * checkpoint_interval` blocks; size both against the deepest reorg

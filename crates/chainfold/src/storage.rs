@@ -6,7 +6,6 @@ mod store;
 mod vfs;
 
 pub use flusher::{
-    DurabilityToken,
     FlushError,
     Flusher,
 };

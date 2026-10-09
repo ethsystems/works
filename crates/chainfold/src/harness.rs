@@ -1,6 +1,11 @@
 //! Tokio harness: runs a `Driver` on its own thread and publishes status into a watch.
 
 use std::{
+    panic::{
+        AssertUnwindSafe,
+        catch_unwind,
+        resume_unwind,
+    },
     sync::{
         Arc,
         Condvar,
@@ -53,13 +58,22 @@ where
                     loop_state.0.lock().expect("harness state mutex poisoned");
                 std::mem::take(&mut guard.checkpoint_requests)
             };
-            // Requests coalesce into one checkpoint, keeping the K slots at K cursors.
-            if requests > 0 {
-                driver.checkpoint();
-            }
-            driver.tick();
+            // A fold panic leaves the engine Poisoned: publish that terminal status and end
+            // the loop. A panic that leaves the engine active is not the fold's, so rethrow.
+            let outcome = catch_unwind(AssertUnwindSafe(|| {
+                // Requests coalesce into one checkpoint, keeping the K slots at K cursors.
+                if requests > 0 {
+                    driver.checkpoint();
+                }
+                driver.tick();
+            }));
             let status = driver.status();
             let _ = status_tx.send(status);
+            if let Err(panic) = outcome
+                && !status.is_terminal()
+            {
+                resume_unwind(panic);
+            }
             let stop = loop_state
                 .0
                 .lock()
@@ -131,8 +145,8 @@ impl<T> Handle<T> {
 
     /// Returns when the durable cursor reaches `pos` or the driver is terminal.
     ///
-    /// A later resync lowers the durable cursor, so the answer holds for the
-    /// instant it resolves.
+    /// A later resync clears the durable cursor until an offer made after it commits, so
+    /// the answer holds for the instant it resolves.
     pub async fn wait_durable(&mut self, pos: Position) -> DriverStatus {
         self.settled(|s| s.is_terminal() || s.durable_cursor.is_some_and(|c| c >= pos))
             .await
@@ -166,6 +180,11 @@ impl<T: Send + 'static> Handle<T> {
 #[cfg(test)]
 mod tests {
     use std::{
+        convert::Infallible,
+        sync::atomic::{
+            AtomicBool,
+            Ordering,
+        },
         time::Duration,
         vec,
         vec::Vec,
@@ -178,6 +197,10 @@ mod tests {
             DriverConfig,
         },
         engine::EngineConfig,
+        error::{
+            EngineStatus,
+            FoldError,
+        },
         test_util::{
             FailKind,
             RecordingFold,
@@ -335,6 +358,79 @@ mod tests {
         let status = timeout(handle.wait_caught_up()).await;
         // then the wait resolves with a terminal status instead of hanging
         assert!(status.is_terminal());
+    }
+
+    #[tokio::test]
+    async fn a_fold_panic_publishes_a_poisoned_status_and_keeps_the_driver() {
+        // given a driver whose fold panics on the second block's event
+        let mut chain = ScriptedChain::new(1);
+        chain.push_block(&[1]);
+        chain.push_block(&[2]);
+        let fold = RecordingFold {
+            applied: Vec::new(),
+            fail_at: Some((Position::new(2, 0), FailKind::Panic)),
+        };
+        let driver = Driver::new(fold, chain, engine_config(0), fast_config()).unwrap();
+        let mut handle = spawn(driver);
+        // when awaiting caught up
+        let status = timeout(handle.wait_caught_up()).await;
+        // then the wait resolves with the poisoned status instead of a stale active one
+        assert!(matches!(status.engine, EngineStatus::Poisoned { .. }));
+        assert!(status.is_terminal());
+        // and shutdown returns the driver with each event folded once
+        let driver = handle.shutdown().await;
+        let expected = vec![(Position::new(1, 0), 1), (Position::new(2, 0), 2)];
+        assert_eq!(driver.engine().fold().applied, expected);
+    }
+
+    /// Fold whose clone panics once armed, as a bug outside `apply` would.
+    struct CloneBomb(Arc<AtomicBool>);
+
+    impl Clone for CloneBomb {
+        fn clone(&self) -> Self {
+            assert!(!self.0.load(Ordering::Relaxed), "armed clone panicked");
+            Self(Arc::clone(&self.0))
+        }
+    }
+
+    impl Fold for CloneBomb {
+        type Event = u64;
+        type Error = Infallible;
+
+        fn apply(
+            &mut self,
+            _pos: Position,
+            _event: &u64,
+        ) -> Result<(), FoldError<Infallible>> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "harness shutdown task panicked")]
+    async fn a_panic_outside_the_fold_still_unwinds_the_loop() {
+        // given a caught-up driver whose fold clone panics once armed
+        let armed = Arc::new(AtomicBool::new(false));
+        let driver = Driver::new(
+            CloneBomb(Arc::clone(&armed)),
+            ScriptedChain::new(1),
+            engine_config(2),
+            fast_config(),
+        )
+        .unwrap();
+        let mut handle = spawn(driver);
+        timeout(handle.wait_caught_up()).await;
+        // when a checkpoint request makes the loop clone the fold
+        armed.store(true, Ordering::Relaxed);
+        handle.request_checkpoint();
+        timeout(async {
+            while !handle.thread.is_finished() {
+                tokio::time::sleep(FAST_POLL).await;
+            }
+        })
+        .await;
+        // then the panic was rethrown, so the loop thread is dead and shutdown says so
+        handle.shutdown().await;
     }
 
     #[tokio::test]
