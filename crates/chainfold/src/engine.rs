@@ -96,6 +96,7 @@ pub struct Engine<F> {
     status: EngineStatus,
     last_verified: Option<BlockRef>,
     skips: u64,
+    resets: u64,
 }
 
 impl<F: Fold> Engine<F> {
@@ -110,6 +111,7 @@ impl<F: Fold> Engine<F> {
             status: EngineStatus::Active,
             last_verified: None,
             skips: 0,
+            resets: 0,
         })
     }
 
@@ -131,6 +133,11 @@ impl<F: Fold> Engine<F> {
     /// Count of events the fold declared not its own.
     pub fn skip_count(&self) -> u64 {
         self.skips
+    }
+
+    /// Count of `reset` calls, wrapping; how a driver notices a restart it did not run.
+    pub(crate) fn resets(&self) -> u64 {
+        self.resets
     }
 
     /// Count of checkpoints the ring can still serve; expired slots are not counted.
@@ -259,8 +266,7 @@ impl<F: Fold> Engine<F> {
     /// Restores the newest live checkpoint whose cursor block is at or below the argument,
     /// truncating the ring to that cursor.
     ///
-    /// Clears Halted and Poisoned; drops checkpoints above the argument, the fork
-    /// boundary, so checkpoints between it and the restored cursor stay valid.
+    /// Clears Halted and Poisoned; drops checkpoints newer than the restored cursor.
     /// Freshness resets to None, since the restored cursor is unverified until the
     /// next boundary check confirms it. Slots whose cursor block has left the observed
     /// window are expired, so NoCheckpointAtOrBelow also names an exhausted window.
@@ -287,7 +293,7 @@ impl<F: Fold> Engine<F> {
         }
         self.status = EngineStatus::Active;
         self.last_verified = None;
-        self.checkpoints.drop_above(block);
+        self.checkpoints.drop_newer(self.cursor);
         Ok(self.cursor)
     }
 
@@ -300,6 +306,7 @@ impl<F: Fold> Engine<F> {
         self.status = EngineStatus::Active;
         self.last_verified = None;
         self.skips = 0;
+        self.resets = self.resets.wrapping_add(1);
     }
 
     /// Terminal for automated paths; only reset leaves this state.
@@ -1297,6 +1304,40 @@ mod tests {
             Err(RollbackError::NoCheckpointAtOrBelow { block: 1 })
         );
         assert_eq!(engine.checkpoint_count(), 0);
+    }
+
+    #[test]
+    fn rollback_to_a_cursorless_checkpoint_drops_the_expired_ones_above_it() {
+        // given a cursorless checkpoint and one at block 1, which a ring of two then forgets
+        let mut engine = Engine::new(
+            RecordingFold::default(),
+            EngineConfig {
+                ring_capacity: 2,
+                checkpoint_slots: 2,
+            },
+        )
+        .unwrap();
+        engine.checkpoint();
+        engine
+            .apply_batch(&batch_of(None, vec![(block(1, 0), vec![0, 1])]))
+            .unwrap();
+        engine.checkpoint();
+        engine
+            .apply_batch(&batch_of(Some(block(1, 0)), vec![(block(2, 0), vec![0])]))
+            .unwrap();
+        engine
+            .apply_batch(&batch_of(Some(block(2, 0)), vec![(block(3, 0), vec![0])]))
+            .unwrap();
+        // when it rolls back to the cursorless one, and a replaced block 1 is folded
+        engine.rollback_at_or_below(2).unwrap();
+        engine
+            .apply_batch(&batch_of(None, vec![(block(1, 1), vec![0])]))
+            .unwrap();
+        engine.checkpoint();
+        // then the old block 1 checkpoint stays gone instead of living again, so the
+        // durable point is the cursorless one rather than a position past the cursor
+        assert_eq!(engine.cursor(), Some(Position::new(1, 0)));
+        assert_eq!(engine.durable_point(), None);
     }
 
     #[test]

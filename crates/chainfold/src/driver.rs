@@ -84,8 +84,9 @@ pub struct DriverStatus {
     pub caught_up: bool,
     /// Events the fold declared not its own.
     pub skips: u64,
-    /// Cursor the sink reports a restart would recover; None without a sink or a
-    /// flush. A resync lowers it, so it holds for the instant it was read.
+    /// Cursor the sink reports a restart would recover; None without a sink, before a
+    /// flush, and after a reset until an offer made since then commits. A resync clears
+    /// it, so it holds for the instant it was read.
     pub durable_cursor: Option<Position>,
     /// True once the sink refused an offer; folding continues unpersisted.
     pub durability_lost: bool,
@@ -162,6 +163,7 @@ where
     generation: u64,
     last_checkpoint_block: Option<u64>,
     last_snapshot_block: Option<u64>,
+    seen_resets: u64,
     durability_lost: bool,
     advanced: bool,
 }
@@ -246,7 +248,7 @@ where
     fn around(
         engine: Engine<F>,
         source: S,
-        sink: K,
+        mut sink: K,
         initial: F,
         driver_config: DriverConfig,
     ) -> Result<Self, ConfigError> {
@@ -258,7 +260,12 @@ where
                 horizon,
             });
         }
-        Ok(Self {
+        // A sink ahead of the engine holds a cursor from a run this engine has not folded.
+        if sink.durable_cursor() > engine.cursor() {
+            sink.reset();
+        }
+        let seen_resets = engine.resets();
+        let mut driver = Self {
             engine,
             source,
             sink,
@@ -272,9 +279,16 @@ where
             generation: 0,
             last_checkpoint_block: None,
             last_snapshot_block: None,
+            seen_resets,
             durability_lost: false,
             advanced: false,
-        })
+        };
+        // A recovered engine holds no checkpoint. Its first poll would take one at the tip,
+        // so a depth-1 reorg there would resync; keep one at the recovery point.
+        if driver.engine.checkpoint_count() == 0 {
+            driver.auto_checkpoint();
+        }
+        Ok(driver)
     }
 
     /// Borrows the durability sink.
@@ -354,13 +368,14 @@ where
         Tick::DurabilityLost
     }
 
-    /// Lowers the snapshot mark to the restore point so the next offer is not suppressed.
-    #[cold]
-    fn clamp_snapshot_mark(&mut self, to: Option<Position>) {
-        self.last_snapshot_block = self
-            .last_snapshot_block
-            .zip(to)
-            .map(|(last, point)| last.min(point.block));
+    /// Lowers both cadence marks to the cursor block, and clears them without a cursor, so
+    /// a rollback or a reset suppresses neither the next checkpoint nor the next offer.
+    fn clamp_marks(&mut self) {
+        let block = self.engine.cursor().map(|cursor| cursor.block);
+        let clamp =
+            |mark: Option<u64>| mark.zip(block).map(|(mark, block)| mark.min(block));
+        self.last_checkpoint_block = clamp(self.last_checkpoint_block);
+        self.last_snapshot_block = clamp(self.last_snapshot_block);
     }
 
     /// Rolls back to the newest checkpoint at or below the ancestor, else escalates.
@@ -369,7 +384,6 @@ where
         match self.engine.rollback_at_or_below(ancestor) {
             Ok(to) => {
                 self.caught_up = false;
-                self.clamp_snapshot_mark(to);
                 Tick::RolledBack { to }
             }
             Err(RollbackError::NoCheckpointAtOrBelow { .. }) => self.resync_or_terminal(),
@@ -403,13 +417,17 @@ where
         self.caught_up = false;
         self.consecutive_errors = 0;
         self.scanned_to = None;
-        self.last_checkpoint_block = None;
-        self.last_snapshot_block = None;
         Tick::Resynced
     }
 
     /// Runs one poll-apply step, then records whether the cursor moved forward.
     fn step(&mut self) -> Tick {
+        // The caller can roll back or reset through `engine_mut`, so both are caught here.
+        self.clamp_marks();
+        if self.seen_resets != self.engine.resets() {
+            self.sink.reset();
+            self.seen_resets = self.engine.resets();
+        }
         let tick = self.poll_apply();
         // Only forward cursor movement earns an immediate re-poll; a batch the
         // engine fully deduped leaves the loop on its poll interval.
@@ -540,7 +558,11 @@ where
             engine: self.engine.status(),
             caught_up: self.is_caught_up(),
             skips: self.engine.skip_count(),
-            durable_cursor: self.sink.durable_cursor(),
+            durable_cursor: if self.seen_resets == self.engine.resets() {
+                self.sink.durable_cursor()
+            } else {
+                None
+            },
             durability_lost: self.durability_lost,
             generation: self.generation,
         }
@@ -919,6 +941,38 @@ mod tests {
     }
 
     #[test]
+    fn a_reset_clears_the_durable_cursor_until_a_later_offer_commits() {
+        // given two drivers that offered through block 8, so each sink holds block 5
+        fn offered() -> SinkDriver {
+            let mut driver = sink_driver(8, 4, cadence_config(1, 1));
+            run_to_idle(&mut driver);
+            assert_eq!(driver.status().durable_cursor, Some(Position::new(5, 0)));
+            driver
+        }
+        let mut resynced = offered();
+        let mut reset = offered();
+        // when one resyncs after a reorg below its ring and the other is reset by hand
+        resynced
+            .source_mut()
+            .reorg(8, &[&[10], &[20], &[30], &[40]]);
+        let outcome = resynced.tick();
+        reset.engine_mut().reset(RecordingFold::default());
+        // then neither reports the durable cursor of the chain it left
+        assert_eq!(outcome, Tick::Resynced);
+        assert_eq!(resynced.status().durable_cursor, None);
+        assert_eq!(reset.status().durable_cursor, None);
+        for driver in [&mut resynced, &mut reset] {
+            // and a poll that offers nothing leaves it None
+            driver.source_mut().fail_next_polls(1);
+            assert_eq!(driver.tick(), Tick::SourceError);
+            assert_eq!(driver.status().durable_cursor, None);
+            // until the first offer made after the reset commits
+            driver.tick();
+            assert_eq!(driver.status().durable_cursor, Some(Position::new(1, 0)));
+        }
+    }
+
+    #[test]
     fn driver_folds_to_tip_and_reports_caught_up() {
         // given a ten-block chain with one event per block
         let mut chain = ScriptedChain::new(1);
@@ -1218,6 +1272,61 @@ mod tests {
         assert_eq!(driver.engine().durable_point(), Some(Position::new(5, 0)));
     }
 
+    /// Twenty one-event blocks folded with a checkpoint every 4, at blocks 1, 5, 9, 13, 17.
+    fn cadence_driver() -> Driver<RecordingFold, ScriptedChain> {
+        let config = DriverConfig {
+            checkpoint_interval: Some(4),
+            snapshot_interval: None,
+            ..DriverConfig::from_block(1)
+        };
+        let engine = EngineConfig {
+            ring_capacity: 64,
+            checkpoint_slots: 16,
+        };
+        let mut driver = new_driver(one_event_chain(20), engine, config);
+        run_to_idle(&mut driver);
+        assert_eq!(driver.engine().checkpoint_count(), 5);
+        driver
+    }
+
+    #[test]
+    fn a_rollback_restarts_the_checkpoint_cadence_at_the_restore_point() {
+        // given twenty blocks folded with a checkpoint every 4, the last at block 17
+        let mut driver = cadence_driver();
+        // when blocks 15 to 20 are replaced and the refold runs on to block 24
+        driver.source_mut().reorg(
+            6,
+            &[
+                &[91],
+                &[92],
+                &[93],
+                &[94],
+                &[95],
+                &[96],
+                &[97],
+                &[98],
+                &[99],
+                &[100],
+            ],
+        );
+        run_to_idle(&mut driver);
+        // then the cadence restarted at the restore point, block 13, so the replaced 17
+        // and the new 21 each got a checkpoint
+        assert_eq!(driver.engine().checkpoint_count(), 6);
+    }
+
+    #[test]
+    fn a_manual_rollback_restarts_the_cadence_at_the_restore_point() {
+        // given twenty blocks folded with a checkpoint every 4, the last at block 17
+        let mut driver = cadence_driver();
+        // when the caller rolls back through engine_mut and the driver refolds
+        let restored = driver.engine_mut().rollback_at_or_below(12).unwrap();
+        run_to_idle(&mut driver);
+        // then blocks 13 and 17 got their checkpoints again
+        assert_eq!(restored, Some(Position::new(9, 0)));
+        assert_eq!(driver.engine().checkpoint_count(), 5);
+    }
+
     #[test]
     fn halt_is_terminal_and_recoverable_via_engine_mut() {
         // given a fold that halts at block 3 after a checkpoint taken at block 2
@@ -1385,6 +1494,106 @@ mod tests {
             (Position::new(6, 0), 60),
         ];
         assert_eq!(driver.engine().fold().applied, expected);
+    }
+
+    #[test]
+    fn a_flapping_head_does_not_wear_the_checkpoints_down_to_a_resync() {
+        // given one event every 100 blocks, so each event block is a checkpoint, folded to
+        // block 700 at the defaults: four slots, one checkpoint per 64 blocks
+        let mut x = ScriptedChain::new(1);
+        for number in 1..=700u64 {
+            if number % 100 == 0 {
+                x.push_block(&[number]);
+            } else {
+                x.push_block(&[]);
+            }
+        }
+        x.set_window(1);
+        // and a second view of it whose head Y is X's sibling, with an event of its own
+        let mut y = x.clone();
+        y.reorg(1, &[&[7001]]);
+        let mut driver = new_driver(
+            x.clone(),
+            EngineConfig::default(),
+            DriverConfig::from_block(1),
+        );
+        run_to_idle(&mut driver);
+        assert_eq!(driver.engine().checkpoint_count(), 4);
+        // when the head flaps between X and Y, and the driver settles after each flap
+        let mut ticks = Vec::new();
+        for flap in 0..6 {
+            *driver.source_mut() = if flap % 2 == 0 { y.clone() } else { x.clone() };
+            ticks.extend(collect_to_idle(&mut driver));
+        }
+        // then no flap resyncs, and the four checkpoints are all still there
+        assert!(!ticks.contains(&Tick::Resynced), "{ticks:?}");
+        assert_eq!(driver.engine().checkpoint_count(), 4);
+    }
+
+    /// Folds blocks `from..=to` of the chain, one event each, straight into the engine.
+    fn fold_blocks(
+        engine: &mut Engine<RecordingFold>,
+        chain: &ScriptedChain,
+        from: u64,
+        to: u64,
+    ) {
+        let mut batch = Batch::new();
+        batch.boundary = from.checked_sub(1).and_then(|number| chain.header(number));
+        for number in from..=to {
+            batch.push_block(chain.header(number).unwrap(), [(0, number)]);
+        }
+        engine.apply_batch(&batch).unwrap();
+    }
+
+    #[test]
+    fn a_resumed_driver_rolls_back_a_reorg_of_its_first_tip() {
+        // given an engine recovered at block 2 with no checkpoints, as a decode leaves it
+        let mut chain = ScriptedChain::new(1);
+        for value in 1..=6u64 {
+            chain.push_block(&[value]);
+        }
+        let mut engine = Engine::new(RecordingFold::default(), engine_config(2)).unwrap();
+        fold_blocks(&mut engine, &chain, 1, 2);
+        let config = DriverConfig {
+            checkpoint_interval: Some(2),
+            ..DriverConfig::from_block(1)
+        };
+        // when the driver resumes, folds to the tip in one poll, and the tip is replaced
+        let mut driver =
+            Driver::resume(engine, chain, RecordingFold::default(), config).unwrap();
+        driver.tick();
+        driver.source_mut().reorg(1, &[&[60]]);
+        let outcome = driver.tick();
+        // then it rolls back to the recovery point instead of resyncing from genesis
+        assert_eq!(
+            outcome,
+            Tick::RolledBack {
+                to: Some(Position::new(2, 0)),
+            }
+        );
+    }
+
+    #[test]
+    fn a_driver_takes_no_extra_checkpoint_over_an_engine_that_has_one() {
+        // given an engine at block 4 whose one slot holds a checkpoint at block 2
+        let mut chain = ScriptedChain::new(1);
+        for value in 1..=4u64 {
+            chain.push_block(&[value]);
+        }
+        let mut engine = Engine::new(RecordingFold::default(), engine_config(1)).unwrap();
+        fold_blocks(&mut engine, &chain, 1, 2);
+        engine.checkpoint();
+        fold_blocks(&mut engine, &chain, 3, 4);
+        // when a driver takes it over
+        let driver = Driver::resume(
+            engine,
+            chain,
+            RecordingFold::default(),
+            DriverConfig::from_block(1),
+        )
+        .unwrap();
+        // then the checkpoint at block 2 is still the only one
+        assert_eq!(driver.engine().durable_point(), Some(Position::new(2, 0)));
     }
 
     #[test]

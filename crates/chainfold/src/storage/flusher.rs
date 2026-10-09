@@ -119,7 +119,8 @@ struct Lane<T>(T);
 struct Shared {
     admission: Lane<Admission>,
     poisoned: Lane<AtomicBool>,
-    durable_cursor: Lane<Mutex<Option<Position>>>,
+    /// Reset epoch and watermark; a commit moves the watermark only in its own epoch.
+    durable_cursor: Lane<Mutex<(u64, Option<Position>)>>,
 }
 
 impl Shared {
@@ -127,7 +128,7 @@ impl Shared {
         Self {
             admission: Lane(Admission::new(queue_depth)),
             poisoned: Lane(AtomicBool::new(false)),
-            durable_cursor: Lane(Mutex::new(cursor)),
+            durable_cursor: Lane(Mutex::new((0, cursor))),
         }
     }
 
@@ -176,6 +177,7 @@ impl TokenState {
 struct Job {
     snapshot: Vec<u8>,
     cursor: Option<Position>,
+    epoch: u64,
     token: Arc<TokenState>,
     shared: Arc<Shared>,
 }
@@ -202,9 +204,11 @@ fn run_flusher<V: Vfs>(
                 let committed = store.durable_cursor();
                 let mut watermark = lock_recovering(&shared.durable_cursor.0);
                 // A commit supersedes whatever the store held, so the watermark
-                // tracks it down as well as up and always names what a reopen
-                // recovers. A resync commits older state and lowers it.
-                *watermark = committed;
+                // tracks it down as well as up. A job queued before a reset commits
+                // without moving it.
+                if watermark.0 == job.epoch {
+                    watermark.1 = committed;
+                }
                 drop(watermark);
                 job.token.complete(Ok(()));
             }
@@ -271,6 +275,7 @@ impl<V: Vfs + Send + 'static> Flusher<V> {
         let job = Job {
             snapshot,
             cursor,
+            epoch: lock_recovering(&self.shared.durable_cursor.0).0,
             token: Arc::clone(&token),
             shared: Arc::clone(&self.shared),
         };
@@ -280,10 +285,10 @@ impl<V: Vfs + Send + 'static> Flusher<V> {
         Ok(token)
     }
 
-    /// Cursor a reopen of the store would recover; falls when a resync commits
-    /// older state.
+    /// Cursor a reopen of the store would recover; None after a `reset` until an
+    /// offer made after it commits.
     pub fn durable_cursor(&self) -> Option<Position> {
-        *lock_recovering(&self.shared.durable_cursor.0)
+        lock_recovering(&self.shared.durable_cursor.0).1
     }
 
     /// Stops the thread and returns the store; pending jobs complete first.
@@ -313,6 +318,12 @@ impl<V: Vfs + Send + 'static, F: Persist> SnapshotSink<F> for Flusher<V> {
     fn durable_cursor(&self) -> Option<Position> {
         Flusher::durable_cursor(self)
     }
+
+    /// Starts a new epoch, so jobs already queued commit without moving the watermark.
+    fn reset(&mut self) {
+        let mut watermark = lock_recovering(&self.shared.durable_cursor.0);
+        *watermark = (watermark.0.wrapping_add(1), None);
+    }
 }
 
 #[cfg(test)]
@@ -336,6 +347,10 @@ mod tests {
     };
     use crate::{
         batch::Batch,
+        driver::{
+            Driver,
+            DriverConfig,
+        },
         engine::{
             Engine,
             EngineConfig,
@@ -352,6 +367,7 @@ mod tests {
         test_util::{
             CrashVfs,
             RecordingFold,
+            ScriptedChain,
         },
     };
 
@@ -666,5 +682,86 @@ mod tests {
         });
         // then the flush completes instead of blocking the first submit forever
         assert_eq!(done_rx.recv_timeout(Duration::from_secs(5)), Ok(Ok(Ok(()))));
+    }
+
+    #[test]
+    fn a_job_queued_before_reset_commits_without_moving_the_watermark() {
+        // given a watermark at (2, 0) and a job for (5, 0) held at the commit gate
+        let dir = PathBuf::from("/flusher-reset");
+        let (release_tx, release_rx) = mpsc::channel();
+        let vfs = GatedVfs::new(CrashVfs::new(), release_rx, 3);
+        let (store, _) = SnapshotStore::open(config(dir, 1), vfs).unwrap();
+        let mut flusher = Flusher::spawn(store, 4);
+        let settled = flusher
+            .submit(b"settled".to_vec(), Some(Position::new(2, 0)))
+            .unwrap();
+        assert_eq!(settled.wait(), Ok(()));
+        assert_eq!(flusher.durable_cursor(), Some(Position::new(2, 0)));
+        let queued = flusher
+            .submit(b"queued".to_vec(), Some(Position::new(5, 0)))
+            .unwrap();
+        // when the flusher is reset and the held job then commits
+        SnapshotSink::<RecordingFold>::reset(&mut flusher);
+        let cleared = flusher.durable_cursor();
+        release_tx.send(()).unwrap();
+        assert_eq!(queued.wait(), Ok(()));
+        // then the watermark stayed None, and only a job submitted after the reset moves it
+        assert_eq!(cleared, None);
+        assert_eq!(flusher.durable_cursor(), None);
+        let fresh = flusher
+            .submit(b"fresh".to_vec(), Some(Position::new(1, 0)))
+            .unwrap();
+        assert_eq!(fresh.wait(), Ok(()));
+        assert_eq!(flusher.durable_cursor(), Some(Position::new(1, 0)));
+    }
+
+    #[test]
+    fn with_sink_over_a_store_ahead_of_the_engine_reports_no_durable_cursor() {
+        // given a flusher over a store that already holds a snapshot at (9, 0)
+        let dir = PathBuf::from("/flusher-ahead");
+        let (mut store, _) =
+            SnapshotStore::open(config(dir, 1), CrashVfs::new()).unwrap();
+        store
+            .commit(b"earlier run", Some(Position::new(9, 0)))
+            .unwrap();
+        let flusher = Flusher::spawn(store, 4);
+        assert_eq!(flusher.durable_cursor(), Some(Position::new(9, 0)));
+        // when a driver over a fresh engine takes it as its sink
+        let driver = Driver::with_sink(
+            RecordingFold::default(),
+            ScriptedChain::new(1),
+            flusher,
+            engine_config(),
+            DriverConfig::default(),
+        )
+        .unwrap();
+        // then neither the driver's status nor the sink reports a durable cursor
+        assert_eq!(driver.status().durable_cursor, None);
+        assert_eq!(driver.sink().durable_cursor(), None);
+    }
+
+    #[test]
+    fn resuming_over_a_flusher_at_the_engine_cursor_keeps_its_watermark() {
+        // given an engine recovered at (2, 0) and a flusher whose store holds that snapshot
+        let dir = PathBuf::from("/flusher-resume");
+        let (mut store, _) =
+            SnapshotStore::open(config(dir, 1), CrashVfs::new()).unwrap();
+        store
+            .commit(b"recovered", Some(Position::new(2, 0)))
+            .unwrap();
+        let mut engine = Engine::new(RecordingFold::default(), engine_config()).unwrap();
+        advance(&mut engine, 1);
+        advance(&mut engine, 2);
+        // when a driver resumes the engine over that flusher
+        let driver = Driver::resume_with_sink(
+            engine,
+            ScriptedChain::new(1),
+            Flusher::spawn(store, 4),
+            RecordingFold::default(),
+            DriverConfig::default(),
+        )
+        .unwrap();
+        // then the watermark is not reset
+        assert_eq!(driver.status().durable_cursor, Some(Position::new(2, 0)));
     }
 }

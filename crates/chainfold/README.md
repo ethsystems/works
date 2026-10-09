@@ -25,7 +25,8 @@ durable, a reorg noticed only when a proof stops verifying.
   at or below it, and refolds forward. `O(log W)` probes, then deterministic replay.
 - **persist**: the driver offers the oldest retained checkpoint to a sink; a flusher
   thread fsyncs it. The durable cursor trails the applied cursor and names what a
-  restart recovers, so the apply path never fsyncs and replay closes the gap.
+  restart recovers, so the apply path never fsyncs and replay closes the gap. After a
+  reset it is None until a later offer commits.
 
 ```mermaid
 flowchart LR
