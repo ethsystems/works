@@ -71,6 +71,16 @@ pub enum Tick {
     Terminal(EngineStatus),
 }
 
+/// What a scan leaves for the tick to act on.
+enum Scan {
+    /// `batch` is ready to apply.
+    Ready,
+    /// The source's head trails the cursor on the chain the ring observed; nothing to do.
+    Lagging,
+    /// The source contradicted itself; its answer is dropped.
+    Refused,
+}
+
 /// Point-in-time snapshot of driver and engine state for external observers.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct DriverStatus {
@@ -156,7 +166,6 @@ where
     config: DriverConfig,
     batch: Batch<F::Event>,
     scratch: Vec<(BlockRef, u32, F::Event)>,
-    scanned_to: Option<u64>,
     initial: F,
     consecutive_errors: u32,
     caught_up: bool,
@@ -272,7 +281,6 @@ where
             config: driver_config,
             batch: Batch::new(),
             scratch: Vec::new(),
-            scanned_to: None,
             initial,
             consecutive_errors: 0,
             caught_up: false,
@@ -416,7 +424,6 @@ where
         self.engine.reset(self.initial.clone());
         self.caught_up = false;
         self.consecutive_errors = 0;
-        self.scanned_to = None;
         Tick::Resynced
     }
 
@@ -444,9 +451,18 @@ where
         if !self.engine.status().is_active() {
             return Tick::Terminal(self.engine.status());
         }
-        if self.scan().is_err() {
-            self.consecutive_errors = self.consecutive_errors.saturating_add(1);
-            return Tick::SourceError;
+        match self.scan() {
+            Ok(Scan::Ready) => {}
+            Ok(Scan::Lagging) => {
+                self.consecutive_errors = 0;
+                self.caught_up = true;
+                return Tick::Idle;
+            }
+            Ok(Scan::Refused) | Err(_) => {
+                self.batch.clear();
+                self.consecutive_errors = self.consecutive_errors.saturating_add(1);
+                return Tick::SourceError;
+            }
         }
         self.consecutive_errors = 0;
         match self.engine.apply_batch(&self.batch) {
@@ -483,38 +499,79 @@ where
         }
     }
 
-    /// Fills `batch` with the blocks strictly after the cursor, plus the cursor block's
-    /// header as the source reports it now.
-    fn scan(&mut self) -> Result<(), S::Error> {
+    /// Fills `batch` with the events after the cursor, plus the cursor block's header, all
+    /// as the chain `head` names reports them.
+    fn scan(&mut self) -> Result<Scan, S::Error> {
         self.batch.clear();
-        let cursor = self.engine.cursor();
-        self.batch.boundary = match cursor {
-            Some(cursor) => self.source.header_at(cursor.block)?,
-            None => None,
-        };
-
         let head = self.source.head()?;
-        let mut from = match cursor {
-            Some(cursor) => self
-                .scanned_to
-                .map_or(cursor.block + 1, |to| to.saturating_add(1))
-                .min(cursor.block + 1),
-            None => self.config.start_block,
-        };
+        let cursor = self.engine.cursor();
+        // a node behind the cursor on the chain the ring observed is lagging, not forked
+        if let Some(cursor) = cursor
+            && head.number < cursor.block
+            && self
+                .engine
+                .observed()
+                .all(|seen| seen.number != head.number || seen.hash == head.hash)
+        {
+            return Ok(Scan::Lagging);
+        }
 
         let window = self.source.window().max(1);
-        while from <= head {
-            let to = head.min(from.saturating_add(window - 1));
+        let mut from = cursor.map_or(self.config.start_block, |cursor| cursor.block);
+        while from <= head.number {
+            let to = head.number.min(from.saturating_add(window - 1));
             self.scratch.clear();
             self.source.events_in(from, to, &mut self.scratch)?;
-            self.scanned_to = Some(to);
-            from = to.saturating_add(1);
+            if self
+                .scratch
+                .iter()
+                .any(|(block, ..)| !(from..=to).contains(&block.number))
+            {
+                return Ok(Scan::Refused);
+            }
+            if let Some(cursor) = cursor
+                && from == cursor.block
+            {
+                let mut at_cursor = self
+                    .scratch
+                    .iter()
+                    .map(|(block, ..)| block)
+                    .filter(|block| block.number == cursor.block);
+                let boundary = at_cursor.next().copied();
+                if at_cursor.any(|block| Some(*block) != boundary) {
+                    return Ok(Scan::Refused);
+                }
+                self.batch.boundary = boundary;
+                // the rest of a partly folded cursor block is still owed
+                self.scratch.retain(|(block, log_index, _)| {
+                    Position::new(block.number, u64::from(*log_index)) > cursor
+                });
+            }
             if !self.scratch.is_empty() {
                 group_into(&mut self.batch, &mut self.scratch);
                 break;
             }
+            let Some(next) = to.checked_add(1) else {
+                break;
+            };
+            from = next;
         }
-        Ok(())
+        if let Some(cursor) = cursor
+            && self.batch.boundary.is_none()
+        {
+            self.batch.boundary = if head.number == cursor.block {
+                Some(head)
+            } else {
+                self.source.header_at(cursor.block)?
+            };
+        }
+        // What was read since `head` came from its chain only while the source still has
+        // `head`. An answer that ends on `head` is no exception: it may still carry blocks
+        // of another fork below it.
+        if !self.batch.is_empty() && self.source.header_at(head.number)? != Some(head) {
+            return Ok(Scan::Refused);
+        }
+        Ok(Scan::Ready)
     }
 
     /// Bisects the observed ring for the deepest still-canonical block, then rolls back.
@@ -596,7 +653,7 @@ fn group_into<E>(batch: &mut Batch<E>, entries: &mut Vec<(BlockRef, u32, E)>) {
     let mut current: Option<BlockRef> = None;
     for (block, log_index, event) in entries.drain(..) {
         match current {
-            Some(open) if open.number != block.number => {
+            Some(open) if open != block => {
                 batch.push_block(open, span.drain(..));
                 current = Some(block);
             }
@@ -657,7 +714,7 @@ mod tests {
         type Event = u64;
         type Error = PollFailure;
 
-        fn head(&mut self) -> Result<u64, PollFailure> {
+        fn head(&mut self) -> Result<BlockRef, PollFailure> {
             self.inner.head()
         }
 
@@ -689,7 +746,7 @@ mod tests {
     }
 
     /// Source that re-serves the same one-event block whatever range is asked for,
-    /// so the engine dedupes every poll after the first.
+    /// so every poll after the first finds it already applied.
     struct Stuck {
         block: BlockRef,
     }
@@ -698,9 +755,8 @@ mod tests {
         type Event = u64;
         type Error = PollFailure;
 
-        fn head(&mut self) -> Result<u64, PollFailure> {
-            // above the block, so the scan keeps querying and keeps being re-served it
-            Ok(self.block.number + 1)
+        fn head(&mut self) -> Result<BlockRef, PollFailure> {
+            Ok(self.block)
         }
 
         fn header_at(&mut self, _number: u64) -> Result<Option<BlockRef>, PollFailure> {
@@ -718,11 +774,111 @@ mod tests {
         }
     }
 
+    /// Scripted chain that misbehaves on cue: it reorgs just before a chosen read, and it
+    /// appends `extra` to the next range answer.
+    struct Hostile {
+        inner: ScriptedChain,
+        reads: u32,
+        reorg: Option<(u32, usize, Vec<Vec<u64>>)>,
+        extra: Vec<(BlockRef, u32, u64)>,
+    }
+
+    impl Hostile {
+        fn new(inner: ScriptedChain) -> Self {
+            Self {
+                inner,
+                reads: 0,
+                reorg: None,
+                extra: Vec::new(),
+            }
+        }
+
+        /// Reorgs the chain just before the `nth` read from now, whichever method it is.
+        fn reorg_before_read(
+            &mut self,
+            nth: u32,
+            depth: usize,
+            new_blocks: Vec<Vec<u64>>,
+        ) {
+            self.reorg = Some((self.reads + nth, depth, new_blocks));
+        }
+
+        fn read(&mut self) {
+            self.reads += 1;
+            assert!(self.reads < 1_000, "the scan never stopped reading");
+            if self
+                .reorg
+                .as_ref()
+                .is_some_and(|(at, ..)| *at == self.reads)
+            {
+                let (_, depth, new_blocks) = self.reorg.take().expect("a reorg is due");
+                let new_blocks: Vec<&[u64]> =
+                    new_blocks.iter().map(Vec::as_slice).collect();
+                self.inner.reorg(depth, &new_blocks);
+            }
+        }
+    }
+
+    impl Source for Hostile {
+        type Event = u64;
+        type Error = PollFailure;
+
+        fn head(&mut self) -> Result<BlockRef, PollFailure> {
+            self.read();
+            self.inner.head()
+        }
+
+        fn header_at(&mut self, number: u64) -> Result<Option<BlockRef>, PollFailure> {
+            self.read();
+            self.inner.header_at(number)
+        }
+
+        fn events_in(
+            &mut self,
+            from: u64,
+            to: u64,
+            out: &mut Vec<(BlockRef, u32, u64)>,
+        ) -> Result<(), PollFailure> {
+            self.read();
+            self.inner.events_in(from, to, out)?;
+            out.append(&mut self.extra);
+            Ok(())
+        }
+
+        fn horizon(&self) -> ReplayHorizon {
+            self.inner.horizon()
+        }
+
+        fn window(&self) -> u64 {
+            self.inner.window()
+        }
+    }
+
     fn engine_config(checkpoint_slots: usize) -> EngineConfig {
         EngineConfig {
             ring_capacity: 8,
             checkpoint_slots,
         }
+    }
+
+    fn hostile_driver(
+        chain: ScriptedChain,
+        checkpoint_slots: usize,
+        config: DriverConfig,
+    ) -> Driver<RecordingFold, Hostile> {
+        Driver::new(
+            RecordingFold::default(),
+            Hostile::new(chain),
+            engine_config(checkpoint_slots),
+            config,
+        )
+        .unwrap()
+    }
+
+    /// Every event the fold holds, in fold order.
+    fn folded<S: Source<Event = u64>>(driver: &Driver<RecordingFold, S>) -> Vec<u64> {
+        let applied = &driver.engine().fold().applied;
+        applied.iter().map(|(_, event)| *event).collect()
     }
 
     fn new_driver(
@@ -1085,7 +1241,7 @@ mod tests {
     }
 
     #[test]
-    fn rollback_replays_from_the_restored_cursor_not_the_scan_mark() {
+    fn rollback_replays_from_the_restored_cursor() {
         // given a driver caught up on ten blocks, checkpointing every block
         let mut chain = ScriptedChain::new(1);
         for value in 1..=10u64 {
@@ -1104,8 +1260,7 @@ mod tests {
         // when the last three blocks are replaced
         driver.source_mut().reorg(3, &[&[80], &[90], &[100]]);
         run_to_idle(&mut driver);
-        // then the scan restarted at the restored cursor, so the replacements folded;
-        // resuming at the high-water mark instead would have skipped them entirely
+        // then the scan restarted at the restored cursor, so the replacements folded
         let applied: Vec<u64> = driver
             .engine()
             .fold()
@@ -1117,7 +1272,7 @@ mod tests {
     }
 
     #[test]
-    fn a_fully_deduped_batch_keeps_the_poll_interval() {
+    fn an_applied_block_served_again_keeps_the_poll_interval() {
         // given a source that re-serves the same one-event block on every poll
         let block = BlockRef {
             number: 1,
@@ -1130,7 +1285,7 @@ mod tests {
             DriverConfig::default(),
         )
         .unwrap();
-        // when the first tick applies the block and the second dedupes it
+        // when the first tick applies the block and the second drops it as applied
         let applying = driver.tick();
         let after_apply = driver.next_delay();
         let deduping = driver.tick();
@@ -1145,14 +1300,7 @@ mod tests {
             })
         );
         assert_eq!(after_apply, Duration::ZERO);
-        assert_eq!(
-            deduping,
-            Tick::Progressed(ApplySummary {
-                applied: 0,
-                deduped: 1,
-                skipped: 0,
-            })
-        );
+        assert_eq!(deduping, Tick::Idle);
         assert_eq!(after_dedup, Duration::from_secs(1));
     }
 
@@ -1681,7 +1829,7 @@ mod tests {
         }
         // when the chain reorgs at the sixth block and the tick surfaces the fork
         driver.source_mut().inner.reorg(3, &[&[60], &[70], &[80]]);
-        // the scan spends one probe per poll on the boundary; count only the bisection
+        // the earlier ticks spent probes too; count only the bisection
         driver.source_mut().calls = 0;
         let outcome = driver.tick();
         // then rollback lands at or below the fifth and probe count is at most four
@@ -1820,5 +1968,316 @@ mod tests {
             (Position::new(6, 0), 60),
         ];
         assert_eq!(driver.engine().fold().applied, expected);
+    }
+
+    #[test]
+    fn a_reorg_between_the_first_two_reads_leaves_no_orphan_in_the_fold() {
+        // given a driver folded to block 3, one block per poll
+        let mut chain = ScriptedChain::new(1);
+        for value in 1..=3u64 {
+            chain.push_block(&[value]);
+        }
+        chain.set_window(1);
+        let config = DriverConfig {
+            checkpoint_interval: Some(1),
+            ..DriverConfig::default()
+        };
+        let mut driver = hostile_driver(chain, 4, config);
+        run_to_idle(&mut driver);
+        // when the chain replaces block 3 and adds a block right after the tick's first read
+        driver
+            .source_mut()
+            .reorg_before_read(2, 1, vec![vec![30], vec![40]]);
+        run_to_idle(&mut driver);
+        // then the fold holds exactly the canonical events
+        assert_eq!(folded(&driver), vec![1, 2, 30, 40]);
+    }
+
+    #[test]
+    fn two_hashes_for_one_height_are_a_source_error() {
+        // given a one-block chain whose first answer also lists a rival block 1
+        let mut chain = ScriptedChain::new(1);
+        chain.push_block(&[10]);
+        let rival = BlockRef {
+            number: 1,
+            hash: [9; 32],
+        };
+        let mut source = Hostile::new(chain);
+        source.extra = vec![(rival, 1, 11)];
+        let mut driver = Driver::new(
+            RecordingFold::default(),
+            source,
+            engine_config(0),
+            DriverConfig::from_block(1),
+        )
+        .unwrap();
+        // when ticked
+        let tick = driver.tick();
+        // then the answer is refused and nothing folds
+        assert_eq!(tick, Tick::SourceError);
+        assert!(folded(&driver).is_empty());
+    }
+
+    #[test]
+    fn a_head_at_the_last_block_number_ends_the_walk() {
+        // given three empty blocks ending at u64::MAX, read two blocks per query
+        let first = u64::MAX - 2;
+        let mut chain = ScriptedChain::new(first);
+        for _ in 0..3 {
+            chain.push_block(&[]);
+        }
+        chain.set_window(2);
+        let mut driver = hostile_driver(chain, 0, DriverConfig::from_block(first));
+        // when polled
+        let tick = driver.tick();
+        // then the walk stops after the last window instead of reading it forever
+        assert_eq!(tick, Tick::Idle);
+    }
+
+    #[test]
+    fn a_reorg_between_windows_does_not_skip_its_events() {
+        // given a driver folded to the only event, at block 5 of ten, two blocks per query
+        let mut chain = ScriptedChain::new(1);
+        for block in 1..=10u64 {
+            let events: &[u64] = if block == 5 { &[50] } else { &[] };
+            chain.push_block(events);
+        }
+        chain.set_window(2);
+        let mut driver = hostile_driver(chain, 0, DriverConfig::from_block(1));
+        run_to_idle(&mut driver);
+        // when blocks 6 to 10 are replaced after the scan read block 6 empty, with events
+        // at the new blocks 6 and 8
+        let new_blocks = vec![vec![60], vec![], vec![80], vec![], vec![]];
+        driver.source_mut().reorg_before_read(3, 5, new_blocks);
+        run_to_idle(&mut driver);
+        // then both new events fold
+        assert_eq!(folded(&driver), vec![50, 60, 80]);
+    }
+
+    #[test]
+    fn a_torn_answer_is_not_folded() {
+        // given a six-block chain with events at blocks 1, 3 and 6
+        let mut chain = ScriptedChain::new(1);
+        for events in [&[1][..], &[], &[30], &[], &[], &[60]] {
+            chain.push_block(events);
+        }
+        let old_block_3 = chain.header(3).unwrap();
+        let mut source = Hostile::new(chain);
+        // when the chain reorgs after the head was read, and the one range answer still
+        // carries block 3 from the old chain
+        source.reorg_before_read(2, 4, vec![vec![], vec![], vec![], vec![61]]);
+        source.extra = vec![(old_block_3, 0, 30)];
+        let mut driver = Driver::new(
+            RecordingFold::default(),
+            source,
+            engine_config(0),
+            DriverConfig::from_block(1),
+        )
+        .unwrap();
+        let first = driver.tick();
+        run_to_idle(&mut driver);
+        // then the tick is refused and the fold ends with the new chain's events only
+        assert_eq!(first, Tick::SourceError);
+        assert_eq!(folded(&driver), vec![1, 61]);
+    }
+
+    #[test]
+    fn a_torn_answer_ending_on_the_head_is_not_folded() {
+        // given a six-block chain with events at blocks 1, 3 and 6
+        let mut chain = ScriptedChain::new(1);
+        for events in [&[1][..], &[], &[30], &[], &[], &[60]] {
+            chain.push_block(events);
+        }
+        let old_head = chain.header(6).unwrap();
+        let mut source = Hostile::new(chain);
+        // when the chain reorgs after the head was read, and the one range answer still
+        // carries the old head block above a block of the new chain
+        source.reorg_before_read(2, 4, vec![vec![31], vec![], vec![], vec![]]);
+        source.extra = vec![(old_head, 0, 60)];
+        let mut driver = Driver::new(
+            RecordingFold::default(),
+            source,
+            engine_config(0),
+            DriverConfig::from_block(1),
+        )
+        .unwrap();
+        let first = driver.tick();
+        let after_first = folded(&driver);
+        run_to_idle(&mut driver);
+        // then the tick is refused and the fold ends with the new chain's events only
+        assert_eq!(first, Tick::SourceError);
+        assert!(after_first.is_empty());
+        assert_eq!(folded(&driver), vec![1, 31]);
+    }
+
+    #[test]
+    fn an_entry_outside_the_window_is_a_source_error() {
+        // given a three-block chain read two blocks per query, whose first answer also
+        // lists a block above its window
+        let mut chain = ScriptedChain::new(1);
+        for value in 1..=3u64 {
+            chain.push_block(&[value]);
+        }
+        chain.set_window(2);
+        let above = BlockRef {
+            number: 3,
+            hash: [7; 32],
+        };
+        let mut source = Hostile::new(chain);
+        source.extra = vec![(above, 0, 777)];
+        let mut driver = Driver::new(
+            RecordingFold::default(),
+            source,
+            engine_config(0),
+            DriverConfig::from_block(1),
+        )
+        .unwrap();
+        // when ticked
+        let tick = driver.tick();
+        // then the answer is refused and nothing folds
+        assert_eq!(tick, Tick::SourceError);
+        assert!(folded(&driver).is_empty());
+    }
+
+    #[test]
+    fn an_entry_below_the_cursor_block_is_a_source_error() {
+        // given a driver folded to block 3
+        let mut chain = ScriptedChain::new(1);
+        for value in 1..=3u64 {
+            chain.push_block(&[value]);
+        }
+        let mut driver = hostile_driver(chain, 0, DriverConfig::default());
+        driver.tick();
+        // when the next answer also lists an older block
+        let below = BlockRef {
+            number: 2,
+            hash: [7; 32],
+        };
+        driver.source_mut().extra = vec![(below, 0, 555)];
+        let tick = driver.tick();
+        // then the answer is refused
+        assert_eq!(tick, Tick::SourceError);
+        assert_eq!(folded(&driver), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn a_head_below_the_cursor_on_the_same_chain_is_idle() {
+        // given a driver folded to block 3 with a checkpoint there, over events at 1 and 3
+        let mut chain = ScriptedChain::new(1);
+        chain.push_block(&[1]);
+        chain.push_block(&[]);
+        chain.push_block(&[3]);
+        let mut at_one = chain.clone();
+        at_one.reorg(2, &[]);
+        let mut at_two = chain.clone();
+        at_two.reorg(1, &[]);
+        let mut driver = new_driver(chain, engine_config(2), DriverConfig::default());
+        driver.tick();
+        driver.source_mut().fail_next_polls(1);
+        driver.tick();
+        // when polls land on a node still at block 1, which the ring holds, and on one at
+        // block 2, which it does not
+        *driver.source_mut() = at_one;
+        let first = driver.tick();
+        *driver.source_mut() = at_two;
+        let second = driver.tick();
+        // then nothing moves: no rollback and no resync, and the error backoff ends
+        assert_eq!([first, second], [Tick::Idle; 2]);
+        assert_eq!(driver.next_delay(), Duration::from_secs(1));
+        assert!(driver.is_caught_up());
+        assert_eq!(driver.engine().cursor(), Some(Position::new(3, 0)));
+        assert_eq!(folded(&driver), vec![1, 3]);
+    }
+
+    #[test]
+    fn a_cursor_inside_a_block_folds_the_rest_of_it() {
+        // given an engine that took the first event of block 2 and no more
+        let mut chain = ScriptedChain::new(1);
+        chain.push_block(&[1]);
+        chain.push_block(&[20, 21, 22]);
+        let mut engine = Engine::new(RecordingFold::default(), engine_config(0)).unwrap();
+        let mut partial = Batch::new();
+        partial.push_block(chain.header(1).unwrap(), [(0, 1)]);
+        partial.push_block(chain.header(2).unwrap(), [(0, 20)]);
+        engine.apply_batch(&partial).unwrap();
+        // when a driver resumes over the whole chain
+        let mut driver = Driver::resume(
+            engine,
+            chain,
+            RecordingFold::default(),
+            DriverConfig::from_block(1),
+        )
+        .unwrap();
+        run_to_idle(&mut driver);
+        // then the rest of block 2 folds too
+        assert_eq!(folded(&driver), vec![1, 20, 21, 22]);
+    }
+
+    #[test]
+    fn two_hashes_at_the_cursor_block_are_a_source_error() {
+        // given a driver folded to block 3
+        let mut chain = ScriptedChain::new(1);
+        for value in 1..=3u64 {
+            chain.push_block(&[value]);
+        }
+        let mut driver = hostile_driver(chain, 0, DriverConfig::default());
+        driver.tick();
+        // when the next answer also lists a rival block 3 at an applied position
+        let rival = BlockRef {
+            number: 3,
+            hash: [7; 32],
+        };
+        driver.source_mut().extra = vec![(rival, 0, 666)];
+        let tick = driver.tick();
+        // then the answer is refused
+        assert_eq!(tick, Tick::SourceError);
+        assert_eq!(folded(&driver), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn only_a_poll_that_folds_re_reads_the_head_block() {
+        // given a driver folded to the head of a chain with an event in every block
+        let mut chain = ScriptedChain::new(1);
+        for value in 1..=3u64 {
+            chain.push_block(&[value]);
+        }
+        let mut driver = hostile_driver(chain, 0, DriverConfig::default());
+        run_to_idle(&mut driver);
+        let reads = |driver: &mut Driver<RecordingFold, Hostile>| {
+            let before = driver.source_mut().reads;
+            driver.tick();
+            driver.source_mut().reads - before
+        };
+        // when polled with no change, after an empty block, and after a block with an event
+        let idle = reads(&mut driver);
+        driver.source_mut().inner.push_block(&[]);
+        let empty_block = reads(&mut driver);
+        driver.source_mut().inner.push_block(&[9]);
+        let event = reads(&mut driver);
+        // then a poll reads the head and one range, and a fold also re-reads the head block
+        assert_eq!([idle, empty_block, event], [2, 2, 3]);
+    }
+
+    #[test]
+    fn an_emptied_head_block_is_a_fork_found_without_reading_its_header() {
+        // given a driver folded to block 3, the head, with a checkpoint at each block
+        let config = DriverConfig {
+            checkpoint_interval: Some(1),
+            ..DriverConfig::default()
+        };
+        let mut driver = hostile_driver(one_event_chain(3), 4, config);
+        run_to_idle(&mut driver);
+        // when block 3 is replaced by an empty block
+        driver.source_mut().inner.reorg(1, &[&[]]);
+        let before = driver.source_mut().reads;
+        let tick = driver.tick();
+        // then the rollback costs the head, one range, and two bisection probes
+        assert_eq!(
+            tick,
+            Tick::RolledBack {
+                to: Some(Position::new(2, 0)),
+            }
+        );
+        assert_eq!(driver.source_mut().reads - before, 4);
     }
 }

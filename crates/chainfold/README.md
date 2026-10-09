@@ -60,9 +60,9 @@ and recovery), and the adapters (`std`: tokio harness, snapshot store, flusher).
   counted and stepped over), `Halt` (clean below this position, rollback or resync),
   `Poison` (partially mutated, untrusted until a restore).
 - `Source` is three reads: `head`, `header_at`, `events_in`. The driver owns the window
-  walk, the scan mark, the boundary refetch, and the grouping into spans, so a source
-  cannot get the batch shape wrong and every source gets fork detection. `Ok(None)` from
-  a probe means suspected fork.
+  walk, the boundary refetch, and the grouping into spans, so a source cannot get the
+  batch shape wrong and every source gets fork detection. `Ok(None)` from a probe means
+  suspected fork.
 - rollback is bounded to K retained checkpoints. Over-rollback past still-canonical but
   unobserved blocks is intended; the discarded events replay deterministically.
 - the recovery ladder is rollback, then resync from genesis, then a typed terminal state.

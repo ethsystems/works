@@ -305,15 +305,16 @@ impl Source for ScriptedChain {
     type Event = u64;
     type Error = PollFailure;
 
-    fn head(&mut self) -> Result<u64, PollFailure> {
+    fn head(&mut self) -> Result<BlockRef, PollFailure> {
         if self.pending_failures > 0 {
             self.pending_failures -= 1;
             return Err(PollFailure);
         }
-        Ok(self
-            .blocks
-            .last()
-            .map_or(self.first_block.saturating_sub(1), |block| block.number))
+        // An empty chain heads at the parent of its first block.
+        Ok(self.tip().unwrap_or(BlockRef {
+            number: self.first_block.saturating_sub(1),
+            hash: [0u8; 32],
+        }))
     }
 
     fn header_at(&mut self, number: u64) -> Result<Option<BlockRef>, PollFailure> {
@@ -748,11 +749,11 @@ mod tests {
         // given an empty chain starting at 1
         let mut chain = ScriptedChain::new(1);
         // then head is below the first block, so nothing is in range
-        assert_eq!(chain.head(), Ok(0));
+        assert_eq!(chain.head().map(|head| head.number), Ok(0));
         // and once blocks exist it is the tip
         chain.push_block(&[1]);
         chain.push_block(&[2]);
-        assert_eq!(chain.head(), Ok(2));
+        assert_eq!(chain.head(), Ok(chain.header(2).unwrap()));
     }
 
     #[test]
@@ -781,6 +782,6 @@ mod tests {
         // then two errors then success
         assert_eq!(first, Err(PollFailure));
         assert_eq!(second, Err(PollFailure));
-        assert_eq!(third, Ok(1));
+        assert_eq!(third.map(|head| head.number), Ok(1));
     }
 }
