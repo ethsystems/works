@@ -13,7 +13,10 @@ use crate::{
         Engine,
         EngineConfig,
     },
-    error::ConfigError,
+    error::{
+        ConfigError,
+        EngineStatus,
+    },
     fold::Fold,
     position::{
         BlockRef,
@@ -188,6 +191,11 @@ pub enum SnapshotError<E> {
         /// Longest field length the codec accepts, in bytes.
         limit: usize,
     },
+    /// Engine is poisoned, so its fold state is untrusted and is not encoded.
+    Poisoned {
+        /// Position the engine poisoned at.
+        at: Position,
+    },
     /// Stored ring holds more entries than the configured capacity.
     RingExceedsCapacity {
         /// Entries the stored ring holds.
@@ -229,6 +237,13 @@ impl<E: fmt::Display> fmt::Display for SnapshotError<E> {
             Self::TooLarge { limit } => {
                 write!(f, "snapshot envelope field exceeds the {limit} byte limit")
             }
+            Self::Poisoned { at } => {
+                write!(
+                    f,
+                    "engine poisoned at block {} log index {}; its state is not encoded",
+                    at.block, at.log_index
+                )
+            }
             Self::RingExceedsCapacity { len, capacity } => {
                 write!(
                     f,
@@ -268,6 +283,9 @@ impl<F: Persist> Engine<F> {
         &self,
         out: &mut Vec<u8>,
     ) -> Result<(), SnapshotError<F::PersistError>> {
+        if let EngineStatus::Poisoned { at } = self.status() {
+            return Err(SnapshotError::Poisoned { at });
+        }
         encode_envelope(self.fold(), self.cursor(), self.observed(), out)
     }
 
@@ -412,7 +430,10 @@ mod tests {
             Position,
         },
         snapshot::Persist,
-        test_util::RecordingFold,
+        test_util::{
+            FailKind,
+            RecordingFold,
+        },
     };
     #[cfg(not(feature = "std"))]
     use alloc::{
@@ -753,6 +774,39 @@ mod tests {
         let result = Engine::<RecordingFold>::decode_snapshot(&bytes, test_config());
         // then RingCursorMismatch
         assert_eq!(result.unwrap_err(), SnapshotError::RingCursorMismatch);
+    }
+
+    /// Engine whose fold fails with `kind` on the second event of block 1.
+    fn engine_failed_with(kind: FailKind) -> Engine<RecordingFold> {
+        let fold = RecordingFold {
+            applied: Vec::new(),
+            fail_at: Some((Position::new(1, 1), kind)),
+        };
+        let mut engine = Engine::new(fold, test_config()).unwrap();
+        let result = engine.apply_batch(&batch_of(None, vec![(block(1, 0), vec![0, 1])]));
+        assert!(result.is_err());
+        engine
+    }
+
+    #[test]
+    fn a_poisoned_engine_refuses_to_encode_but_a_halted_one_encodes() {
+        // given an engine poisoned by its fold and one halted by it
+        let poisoned = engine_failed_with(FailKind::Poison);
+        let halted = engine_failed_with(FailKind::Halt);
+        // when each encodes into its own buffer
+        let (mut poisoned_bytes, mut halted_bytes) = (Vec::new(), Vec::new());
+        let refused = poisoned.encode_snapshot(&mut poisoned_bytes);
+        let accepted = halted.encode_snapshot(&mut halted_bytes);
+        // then only the poisoned engine is refused, and it appends nothing
+        assert_eq!(
+            refused,
+            Err(SnapshotError::Poisoned {
+                at: Position::new(1, 1),
+            })
+        );
+        assert!(poisoned_bytes.is_empty());
+        assert_eq!(accepted, Ok(()));
+        assert!(!halted_bytes.is_empty());
     }
 
     #[test]

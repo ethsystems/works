@@ -211,6 +211,11 @@ impl<F: Fold> Engine<F> {
             self.last_verified = Some(boundary);
         }
 
+        // A panic in the fold unwinds past this mark and leaves its span half applied, so
+        // the engine stays Poisoned. Every other exit restores Active or sets its own.
+        self.status = EngineStatus::Poisoned {
+            at: self.cursor.unwrap_or(Position::new(0, 0)),
+        };
         let mut summary = ApplySummary::default();
         for span in batch.spans() {
             let redelivered = self
@@ -220,11 +225,13 @@ impl<F: Fold> Engine<F> {
                 && let Some(observed_hash) = self.ring.hash_at(span.number)
                 && &observed_hash != span.hash
             {
+                self.status = EngineStatus::Active;
                 return Err(fork_suspected(span.number, observed_hash, span.block()));
             }
             self.apply_span(&span, &mut summary)?;
         }
 
+        self.status = EngineStatus::Active;
         Ok(summary)
     }
 
@@ -621,7 +628,7 @@ mod tests {
         // when a span at that number returns a different hash
         let next = batch_of(Some(block(5, 0)), vec![(block(5, 1), vec![0])]);
         let result = engine.apply_batch(&next);
-        // then ForkSuspected
+        // then ForkSuspected, and the engine stays Active since no fold failed
         assert_eq!(
             result,
             Err(ApplyError::ForkSuspected {
@@ -629,6 +636,7 @@ mod tests {
                 refetched: block(5, 1),
             })
         );
+        assert_eq!(engine.status(), EngineStatus::Active);
     }
 
     #[test]
@@ -835,6 +843,32 @@ mod tests {
         );
         assert_eq!(engine.status(), EngineStatus::Poisoned { at: poison_pos });
         assert_eq!(engine.fold().applied, vec![(poison_pos, 0)]);
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn a_fold_panic_leaves_the_engine_poisoned() {
+        // given a fold that panics on the second event of a three-event block
+        let mut engine = scripted_engine(Position::new(1, 1), FailKind::Panic);
+        let batch = batch_of(None, vec![(block(1, 0), vec![0, 1, 2])]);
+        // when the panic is caught
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            engine.apply_batch(&batch)
+        }));
+        // then the engine is Poisoned, so redelivering the batch folds nothing twice
+        let poisoned = EngineStatus::Poisoned {
+            at: Position::new(0, 0),
+        };
+        assert!(caught.is_err());
+        assert_eq!(engine.status(), poisoned);
+        assert_eq!(
+            engine.apply_batch(&batch),
+            Err(ApplyError::NotActive { status: poisoned })
+        );
+        assert_eq!(
+            engine.fold().applied,
+            vec![(Position::new(1, 0), 0), (Position::new(1, 1), 1)]
+        );
     }
 
     #[test]

@@ -304,7 +304,7 @@ where
 
     /// True once the most recent poll returned no new blocks.
     pub fn is_caught_up(&self) -> bool {
-        self.caught_up
+        self.caught_up && self.engine.status().is_active()
     }
 
     /// Runs the interval-based checkpoint rule.
@@ -538,7 +538,7 @@ where
             cursor: self.engine.cursor(),
             last_verified: self.engine.last_verified(),
             engine: self.engine.status(),
-            caught_up: self.caught_up,
+            caught_up: self.is_caught_up(),
             skips: self.engine.skip_count(),
             durable_cursor: self.sink.durable_cursor(),
             durability_lost: self.durability_lost,
@@ -1253,6 +1253,62 @@ mod tests {
         run_to_idle(&mut driver);
         assert!(driver.is_caught_up());
         assert_eq!(driver.engine().cursor(), Some(Position::new(5, 0)));
+    }
+
+    #[test]
+    fn a_terminal_tick_clears_caught_up() {
+        // given a caught-up driver whose fold halts on the next block's event
+        let mut chain = ScriptedChain::new(1);
+        chain.push_block(&[1]);
+        let halt_pos = Position::new(2, 0);
+        let fold = RecordingFold {
+            applied: Vec::new(),
+            fail_at: Some((halt_pos, FailKind::Halt)),
+        };
+        let mut driver =
+            Driver::new(fold, chain, engine_config(0), DriverConfig::default()).unwrap();
+        run_to_idle(&mut driver);
+        assert!(driver.is_caught_up());
+        // when that block arrives and the next tick hits the halt
+        driver.source_mut().push_block(&[2]);
+        let outcome = driver.tick();
+        // then the tick is Terminal and neither the driver nor its status claims caught up
+        assert_eq!(
+            outcome,
+            Tick::Terminal(EngineStatus::Halted { at: halt_pos })
+        );
+        assert!(!driver.is_caught_up());
+        assert!(!driver.status().caught_up);
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn a_caught_fold_panic_clears_caught_up() {
+        // given a caught-up driver whose fold panics on the next block's event
+        let mut chain = ScriptedChain::new(1);
+        chain.push_block(&[1]);
+        let fold = RecordingFold {
+            applied: Vec::new(),
+            fail_at: Some((Position::new(2, 0), FailKind::Panic)),
+        };
+        let mut driver =
+            Driver::new(fold, chain, engine_config(0), DriverConfig::default()).unwrap();
+        run_to_idle(&mut driver);
+        assert!(driver.is_caught_up());
+        // when that block arrives and the panic out of the next tick is caught
+        driver.source_mut().push_block(&[2]);
+        let caught =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| driver.tick()));
+        // then the engine is Poisoned and neither the driver nor its status claims caught up
+        assert!(caught.is_err());
+        assert_eq!(
+            driver.engine().status(),
+            EngineStatus::Poisoned {
+                at: Position::new(1, 0),
+            }
+        );
+        assert!(!driver.is_caught_up());
+        assert!(!driver.status().caught_up);
     }
 
     #[test]

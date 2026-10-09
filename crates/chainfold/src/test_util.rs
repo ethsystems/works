@@ -43,6 +43,8 @@ pub enum FailKind {
     Halt,
     /// Records the event, then refuses it.
     Poison,
+    /// Records the event, then panics.
+    Panic,
 }
 
 impl Fold for RecordingFold {
@@ -63,6 +65,10 @@ impl Fold for RecordingFold {
                 FailKind::Poison => {
                     self.applied.push((pos, *event));
                     Err(FoldError::Poison(kind))
+                }
+                FailKind::Panic => {
+                    self.applied.push((pos, *event));
+                    panic!("scripted fold panic at {pos:?}")
                 }
             };
         }
