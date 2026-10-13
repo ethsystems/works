@@ -82,8 +82,8 @@ enum Scan {
     /// The walk stopped at its cap with nothing to fold; `batch` holds only the boundary,
     /// `anchor` is the block the walk ended on, and the walk ran under `head`.
     Capped { anchor: BlockRef, head: BlockRef },
-    /// The source's head trails the cursor, or the walked mark, on the chain the ring
-    /// observed; nothing to do.
+    /// The source's head trails the cursor, or the walked mark, and the newest ring block
+    /// at or below it is on its chain; nothing to do.
     Lagging,
     /// The source contradicted itself; its answer is dropped.
     Refused,
@@ -573,19 +573,32 @@ where
         self.batch.clear();
         let head = self.source.head()?;
         let cursor = self.engine.cursor();
-        // a node behind the mark, or behind the cursor without one, on the chain the ring
-        // observed is lagging, not forked
+        // a head below the floor on another chain falls through to the walk, which fails
+        // the boundary check and bisects
         if let Some(floor) = self
             .walked
             .map(|walked| walked.number)
             .or(cursor.map(|cursor| cursor.block))
             && head.number < floor
-            && self
+        {
+            let lagging = match self
                 .engine
                 .observed()
-                .all(|seen| seen.number != head.number || seen.hash == head.hash)
-        {
-            return Ok(Scan::Lagging);
+                .take_while(|seen| seen.number <= head.number)
+                .last()
+            {
+                None => true,
+                Some(seen) if seen.number == head.number => seen == head,
+                // a source with no header at or below its own head contradicts itself;
+                // only another hash proves a fork
+                Some(seen) => self
+                    .source
+                    .header_at(seen.number)?
+                    .is_none_or(|header| header == seen),
+            };
+            if lagging {
+                return Ok(Scan::Lagging);
+            }
         }
 
         let window = self.source.window().max(1);
@@ -2895,8 +2908,9 @@ mod tests {
         let full = chain.borrow().clone();
         chain.borrow_mut().reorg(500, &[]);
         let (tick, read) = tick_counted(&mut driver, &calls);
-        // then the tick reads the head and stops, and nothing it holds moves
-        assert_eq!((tick, read), (Tick::Idle, 1));
+        // then the tick reads the head and the cursor block under it, and stops, and
+        // nothing it holds moves
+        assert_eq!((tick, read), (Tick::Idle, 2));
         assert!(driver.is_caught_up());
         assert_eq!(driver.next_delay(), Duration::from_secs(1));
         assert_eq!(driver.engine().cursor(), Some(Position::new(1, 0)));
@@ -2958,6 +2972,10 @@ mod tests {
         let tick = driver.tick();
         // then the tick is no wait for a node to catch up: the engine resyncs
         assert_eq!(tick, Tick::Resynced);
+        // and the next tick folds the other chain's event at block 1
+        assert_eq!(driver.walked, None);
+        driver.tick();
+        assert_eq!(folded(&driver), vec![1]);
     }
 
     #[test]
