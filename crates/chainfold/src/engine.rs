@@ -30,13 +30,15 @@ use crate::{
 const MIN_RING_CAPACITY: usize = 2;
 /// Largest allowed observed-block ring capacity.
 const MAX_RING_CAPACITY: usize = 1 << 20;
+/// Largest allowed checkpoint slot count.
+const MAX_CHECKPOINT_SLOTS: usize = 1 << 16;
 
 /// Fixed engine construction parameters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EngineConfig {
     /// Observed-block window W; power of two between 2 and 1 << 20.
     pub ring_capacity: usize,
-    /// Retained checkpoint slots K; zero disables rollback.
+    /// Retained checkpoint slots K, at most 1 << 16; zero disables rollback.
     pub checkpoint_slots: usize,
 }
 
@@ -50,7 +52,7 @@ impl Default for EngineConfig {
 }
 
 impl EngineConfig {
-    /// Accepts a power-of-two ring capacity within the allowed range.
+    /// Accepts a power-of-two ring capacity and a slot count within the allowed ranges.
     pub(crate) fn validate(&self) -> Result<(), ConfigError> {
         if !self.ring_capacity.is_power_of_two() {
             return Err(ConfigError::RingCapacityNotPowerOfTwo {
@@ -60,6 +62,11 @@ impl EngineConfig {
         if !(MIN_RING_CAPACITY..=MAX_RING_CAPACITY).contains(&self.ring_capacity) {
             return Err(ConfigError::RingCapacityOutOfRange {
                 got: self.ring_capacity,
+            });
+        }
+        if self.checkpoint_slots > MAX_CHECKPOINT_SLOTS {
+            return Err(ConfigError::CheckpointSlotsOutOfRange {
+                got: self.checkpoint_slots,
             });
         }
         Ok(())
@@ -89,6 +96,7 @@ pub struct Engine<F> {
     status: EngineStatus,
     last_verified: Option<BlockRef>,
     skips: u64,
+    resets: u64,
 }
 
 impl<F: Fold> Engine<F> {
@@ -103,6 +111,7 @@ impl<F: Fold> Engine<F> {
             status: EngineStatus::Active,
             last_verified: None,
             skips: 0,
+            resets: 0,
         })
     }
 
@@ -124,6 +133,11 @@ impl<F: Fold> Engine<F> {
     /// Count of events the fold declared not its own.
     pub fn skip_count(&self) -> u64 {
         self.skips
+    }
+
+    /// Count of `reset` calls, wrapping; how a driver notices a restart it did not run.
+    pub(crate) fn resets(&self) -> u64 {
+        self.resets
     }
 
     /// Count of checkpoints the ring can still serve; expired slots are not counted.
@@ -204,6 +218,11 @@ impl<F: Fold> Engine<F> {
             self.last_verified = Some(boundary);
         }
 
+        // A panic in the fold unwinds past this mark and leaves its span half applied, so
+        // the engine stays Poisoned. Every other exit restores Active or sets its own.
+        self.status = EngineStatus::Poisoned {
+            at: self.cursor.unwrap_or(Position::new(0, 0)),
+        };
         let mut summary = ApplySummary::default();
         for span in batch.spans() {
             let redelivered = self
@@ -213,11 +232,13 @@ impl<F: Fold> Engine<F> {
                 && let Some(observed_hash) = self.ring.hash_at(span.number)
                 && &observed_hash != span.hash
             {
+                self.status = EngineStatus::Active;
                 return Err(fork_suspected(span.number, observed_hash, span.block()));
             }
             self.apply_span(&span, &mut summary)?;
         }
 
+        self.status = EngineStatus::Active;
         Ok(summary)
     }
 
@@ -245,8 +266,7 @@ impl<F: Fold> Engine<F> {
     /// Restores the newest live checkpoint whose cursor block is at or below the argument,
     /// truncating the ring to that cursor.
     ///
-    /// Clears Halted and Poisoned; drops checkpoints above the argument, the fork
-    /// boundary, so checkpoints between it and the restored cursor stay valid.
+    /// Clears Halted and Poisoned; drops checkpoints newer than the restored cursor.
     /// Freshness resets to None, since the restored cursor is unverified until the
     /// next boundary check confirms it. Slots whose cursor block has left the observed
     /// window are expired, so NoCheckpointAtOrBelow also names an exhausted window.
@@ -273,7 +293,7 @@ impl<F: Fold> Engine<F> {
         }
         self.status = EngineStatus::Active;
         self.last_verified = None;
-        self.checkpoints.drop_above(block);
+        self.checkpoints.drop_newer(self.cursor);
         Ok(self.cursor)
     }
 
@@ -286,6 +306,7 @@ impl<F: Fold> Engine<F> {
         self.status = EngineStatus::Active;
         self.last_verified = None;
         self.skips = 0;
+        self.resets = self.resets.wrapping_add(1);
     }
 
     /// Terminal for automated paths; only reset leaves this state.
@@ -614,7 +635,7 @@ mod tests {
         // when a span at that number returns a different hash
         let next = batch_of(Some(block(5, 0)), vec![(block(5, 1), vec![0])]);
         let result = engine.apply_batch(&next);
-        // then ForkSuspected
+        // then ForkSuspected, and the engine stays Active since no fold failed
         assert_eq!(
             result,
             Err(ApplyError::ForkSuspected {
@@ -622,6 +643,7 @@ mod tests {
                 refetched: block(5, 1),
             })
         );
+        assert_eq!(engine.status(), EngineStatus::Active);
     }
 
     #[test]
@@ -830,6 +852,32 @@ mod tests {
         assert_eq!(engine.fold().applied, vec![(poison_pos, 0)]);
     }
 
+    #[cfg(feature = "std")]
+    #[test]
+    fn a_fold_panic_leaves_the_engine_poisoned() {
+        // given a fold that panics on the second event of a three-event block
+        let mut engine = scripted_engine(Position::new(1, 1), FailKind::Panic);
+        let batch = batch_of(None, vec![(block(1, 0), vec![0, 1, 2])]);
+        // when the panic is caught
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            engine.apply_batch(&batch)
+        }));
+        // then the engine is Poisoned, so redelivering the batch folds nothing twice
+        let poisoned = EngineStatus::Poisoned {
+            at: Position::new(0, 0),
+        };
+        assert!(caught.is_err());
+        assert_eq!(engine.status(), poisoned);
+        assert_eq!(
+            engine.apply_batch(&batch),
+            Err(ApplyError::NotActive { status: poisoned })
+        );
+        assert_eq!(
+            engine.fold().applied,
+            vec![(Position::new(1, 0), 0), (Position::new(1, 1), 1)]
+        );
+    }
+
     #[test]
     fn ring_records_each_observed_block_once() {
         // given two batches over four blocks
@@ -880,6 +928,32 @@ mod tests {
         assert_eq!(
             result.err(),
             Some(ConfigError::RingCapacityNotPowerOfTwo { got: 12 })
+        );
+    }
+
+    #[test]
+    fn config_rejects_checkpoint_slots_past_the_cap() {
+        // given slot counts at the cap, one past it, and far past it
+        let config = |checkpoint_slots| EngineConfig {
+            ring_capacity: 8,
+            checkpoint_slots,
+        };
+        // when constructing
+        let at_cap = Engine::new(RecordingFold::default(), config(MAX_CHECKPOINT_SLOTS));
+        let past_cap =
+            Engine::new(RecordingFold::default(), config(MAX_CHECKPOINT_SLOTS + 1));
+        let far_past = Engine::new(RecordingFold::default(), config(usize::MAX));
+        // then only the cap is accepted, and the rest are typed errors, never a panic
+        assert!(at_cap.is_ok());
+        assert_eq!(
+            past_cap.err(),
+            Some(ConfigError::CheckpointSlotsOutOfRange {
+                got: MAX_CHECKPOINT_SLOTS + 1,
+            })
+        );
+        assert_eq!(
+            far_past.err(),
+            Some(ConfigError::CheckpointSlotsOutOfRange { got: usize::MAX })
         );
     }
 
@@ -1166,7 +1240,11 @@ mod tests {
     fn unrecoverable_refuses_apply_and_rollback() {
         // given mark_unrecoverable
         let mut engine = new_engine();
-        engine.mark_unrecoverable(DivergenceCause::ForkBeyondWindow);
+        let cause = DivergenceCause::HorizonExceeded {
+            needed: 0,
+            horizon: 1,
+        };
+        engine.mark_unrecoverable(cause);
         // when applying or rolling back
         let apply_result =
             engine.apply_batch(&batch_of(None, vec![(block(1, 0), vec![0])]));
@@ -1175,17 +1253,10 @@ mod tests {
         assert_eq!(
             apply_result,
             Err(ApplyError::NotActive {
-                status: EngineStatus::Unrecoverable {
-                    cause: DivergenceCause::ForkBeyondWindow
-                },
+                status: EngineStatus::Unrecoverable { cause },
             })
         );
-        assert_eq!(
-            rollback_result,
-            Err(RollbackError::Unrecoverable {
-                cause: DivergenceCause::ForkBeyondWindow,
-            })
-        );
+        assert_eq!(rollback_result, Err(RollbackError::Unrecoverable { cause }));
     }
 
     #[test]
@@ -1230,6 +1301,40 @@ mod tests {
             Err(RollbackError::NoCheckpointAtOrBelow { block: 1 })
         );
         assert_eq!(engine.checkpoint_count(), 0);
+    }
+
+    #[test]
+    fn rollback_to_a_cursorless_checkpoint_drops_the_expired_ones_above_it() {
+        // given a cursorless checkpoint and one at block 1, which a ring of two then forgets
+        let mut engine = Engine::new(
+            RecordingFold::default(),
+            EngineConfig {
+                ring_capacity: 2,
+                checkpoint_slots: 2,
+            },
+        )
+        .unwrap();
+        engine.checkpoint();
+        engine
+            .apply_batch(&batch_of(None, vec![(block(1, 0), vec![0, 1])]))
+            .unwrap();
+        engine.checkpoint();
+        engine
+            .apply_batch(&batch_of(Some(block(1, 0)), vec![(block(2, 0), vec![0])]))
+            .unwrap();
+        engine
+            .apply_batch(&batch_of(Some(block(2, 0)), vec![(block(3, 0), vec![0])]))
+            .unwrap();
+        // when it rolls back to the cursorless one, and a replaced block 1 is folded
+        engine.rollback_at_or_below(2).unwrap();
+        engine
+            .apply_batch(&batch_of(None, vec![(block(1, 1), vec![0])]))
+            .unwrap();
+        engine.checkpoint();
+        // then the old block 1 checkpoint stays gone instead of living again, so the
+        // durable point is the cursorless one rather than a position past the cursor
+        assert_eq!(engine.cursor(), Some(Position::new(1, 0)));
+        assert_eq!(engine.durable_point(), None);
     }
 
     #[test]

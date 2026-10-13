@@ -56,7 +56,7 @@ impl Source for Probed {
     type Error = PollFailure;
     type Event = u64;
 
-    fn head(&mut self) -> Result<u64, PollFailure> {
+    fn head(&mut self) -> Result<BlockRef, PollFailure> {
         self.inner.head()
     }
 

@@ -9,13 +9,7 @@ use std::{
         Layout,
         System,
     },
-    sync::{
-        Mutex,
-        atomic::{
-            AtomicU64,
-            Ordering::Relaxed,
-        },
-    },
+    cell::Cell,
 };
 
 use chainfold::{
@@ -26,17 +20,21 @@ use chainfold::{
     test_util::NoopFold,
 };
 
-static ALLOCATIONS: AtomicU64 = AtomicU64::new(0);
-static ALLOCATED_BYTES: AtomicU64 = AtomicU64::new(0);
-/// Serializes measured regions, since the counters are process wide.
-static MEASURING: Mutex<()> = Mutex::new(());
+thread_local! {
+    /// Allocations and bytes this thread asked for. Per thread, so the test harness's own
+    /// threads never land in a measurement.
+    static COUNTS: Cell<(u64, u64)> = const { Cell::new((0, 0)) };
+}
 
 struct Counting;
 
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        ALLOCATIONS.fetch_add(1, Relaxed);
-        ALLOCATED_BYTES.fetch_add(layout.size() as u64, Relaxed);
+        // A thread can still allocate while its locals are torn down; those go uncounted.
+        let _ = COUNTS.try_with(|counts| {
+            let (allocations, bytes) = counts.get();
+            counts.set((allocations + 1, bytes + layout.size() as u64));
+        });
         unsafe { System.alloc(layout) }
     }
 
@@ -47,6 +45,11 @@ unsafe impl GlobalAlloc for Counting {
 
 #[global_allocator]
 static GLOBAL: Counting = Counting;
+
+/// This thread's allocation count and allocated bytes so far.
+fn counts() -> (u64, u64) {
+    COUNTS.with(Cell::get)
+}
 
 /// Deterministic block header: the block number embedded directly in the hash bytes.
 fn block_ref(number: u64) -> BlockRef {
@@ -69,9 +72,6 @@ fn block_batch(boundary: Option<BlockRef>, number: u64, count: u32) -> Batch<u64
 #[test]
 fn steady_state_apply_allocates_zero() {
     // given a pre-built engine warmed by one prior batch and a pre-built 1024-event batch
-    let _measuring = MEASURING
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner());
     let mut engine = Engine::new(
         NoopFold,
         EngineConfig {
@@ -84,9 +84,9 @@ fn steady_state_apply_allocates_zero() {
     let batch = block_batch(Some(block_ref(1)), 2, 1024);
 
     // when apply_batch runs over the pre-built batch
-    let before = ALLOCATIONS.load(Relaxed);
+    let (before, _) = counts();
     engine.apply_batch(&batch).unwrap();
-    let after = ALLOCATIONS.load(Relaxed);
+    let (after, _) = counts();
 
     // then the allocation count delta is zero
     assert_eq!(after, before);
@@ -101,9 +101,9 @@ fn failed_decode_bytes(bytes: &[u8]) -> u64 {
         ring_capacity: 8,
         checkpoint_slots: 0,
     };
-    let before = ALLOCATED_BYTES.load(Relaxed);
+    let (_, before) = counts();
     let result = Engine::<RecordingFold>::decode_snapshot(bytes, config);
-    let after = ALLOCATED_BYTES.load(Relaxed);
+    let (_, after) = counts();
     assert!(result.is_err(), "corrupt input decoded successfully");
     after - before
 }
@@ -114,9 +114,6 @@ fn corrupt_snapshot_decode_allocates_within_the_input_length() {
     // given every truncation of a valid snapshot plus one bit-flipped copy
     use chainfold::test_util::RecordingFold;
 
-    let _measuring = MEASURING
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner());
     let mut engine = Engine::new(
         RecordingFold::default(),
         EngineConfig {

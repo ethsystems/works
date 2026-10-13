@@ -84,8 +84,6 @@ impl core::error::Error for EngineStatus {}
 /// Terminal divergence reason the engine cannot recover from automatically.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DivergenceCause {
-    /// Fork deeper than the oldest observed block in the ring.
-    ForkBeyondWindow,
     /// Replay is required but the source's horizon no longer covers the start block.
     HorizonExceeded {
         /// Block replay must start from.
@@ -98,7 +96,6 @@ pub enum DivergenceCause {
 impl fmt::Display for DivergenceCause {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::ForkBeyondWindow => write!(f, "fork deeper than the observed window"),
             Self::HorizonExceeded { needed, horizon } => {
                 write!(
                     f,
@@ -139,6 +136,11 @@ pub enum ConfigError {
         /// Capacity the caller asked for.
         got: usize,
     },
+    /// Checkpoint slot count is above the allowed maximum.
+    CheckpointSlotsOutOfRange {
+        /// Slot count the caller asked for.
+        got: usize,
+    },
     /// Source cannot replay from the configured start block.
     HorizonExceedsStart {
         /// Block the driver folds from.
@@ -156,6 +158,9 @@ impl fmt::Display for ConfigError {
             }
             Self::RingCapacityOutOfRange { got } => {
                 write!(f, "ring capacity {got} is out of the allowed range")
+            }
+            Self::CheckpointSlotsOutOfRange { got } => {
+                write!(f, "checkpoint slot count {got} is out of the allowed range")
             }
             Self::HorizonExceedsStart { start, horizon } => {
                 write!(f, "replay horizon {horizon} exceeds start block {start}")

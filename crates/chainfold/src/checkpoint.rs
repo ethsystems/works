@@ -79,11 +79,17 @@ impl<F> CheckpointRing<F> {
             .find(|slot| slot.cursor.is_none_or(|cursor| cursor.block <= block))
     }
 
-    /// Drops slots with cursor block strictly above the argument.
+    /// Drops slots with a cursor after the argument, and moves the write position back
+    /// over them so the next stores refill the holes before any live slot is evicted.
+    ///
+    /// Cursors only rise between rollbacks, so the dropped slots are the newest stored.
     #[cold]
-    pub(crate) fn drop_above(&mut self, block: u64) {
+    pub(crate) fn drop_newer(&mut self, cursor: Option<Position>) {
+        let len = self.slots.len();
         for slot in &mut self.slots {
-            slot.take_if(|slot| slot.cursor.is_some_and(|cursor| cursor.block > block));
+            if slot.take_if(|slot| slot.cursor > cursor).is_some() {
+                self.next = (self.next + len - 1) % len;
+            }
         }
     }
 

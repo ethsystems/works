@@ -24,8 +24,8 @@ pub trait Source {
     /// Failure reading the source.
     type Error;
 
-    /// Highest block this source will serve.
-    fn head(&mut self) -> Result<u64, Self::Error>;
+    /// Header of the highest block this source will serve.
+    fn head(&mut self) -> Result<BlockRef, Self::Error>;
 
     /// Header of one block, or None when it is not on the current chain.
     fn header_at(&mut self, number: u64) -> Result<Option<BlockRef>, Self::Error>;

@@ -43,6 +43,8 @@ pub enum FailKind {
     Halt,
     /// Records the event, then refuses it.
     Poison,
+    /// Records the event, then panics.
+    Panic,
 }
 
 impl Fold for RecordingFold {
@@ -63,6 +65,10 @@ impl Fold for RecordingFold {
                 FailKind::Poison => {
                     self.applied.push((pos, *event));
                     Err(FoldError::Poison(kind))
+                }
+                FailKind::Panic => {
+                    self.applied.push((pos, *event));
+                    panic!("scripted fold panic at {pos:?}")
                 }
             };
         }
@@ -128,7 +134,7 @@ impl Fold for NoopFold {
 /// Sink recording each accepted offer's durable point; fails scripted offers.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct WatermarkSink {
-    /// Durable point of every accepted offer, in offer order.
+    /// Durable point of every accepted offer since the last reset, in offer order.
     pub offered: Vec<Position>,
     /// Offers still scripted to fail before the sink accepts again.
     pub fail_next_offers: u32,
@@ -148,6 +154,10 @@ impl<F: Fold> SnapshotSink<F> for WatermarkSink {
 
     fn durable_cursor(&self) -> Option<Position> {
         self.offered.last().copied()
+    }
+
+    fn reset(&mut self) {
+        self.offered.clear();
     }
 }
 
@@ -295,15 +305,16 @@ impl Source for ScriptedChain {
     type Event = u64;
     type Error = PollFailure;
 
-    fn head(&mut self) -> Result<u64, PollFailure> {
+    fn head(&mut self) -> Result<BlockRef, PollFailure> {
         if self.pending_failures > 0 {
             self.pending_failures -= 1;
             return Err(PollFailure);
         }
-        Ok(self
-            .blocks
-            .last()
-            .map_or(self.first_block.saturating_sub(1), |block| block.number))
+        // An empty chain heads at the parent of its first block.
+        Ok(self.tip().unwrap_or(BlockRef {
+            number: self.first_block.saturating_sub(1),
+            hash: [0u8; 32],
+        }))
     }
 
     fn header_at(&mut self, number: u64) -> Result<Option<BlockRef>, PollFailure> {
@@ -320,7 +331,13 @@ impl Source for ScriptedChain {
             usize::try_from(number.saturating_sub(self.first_block))
                 .map_or(self.blocks.len(), |i| i.min(self.blocks.len()))
         };
-        let (start, end) = (index(from), index(to.saturating_add(1)));
+        // One past `to`, without the `to + 1` that saturates at u64::MAX.
+        let end = if to < self.first_block {
+            0
+        } else {
+            index(to).saturating_add(1).min(self.blocks.len())
+        };
+        let start = index(from);
         for block in &self.blocks[start.min(end)..end] {
             let header = BlockRef {
                 number: block.number,
@@ -734,15 +751,29 @@ mod tests {
     }
 
     #[test]
+    fn events_in_includes_the_block_numbered_u64_max() {
+        // given blocks numbered u64::MAX - 1 and u64::MAX
+        let mut chain = ScriptedChain::new(u64::MAX - 1);
+        chain.push_block(&[1]);
+        chain.push_block(&[2]);
+        let mut out = Vec::new();
+        // when reading a range that ends at u64::MAX
+        chain.events_in(u64::MAX - 1, u64::MAX, &mut out).unwrap();
+        // then both blocks' events
+        let numbers: Vec<u64> = out.iter().map(|(block, ..)| block.number).collect();
+        assert_eq!(numbers, vec![u64::MAX - 1, u64::MAX]);
+    }
+
+    #[test]
     fn head_reports_the_tip_and_underflows_to_before_first_on_empty() {
         // given an empty chain starting at 1
         let mut chain = ScriptedChain::new(1);
         // then head is below the first block, so nothing is in range
-        assert_eq!(chain.head(), Ok(0));
+        assert_eq!(chain.head().map(|head| head.number), Ok(0));
         // and once blocks exist it is the tip
         chain.push_block(&[1]);
         chain.push_block(&[2]);
-        assert_eq!(chain.head(), Ok(2));
+        assert_eq!(chain.head(), Ok(chain.header(2).unwrap()));
     }
 
     #[test]
@@ -771,6 +802,6 @@ mod tests {
         // then two errors then success
         assert_eq!(first, Err(PollFailure));
         assert_eq!(second, Err(PollFailure));
-        assert_eq!(third, Ok(1));
+        assert_eq!(third.map(|head| head.number), Ok(1));
     }
 }

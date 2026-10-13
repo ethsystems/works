@@ -157,11 +157,18 @@ impl Source for Pool {
     type Error = core::convert::Infallible;
     type Event = u64;
 
-    fn head(&mut self) -> Result<u64, Self::Error> {
-        Ok(self
-            .blocks
-            .last()
-            .map_or(self.first_block.saturating_sub(1), |block| block.number))
+    fn head(&mut self) -> Result<BlockRef, Self::Error> {
+        // An empty pool heads at the parent of its first block.
+        Ok(self.blocks.last().map_or(
+            BlockRef {
+                number: self.first_block.saturating_sub(1),
+                hash: [0u8; 32],
+            },
+            |block| BlockRef {
+                number: block.number,
+                hash: block.hash,
+            },
+        ))
     }
 
     fn header_at(&mut self, number: u64) -> Result<Option<BlockRef>, Self::Error> {
