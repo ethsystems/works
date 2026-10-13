@@ -2916,6 +2916,12 @@ mod tests {
         assert_eq!(driver.engine().cursor(), Some(Position::new(1, 0)));
         assert_eq!(folded(&driver), vec![1]);
         assert_eq!(driver.walked, mark);
+        // and a node at the cursor block, which the ring holds, costs only the head read
+        let mut at_cursor = full.clone();
+        at_cursor.reorg(599, &[]);
+        *chain.borrow_mut() = at_cursor;
+        assert_eq!(tick_counted(&mut driver, &calls), (Tick::Idle, 1));
+        assert_eq!(driver.walked, mark);
         // and the walk goes on from the mark once the node catches up, without a check of
         // the mark, since the head is the one the capped walk read twice
         *chain.borrow_mut() = full;
