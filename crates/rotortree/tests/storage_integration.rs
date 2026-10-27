@@ -26,6 +26,21 @@ fn manual_config(dir: &std::path::Path) -> RotorTreeConfig {
     }
 }
 
+/// Poll for the background checkpoint's meta file. `wait_for_checkpoint`
+/// only sees a checkpoint that finishes after the call, and the one the
+/// inserts started may already be done by then.
+fn wait_for_checkpoint_meta(dir: &std::path::Path) -> bool {
+    let meta = dir.join("data").join("checkpoint.meta");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !meta.exists() {
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    true
+}
+
 #[test]
 fn open_empty_close_reopen() {
     // given
@@ -591,7 +606,7 @@ fn checkpoint_every_n_entries() {
         tree.insert(leaf(i)).unwrap();
     }
 
-    assert!(tree.wait_for_checkpoint(std::time::Duration::from_secs(5)));
+    assert!(wait_for_checkpoint_meta(dir.path()));
 
     let root = tree.root();
     tree.flush().unwrap();
@@ -622,7 +637,7 @@ fn checkpoint_memory_threshold() {
     let leaves: Vec<Hash> = (0..200u32).map(leaf).collect();
     tree.insert_many(&leaves).unwrap();
 
-    assert!(tree.wait_for_checkpoint(std::time::Duration::from_secs(5)));
+    assert!(wait_for_checkpoint_meta(dir.path()));
 
     let root = tree.root();
     tree.flush().unwrap();
