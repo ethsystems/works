@@ -696,6 +696,15 @@ fn compute_initial_level_files<const N: usize, const MAX_DEPTH: usize>(
     Ok(result)
 }
 
+/// Per level, from the leaves up, how many leading chunks hold only final nodes.
+/// A level-`L` node is final once its subtree holds all `N^L` leaves, so each
+/// level has `leaf_count / N^L` final nodes. Never ends: callers bound it to the
+/// stored levels.
+fn final_chunk_counts<const N: usize>(leaf_count: usize) -> impl Iterator<Item = usize> {
+    std::iter::successors(Some(leaf_count), |final_nodes| Some(final_nodes / N))
+        .map(|final_nodes| final_nodes / CHUNK_SIZE)
+}
+
 fn start_flush_thread<H: Hasher, const N: usize, const MAX_DEPTH: usize>(
     shared: &Arc<Shared<H, N, MAX_DEPTH>>,
     policy: &FlushPolicy,

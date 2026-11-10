@@ -23,6 +23,7 @@ use crate::{
 
 use super::{
     error::StorageError,
+    final_chunk_counts,
     wal::{
         WalPayload,
         deserialize_entry,
@@ -171,7 +172,8 @@ where
     let mut inner = TreeInner::<N, MAX_DEPTH>::new();
 
     let active = depth.min(MAX_DEPTH - 1) + 1;
-    for (level_idx, &len) in level_lens.iter().enumerate().take(active) {
+    let levels = level_lens.iter().zip(final_chunk_counts::<N>(leaf_count));
+    for (level_idx, (&len, final_chunks)) in levels.enumerate().take(active) {
         if len == 0 {
             continue;
         }
@@ -192,7 +194,16 @@ where
                 .map(|chunk_idx| {
                     let (shard_idx, offset_in_shard) =
                         checkpoint::shard_address(chunk_idx);
-                    Chunk::new_mapped(Arc::clone(&regions[shard_idx]), offset_in_shard)
+                    let mut chunk = Chunk::new_mapped(
+                        Arc::clone(&regions[shard_idx]),
+                        offset_in_shard,
+                    );
+                    // Copy chunks a checkpoint can rewrite in place: a private
+                    // mapping can show that rewrite to snapshots taken before it.
+                    if chunk_idx >= final_chunks {
+                        chunk.make_mut();
+                    }
+                    chunk
                 })
                 .collect()
         };
