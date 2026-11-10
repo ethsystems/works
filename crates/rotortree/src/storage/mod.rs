@@ -65,7 +65,7 @@ struct LevelCheckpointData {
     new_chunks: Vec<Chunk>,
     /// start from
     from_chunk: usize,
-    /// Complete chunks only: a partial last chunk is rewritten each checkpoint.
+    /// Chunks of final nodes only: later chunks are rewritten each checkpoint.
     total_chunks: usize,
 }
 
@@ -220,11 +220,10 @@ impl<H: Hasher, const N: usize, const MAX_DEPTH: usize> Shared<H, N, MAX_DEPTH> 
 
             let active_levels = depth.min(MAX_DEPTH - 1) + 1;
             let mut level_data = Vec::with_capacity(active_levels);
+            let final_chunks_per_level =
+                final_chunk_counts::<N>(state.inner.levels[0].len()).take(active_levels);
 
-            for level_idx in 0..active_levels {
-                // Count only whole chunks as done. The last chunk may be
-                // partially filled and still growing
-                let total_chunks = state.inner.levels[level_idx].len() / CHUNK_SIZE;
+            for (level_idx, total_chunks) in final_chunks_per_level.enumerate() {
                 let already = if level_idx < state.checkpointed_chunks.len() {
                     state.checkpointed_chunks[level_idx]
                 } else {
@@ -684,22 +683,16 @@ fn compute_initial_level_files<const N: usize, const MAX_DEPTH: usize>(
     }
 
     let active_levels = depth.min(MAX_DEPTH - 1) + 1;
-    let mut result = Vec::with_capacity(active_levels);
-    let mut level_len = leaf_count;
-
-    for _ in 0..active_levels {
-        let chunks = level_len / CHUNK_SIZE;
-        result.push(chunks);
-        level_len = level_len.div_ceil(N);
-    }
-
-    Ok(result)
+    Ok(final_chunk_counts::<N>(leaf_count)
+        .take(active_levels)
+        .collect())
 }
 
 /// Per level, from the leaves up, how many leading chunks hold only final nodes.
 /// A level-`L` node is final once its subtree holds all `N^L` leaves, so each
-/// level has `leaf_count / N^L` final nodes. Never ends: callers bound it to the
-/// stored levels.
+/// level has `leaf_count / N^L` final nodes. Only these chunks are written once
+/// and may be mapped from the level files; every checkpoint rewrites the rest.
+/// Never ends: callers bound it to the stored levels.
 fn final_chunk_counts<const N: usize>(leaf_count: usize) -> impl Iterator<Item = usize> {
     std::iter::successors(Some(leaf_count), |final_nodes| Some(final_nodes / N))
         .map(|final_nodes| final_nodes / CHUNK_SIZE)

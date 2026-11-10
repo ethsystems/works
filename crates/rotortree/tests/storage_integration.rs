@@ -1208,3 +1208,63 @@ fn snapshot_after_reopen_keeps_nodes_across_checkpoint() {
     check::<2>();
     check::<3>();
 }
+
+/// Regression: a checkpoint taken while an upper level's last node was open
+/// recorded its chunk as final, so the next checkpoint mapped the stale copy back.
+#[test]
+fn checkpoint_rewrites_upper_level_node_written_while_open() {
+    fn check<const N: usize>() {
+        // given
+        let dir = tempfile::tempdir().unwrap();
+        let tree = open_tree::<N>(dir.path());
+        let leaves = leaves_completing_open_upper_nodes::<N>();
+        let (last, all_but_last) = leaves.split_last().unwrap();
+        tree.insert_many(all_but_last).unwrap();
+        tree.checkpoint().unwrap();
+
+        // when
+        tree.insert(*last).unwrap();
+        tree.checkpoint().unwrap();
+
+        // then
+        assert_nodes_match_lean_imt(&tree.snapshot(), &leaves);
+        tree.close().unwrap();
+        let reopened = open_tree::<N>(dir.path());
+        assert_nodes_match_lean_imt(&reopened.snapshot(), &leaves);
+        reopened.close().unwrap();
+    }
+
+    check::<2>();
+    check::<3>();
+}
+
+/// Regression: reopening a checkpoint taken while an upper level's last node was
+/// open counted its chunk as final, so the next checkpoint never rewrote it.
+#[test]
+fn checkpoint_after_reopen_rewrites_upper_level_node_written_while_open() {
+    fn check<const N: usize>() {
+        // given
+        let dir = tempfile::tempdir().unwrap();
+        let tree = open_tree::<N>(dir.path());
+        let leaves = leaves_completing_open_upper_nodes::<N>();
+        let (last, all_but_last) = leaves.split_last().unwrap();
+        tree.insert_many(all_but_last).unwrap();
+        tree.checkpoint().unwrap();
+        tree.close().unwrap();
+
+        // when
+        let tree = open_tree::<N>(dir.path());
+        tree.insert(*last).unwrap();
+        tree.checkpoint().unwrap();
+
+        // then
+        assert_nodes_match_lean_imt(&tree.snapshot(), &leaves);
+        tree.close().unwrap();
+        let reopened = open_tree::<N>(dir.path());
+        assert_nodes_match_lean_imt(&reopened.snapshot(), &leaves);
+        reopened.close().unwrap();
+    }
+
+    check::<2>();
+    check::<3>();
+}
