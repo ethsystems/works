@@ -293,7 +293,9 @@ impl<const N: usize, const MAX_DEPTH: usize> ConsistencyProof<N, MAX_DEPTH> {
 
     /// Verify this consistency proof against a trusted old root.
     ///
-    /// If verification succeeds, the caller can trust `self.new_root`.
+    /// If verification succeeds, the caller can trust `self.new_root`. A root
+    /// does not commit to the leaf count, so also check `self.old_size`
+    /// against the size you track.
     pub fn verify_transition<H: Hasher>(
         &self,
         hasher: &H,
@@ -306,13 +308,15 @@ impl<const N: usize, const MAX_DEPTH: usize> ConsistencyProof<N, MAX_DEPTH> {
     ///
     /// Given a valid `NaryProof` for some leaf against `old_root`, produces
     /// a valid `NaryProof` for the same leaf against `new_root` using only
-    /// the data in this consistency proof
+    /// the data in this consistency proof. Returns an error if `old_proof`
+    /// does not verify, or if its `tree_size` is not `old_size`.
     pub fn update_inclusion_proof<H: Hasher>(
         &self,
         old_proof: &NaryProof<N, MAX_DEPTH>,
         hasher: &H,
     ) -> Result<NaryProof<N, MAX_DEPTH>, TreeError> {
-        if old_proof.root != self.old_root {
+        // A root does not commit to the leaf count, so the sizes must match too.
+        if old_proof.root != self.old_root || old_proof.tree_size != self.old_size {
             return Err(TreeError::MathError);
         }
         if !self.verify(hasher)? {
@@ -323,6 +327,11 @@ impl<const N: usize, const MAX_DEPTH: usize> ConsistencyProof<N, MAX_DEPTH> {
                 index: old_proof.leaf_index,
                 size: self.old_size,
             });
+        }
+        // The result reuses `old_proof`'s siblings. An invalid one could make
+        // the loop below panic or return a proof that does not verify.
+        if !old_proof.verify(hasher)? {
+            return Err(TreeError::MathError);
         }
 
         if self.old_size == self.new_size {
@@ -1008,6 +1017,57 @@ mod tests {
         let mut bad_proof = snaps[1].2.generate_proof(0).unwrap();
         bad_proof.root = [0xFF; 32];
         assert!(cp.update_inclusion_proof(&bad_proof, &XorHasher).is_err());
+    }
+
+    /// Regression: a transition from a smaller tree with the same root
+    /// panicked while slicing the boundary group.
+    #[test]
+    fn update_rejects_size_mismatch() {
+        // given a proof from a 2-leaf tree
+        let mut tracked = LeanIMT::<XorHasher, 2, 32>::new(XorHasher);
+        tracked.insert(leaf(1)).unwrap();
+        tracked.insert(leaf(2)).unwrap();
+        let root = tracked.root().unwrap();
+        let proof = tracked.snapshot().generate_proof(0).unwrap();
+
+        // when a 1-leaf tree whose leaf is that root grows by one leaf
+        let mut other = LeanIMT::<XorHasher, 2, 32>::new(XorHasher);
+        other.insert(root).unwrap();
+        other.insert(leaf(99)).unwrap();
+        let cp = other
+            .snapshot()
+            .generate_consistency_proof(1, root)
+            .unwrap();
+        assert!(cp.verify_transition(&XorHasher, root).unwrap());
+
+        // then the update is rejected
+        assert_eq!(
+            cp.update_inclusion_proof(&proof, &XorHasher),
+            Err(TreeError::MathError)
+        );
+    }
+
+    /// Regression: an old proof with more siblings than `N - 1` panicked
+    /// while copying its boundary group.
+    #[test]
+    fn update_rejects_malformed_old_proof() {
+        // given a 2 -> 3 leaf transition and leaf 1's proof
+        let leaves: Vec<Hash> = (1..=3).map(leaf).collect();
+        let snaps = build_snapshots::<2, 32>(&leaves);
+        let cp = snaps[2]
+            .2
+            .generate_consistency_proof(snaps[1].0, snaps[1].1)
+            .unwrap();
+        let mut proof = snaps[1].2.generate_proof(1).unwrap();
+
+        // when the proof claims two siblings in a binary tree
+        proof.levels[0].sibling_count = 2;
+
+        // then the update is rejected
+        assert_eq!(
+            cp.update_inclusion_proof(&proof, &XorHasher),
+            Err(TreeError::MathError)
+        );
     }
 
     #[cfg(feature = "wincode")]
