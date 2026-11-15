@@ -80,36 +80,44 @@ impl<const N: usize, const MAX_DEPTH: usize> NaryProof<N, MAX_DEPTH> {
         }
 
         let mut expected_index = u64_to_usize(self.leaf_index)?;
+        // u64, because the tree can outgrow a 32-bit usize when the leaf doesn't.
+        let mut level_len = self.tree_size;
         let mut current = self.leaf;
         let mut children = [[0u8; 32]; N];
 
         for level in &self.levels[..self.level_count] {
-            let expected_pos = expected_index % N;
-            if level.position as usize != expected_pos {
+            let pos = expected_index % N;
+            let group_start = expected_index - pos;
+            // The group size comes from the tree's shape, not from the proof.
+            // A wrong count lets an internal node, or half of a leaf's
+            // preimage, verify as a leaf.
+            let remaining = level_len - group_start as u64;
+            let group_size = usize::try_from(remaining).map_or(N, |r| r.min(N));
+            if usize::from(level.position) != pos
+                || usize::from(level.sibling_count) != group_size - 1
+            {
                 return Err(TreeError::MathError);
             }
 
-            if level.sibling_count > 0 {
-                let total = (level.sibling_count as usize) + 1;
-                let pos = level.position as usize;
-                if total > N || pos >= total {
-                    return Err(TreeError::MathError);
-                }
+            if group_size > 1 {
                 children[..pos].copy_from_slice(&level.siblings[..pos]);
                 children[pos] = current;
-                let rest = total - pos - 1;
-                children[pos + 1..total]
-                    .copy_from_slice(&level.siblings[pos..pos + rest]);
-                current = hasher.hash_children(&children[..total]);
+                children[pos + 1..group_size]
+                    .copy_from_slice(&level.siblings[pos..group_size - 1]);
+                current = hasher.hash_children(&children[..group_size]);
             }
 
             expected_index /= N;
+            level_len = level_len.div_ceil(N as u64);
         }
 
         Ok(current == self.root)
     }
 
     /// Verify this inclusion proof against an externally-trusted root.
+    ///
+    /// A root does not commit to the leaf count, so also check `tree_size`
+    /// against a size you trust.
     pub fn verify_against<H: Hasher>(
         &self,
         hasher: &H,
@@ -1126,6 +1134,67 @@ mod tests {
         // Truncate: claim fewer levels than the tree requires
         proof.level_count = 1;
         assert!(proof.verify(&th).is_err());
+    }
+
+    /// Regression: a lift at level 0 let node (1, 0) verify as leaf 0.
+    #[test]
+    fn verify_rejects_internal_node_as_leaf() {
+        // given a 4-leaf binary tree
+        let mut tree = LeanIMT::<XorHasher, 2, 32>::new(XorHasher);
+        for i in 1..=4 {
+            tree.insert(leaf(i)).unwrap();
+        }
+        let snap = tree.snapshot();
+
+        // when node (1, 0) claims leaf 0 with no sibling at level 0
+        let mut levels = [ProofLevel::EMPTY; 32];
+        levels[1] = ProofLevel {
+            position: 0,
+            sibling_count: 1,
+            siblings: [snap.get_node(1, 1).unwrap(), [0u8; 32]],
+        };
+        let forged = NaryProof::<2, 32> {
+            root: snap.root().unwrap(),
+            leaf: snap.get_node(1, 0).unwrap(),
+            leaf_index: 0,
+            tree_size: 4,
+            level_count: 2,
+            levels,
+        };
+
+        // then the proof is rejected
+        assert_eq!(forged.verify(&XorHasher), Err(TreeError::MathError));
+    }
+
+    /// Every level accepts only the sibling count that `leaf_index` and
+    /// `tree_size` imply.
+    fn verify_rejects_spoofed_sibling_count_up_to<const N: usize>(count: u32) {
+        let leaves: Vec<Hash> = (1..=count).map(leaf).collect();
+        for (size, _, snap) in build_snapshots::<N, 32>(&leaves) {
+            for index in 0..size {
+                let proof = snap.generate_proof(index).unwrap();
+                for level in 0..proof.level_count {
+                    let honest = proof.levels[level].sibling_count;
+                    for spoofed in (0..=u8::MAX).filter(|&c| c != honest) {
+                        let mut bad = proof.clone();
+                        bad.levels[level].sibling_count = spoofed;
+                        assert_eq!(
+                            bad.verify(&XorHasher),
+                            Err(TreeError::MathError),
+                            "N={N} size={size} index={index} level={level} \
+                             sibling_count={spoofed}",
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn verify_rejects_spoofed_sibling_count() {
+        verify_rejects_spoofed_sibling_count_up_to::<2>(17);
+        verify_rejects_spoofed_sibling_count_up_to::<3>(28);
+        verify_rejects_spoofed_sibling_count_up_to::<4>(17);
     }
 
     #[test]
