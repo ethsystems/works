@@ -7,11 +7,13 @@ use rotortree::{
     CheckpointPolicy,
     FlushPolicy,
     Hash,
+    LeanIMT,
     RotorTree,
     RotorTreeConfig,
     RotorTreeError,
     StorageError,
     TieringConfig,
+    TreeSnapshot,
     test_util::*,
     write_test_meta,
 };
@@ -1143,4 +1145,126 @@ fn insert_many_after_checkpoint_recovery() {
         assert!(proof.verify(&XorHasher).unwrap());
     }
     tree.close().unwrap();
+}
+
+fn open_tree<const N: usize>(dir: &std::path::Path) -> RotorTree<XorHasher, N, 10> {
+    RotorTree::open(XorHasher, manual_config(dir)).unwrap()
+}
+
+/// Leaves `0..128 * N * N`. With all but the last inserted, levels 1 and 2 each end on
+/// a full chunk whose last node is still open; the last leaf completes both.
+fn leaves_completing_open_upper_nodes<const N: usize>() -> Vec<Hash> {
+    let count = u32::try_from(128 * N * N).unwrap();
+    (0..count).map(leaf).collect()
+}
+
+/// Asserts every node of `snapshot` equals the one an in-memory tree over `leaves`
+/// holds.
+#[cfg_attr(feature = "concurrent", allow(unused_mut))]
+fn assert_nodes_match_lean_imt<const N: usize>(
+    snapshot: &TreeSnapshot<N, 10>,
+    leaves: &[Hash],
+) {
+    let mut expected = LeanIMT::<XorHasher, N, 10>::new(XorHasher);
+    expected.insert_many(leaves).unwrap();
+    let want = expected.snapshot();
+    for level in 0..=want.depth() {
+        for index in 0..want.level_len(level) {
+            assert_eq!(
+                snapshot.get_node(level, index),
+                want.get_node(level, index),
+                "node ({level}, {index})"
+            );
+        }
+    }
+}
+
+/// Regression: recovery mapped chunks that a later checkpoint rewrites in place. On
+/// Linux a file write reaches untouched `MAP_PRIVATE` pages, so a snapshot taken
+/// after reopen changed under that checkpoint; other platforms can't show it.
+#[test]
+fn snapshot_after_reopen_keeps_nodes_across_checkpoint() {
+    fn check<const N: usize>() {
+        // given
+        let dir = tempfile::tempdir().unwrap();
+        let tree = open_tree::<N>(dir.path());
+        let leaves = leaves_completing_open_upper_nodes::<N>();
+        let (last, all_but_last) = leaves.split_last().unwrap();
+        tree.insert_many(all_but_last).unwrap();
+        tree.checkpoint().unwrap();
+        tree.close().unwrap();
+        let tree = open_tree::<N>(dir.path());
+        let before = tree.snapshot();
+
+        // when
+        tree.insert(*last).unwrap();
+        tree.checkpoint().unwrap();
+
+        // then
+        assert_nodes_match_lean_imt(&before, all_but_last);
+        tree.close().unwrap();
+    }
+
+    check::<2>();
+    check::<3>();
+}
+
+/// Regression: a checkpoint taken while an upper level's last node was open
+/// recorded its chunk as final, so the next checkpoint mapped the stale copy back.
+#[test]
+fn checkpoint_rewrites_upper_level_node_written_while_open() {
+    fn check<const N: usize>() {
+        // given
+        let dir = tempfile::tempdir().unwrap();
+        let tree = open_tree::<N>(dir.path());
+        let leaves = leaves_completing_open_upper_nodes::<N>();
+        let (last, all_but_last) = leaves.split_last().unwrap();
+        tree.insert_many(all_but_last).unwrap();
+        tree.checkpoint().unwrap();
+
+        // when
+        tree.insert(*last).unwrap();
+        tree.checkpoint().unwrap();
+
+        // then
+        assert_nodes_match_lean_imt(&tree.snapshot(), &leaves);
+        tree.close().unwrap();
+        let reopened = open_tree::<N>(dir.path());
+        assert_nodes_match_lean_imt(&reopened.snapshot(), &leaves);
+        reopened.close().unwrap();
+    }
+
+    check::<2>();
+    check::<3>();
+}
+
+/// Regression: reopening a checkpoint taken while an upper level's last node was
+/// open counted its chunk as final, so the next checkpoint never rewrote it.
+#[test]
+fn checkpoint_after_reopen_rewrites_upper_level_node_written_while_open() {
+    fn check<const N: usize>() {
+        // given
+        let dir = tempfile::tempdir().unwrap();
+        let tree = open_tree::<N>(dir.path());
+        let leaves = leaves_completing_open_upper_nodes::<N>();
+        let (last, all_but_last) = leaves.split_last().unwrap();
+        tree.insert_many(all_but_last).unwrap();
+        tree.checkpoint().unwrap();
+        tree.close().unwrap();
+
+        // when
+        let tree = open_tree::<N>(dir.path());
+        tree.insert(*last).unwrap();
+        tree.checkpoint().unwrap();
+
+        // then
+        assert_nodes_match_lean_imt(&tree.snapshot(), &leaves);
+        tree.close().unwrap();
+        let reopened = open_tree::<N>(dir.path());
+        assert_nodes_match_lean_imt(&reopened.snapshot(), &leaves);
+        reopened.close().unwrap();
+    }
+
+    check::<2>();
+    check::<3>();
 }
